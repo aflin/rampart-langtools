@@ -135,7 +135,6 @@ uint16_t *vec_fp32_to_fp16_scalar(const float *src, size_t n)
 ========================================================= */
 #if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
-fpConverterBackEnd="accelerate";
 float *vec_fp16_to_fp32_buf(const uint16_t *src, float *dst, size_t n)
 {
     vImage_Buffer srcBuf = {
@@ -155,6 +154,8 @@ float *vec_fp16_to_fp32_buf(const uint16_t *src, float *dst, size_t n)
     vImage_Error err = vImageConvert_Planar16FtoPlanarF(&srcBuf, &dstBuf, kvImageNoFlags);
     /* Optional: handle/propagate err; kvImageNoError == 0 */
     (void)err;
+
+    fpConverterBackEnd="accelerate";
 
     return dst;
 }
@@ -289,7 +290,7 @@ float *vec_fp16_to_fp32(const uint16_t *src, size_t n)
 /* ---------- Per-ISA implementations (static) ---------- */
 
 #if (defined(__aarch64__) || defined(__ARM_NEON)) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-static void fp32_to_fp16_buf_neon(const float *src, uint16_t *dst, size_t n)
+static void vec_fp32_to_fp16_buf(const float *src, uint16_t *dst, size_t n)
 {
     size_t i = 0;
     for (; i + 4 <= n; i += 4)

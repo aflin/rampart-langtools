@@ -4,10 +4,11 @@ project(rampart_langtools C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-include(${CMAKE_CURRENT_SOURCE_DIR}/extern/extern.cmake)
 
 # Common compile flags
 add_compile_options(-Wall -g -O3)
+
+option(LT_ENABLE_GPU "Enable GPU acceleration" OFF)
 
 find_program(RAMPART_EXECUTABLE rampart)
 if(NOT RAMPART_EXECUTABLE)
@@ -27,6 +28,7 @@ if(NOT _res EQUAL 0)
 endif()
 
 # Include directories (common)
+
 include_directories(
   ${RP_PATH}/include
   ${CMAKE_CURRENT_SOURCE_DIR}
@@ -50,61 +52,282 @@ set(LIBS
     -lm
 )
 
+#Simple helper to find files
+function(find_library_in_dirs OUTVAR FILENAME)
+    set(dirs ${ARGN})
+    set(found "")
+    foreach(d ${dirs})
+        if(EXISTS "${d}/${FILENAME}")
+            set(found "${d}/${FILENAME}")
+            break()
+        endif()
+    endforeach()
+
+    # Return the result to the caller
+    set(${OUTVAR} "${found}" PARENT_SCOPE)
+endfunction()
+
+# find_libraries_in_dirs(
+#   OUT_LIST_VAR
+#   FILES <file1> [file2 ...]
+#   DIRS  <dir1>  [dir2  ...]
+#   [PREFIX <var_prefix>]           # default: LIB_
+# )
+function(find_libraries_in_dirs OUT_LIST_VAR)
+    set(options)
+    set(oneValueArgs PREFIX)
+    set(multiValueArgs FILES DIRS)
+    cmake_parse_arguments(FLID "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    if(NOT FLID_FILES OR NOT FLID_DIRS)
+        message(FATAL_ERROR "find_libraries_in_dirs: require FILES and DIRS.")
+    endif()
+
+    if(NOT FLID_PREFIX)
+        set(FLID_PREFIX "LIB_")
+    endif()
+
+    set(_found_list "")
+    set(_missing "")
+
+    foreach(LIBFILE IN LISTS FLID_FILES)
+        set(_found "")
+        foreach(D IN LISTS FLID_DIRS)
+            if(EXISTS "${D}/${LIBFILE}")
+                set(_found "${D}/${LIBFILE}")
+                break()
+            endif()
+        endforeach()
+
+        # Derive variable name: libfoo.so -> LIB_FOO
+        get_filename_component(_fname "${LIBFILE}" NAME)
+        string(REGEX REPLACE "^lib" "" _base "${_fname}")
+        string(REGEX REPLACE "\\..*$" "" _base "${_base}")
+        string(TOUPPER "${_base}" _upper)
+        set(_var "${FLID_PREFIX}${_upper}")
+
+        # Export per-library variable
+        set(${_var} "${_found}" PARENT_SCOPE)
+
+        if(_found)
+            list(APPEND _found_list "${_found}")
+            message(STATUS "Found ${LIBFILE}: ${_found}")
+        else()
+            list(APPEND _missing "${LIBFILE}")
+        endif()
+    endforeach()
+
+    if(_missing)
+        list(JOIN _missing ", " _miss_str)
+        message(FATAL_ERROR "Missing required libraries: ${_miss_str}")
+    endif()
+
+    # Export the list of found paths
+    set(${OUT_LIST_VAR} "${_found_list}" PARENT_SCOPE)
+endfunction()
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+add_library(rampart-langtools SHARED rampart-langtools.c)
 
 if(APPLE)
+
+  ##########  APPLE ############
+  if(LT_ENABLE_GPU AND NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") 
+    message(FATAL_ERROR "Cannot build for GPU on Apple x86_64")
+  endif()
+
+  execute_process(
+    COMMAND brew --prefix libomp
+    OUTPUT_VARIABLE OMP_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+
+  if (NOT OMP_PREFIX)
+    message(FATAL_ERROR "OpenMP not found, try brew install libomp")
+  endif()
+
+  execute_process(
+    COMMAND brew --prefix
+    OUTPUT_VARIABLE BREW_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+
+  if (NOT BREW_PREFIX)
+    message(FATAL_ERROR "brew package manager is required")
+  endif()
+
   # Extra includes on macOS
   include_directories(
-    /opt/homebrew/include
+   "${BREW_PREFIX}/include"
+   "${OMP_PREFIX}/include"
   )
 
   # Extra compile flags
   add_compile_options(-Wno-deprecated-declarations)
 
-    list(APPEND LIBS
-        /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk/usr/lib/libcurl.tbd
-        /opt/homebrew/opt/libomp/lib/libomp.a
-        ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
-        ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-metal/libggml-metal.a
-    )
+  # Where to look on macOS
+  set(LIB_DIRS
+    "${BREW_PREFIX}/lib"
+    /usr/lib
+    /usr/local/lib
+    /opt/homebrew/lib
+    /opt/local/lib
+    "${OMP_PREFIX}/lib"
+    /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib/
+  )
 
-  set(CMAKE_SHARED_LINKER_FLAGS
-    "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-headerpad_max_install_names -undefined dynamic_lookup -Wl,-rpath,@loader_path -Wl,-rpath,/usr/local/lib -Wl,-rpath,/opt/homebrew/lib -framework Accelerate -framework Foundation -framework Metal -framework MetalKit"
+  set(LIB_FILES
+    libomp.a
+    libcurl.tbd
+  )
+
+  find_libraries_in_dirs(FOUND_LIBS FILES ${LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
+
+  if(LT_ENABLE_GPU)
+    list(APPEND LIBS
+          ${FOUND_LIBS}
+          ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
+          ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-metal/libggml-metal.a
+    )
+  else()
+    list(APPEND LIBS
+          ${FOUND_LIBS}
+          ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
+    )
+  endif()
+  target_link_options(rampart-langtools PRIVATE
+    "-Wl,-headerpad_max_install_names"
+    "-Wl,-undefined,dynamic_lookup"
+    # install_name sets the “where to load me from at runtime”; use @rpath to respect the RPATH above
+    "-Wl,-install_name,@rpath/rampart-langtools.so"
+  )
+
+  # Frameworks (do NOT stuff these into global linker flags)
+  target_link_libraries(rampart-langtools PRIVATE
+    "-framework Foundation"
+    "-framework Metal"
+    "-framework MetalKit"
+    "-framework Accelerate"
   )
 
 else()
-  # Linux
+
+  ############ Linux ##############
+
+  set(LIB_DIRS
+    /lib
+    /usr/lib
+    /usr/lib64
+    /usr/local/lib
+    /usr/lib/x86_64-linux-gnu/
+    /usr/lib/i386-linux-gnu/
+  )
+
+  if(LT_ENABLE_GPU)
+    set(LIB_FILES
+      libomp5.so
+      libopenblas.a
+      libgfortran.so.5
+      libcudart.so
+      libcublas.so
+      libcuda.so
+    )
+  else()
+    set(LIB_FILES
+      libomp5.so
+      libopenblas.a
+      libgfortran.so.5
+    )
+  endif()
+
+  find_libraries_in_dirs(FOUND_LIBS FILES ${LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
+
+  if(LT_ENABLE_GPU)
     list(APPEND LIBS
-        /usr/lib/x86_64-linux-gnu/libomp5.so
-        /usr/lib/x86_64-linux-gnu/libopenblas.a
-        /usr/lib/x86_64-linux-gnu/libgfortran.so.5
-        ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-cuda/libggml-cuda.a
-        /usr/lib/x86_64-linux-gnu/libcudart.so
-        /usr/lib/x86_64-linux-gnu/libcublas.so
-        /usr/lib/x86_64-linux-gnu/libcuda.so
+      ${FOUND_LIBS}
+      ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-cuda/libggml-cuda.a
     )
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
-    set(CMAKE_SHARED_LINKER_FLAGS
-      "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-soname,rampart-langtools.so"
+  else()
+    list(APPEND LIBS
+      ${FOUND_LIBS}
     )
+  endif()
+
+  set(CMAKE_SHARED_LINKER_FLAGS
+    "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-soname,rampart-langtools.so"
+  )
 endif()
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/extern/extern.cmake)
 
-add_library(rampart-langtools SHARED rampart-langtools.c)
 set_target_properties(
     rampart-langtools
     PROPERTIES SUFFIX ".so"
     PREFIX ""
 )
 
-add_dependencies(rampart-langtools
-  llama
-  common
-  ggml
-  llama-gguf
-  sentencepiece
-  faiss
-  faiss_c
-)
+if(NOT DEFINED LT_ENABLE_GPU_LAST)
+    set(LT_ENABLE_GPU_LAST "unset")
+    message(STATUS "GPU set ${LT_ENABLE_GPU}, was not previously set")
+else()
+    message(STATUS "GPU set ${LT_ENABLE_GPU}, was set ${LT_ENABLE_GPU_LAST}")
+endif()
+
+
+#always rebuild if we change to/from gpu build
+if("${LT_ENABLE_GPU}" STREQUAL "${LT_ENABLE_GPU_LAST}")
+
+  #faiss really likes to rebuild unnecessarily
+  set(FAISS_C_LIB "${CMAKE_CURRENT_BINARY_DIR}/extern/faiss/c_api/libfaiss_c.a")
+  set(FAISS_LIB   "${CMAKE_CURRENT_BINARY_DIR}/extern/faiss/faiss/libfaiss.a")
+
+  set(LLAMA_LIB   "${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/src/libllama.a")
+  set(GGML_LIB    "${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml.a")
+
+  set(SP_LIB      "${CMAKE_CURRENT_BINARY_DIR}/extern/sentencepiece/src/libsentencepiece.a")
+
+  if(NOT EXISTS "${FAISS_C_LIB}" OR NOT EXISTS "${FAISS_LIB}")
+    add_dependencies(rampart-langtools
+      faiss
+      faiss_c
+    )
+  endif()
+
+  if(NOT EXISTS "${LLAMA_LIB}" OR NOT EXISTS "${GGML_LIB}")
+    add_dependencies(rampart-langtools
+      llama
+      common
+      ggml
+    )
+  endif()
+
+  if(NOT EXISTS "${SP_LIB}")
+    add_dependencies(rampart-langtools
+      sentencepiece
+    )
+  endif()
+else()
+  # build/rebuild from scratch
+  if(NOT "${LT_ENABLE_GPU_LAST}" STREQUAL "unset")
+    if(LT_ENABLE_GPU)
+      message(STATUS "Rebuilding for gpu")
+    else()
+      message(STATUS "Rebuilding for cpu")
+    endif()
+  endif()
+  add_dependencies(rampart-langtools
+    llama
+    common
+    ggml
+    sentencepiece
+    faiss
+    faiss_c
+  )
+endif()
+
+set(LT_ENABLE_GPU_LAST "${LT_ENABLE_GPU}" CACHE INTERNAL "Previous value of LT_ENABLE_GPU")
 
 # Link with all libs
 target_link_libraries(rampart-langtools PRIVATE ${LIBS})
