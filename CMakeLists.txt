@@ -57,6 +57,8 @@ include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/faiss
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/sentencepiece/src
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/sentencepiece/wrapper
+  ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/ggml/include/
 )
 
 # Libraries
