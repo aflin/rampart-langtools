@@ -8,13 +8,36 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Common compile flags
 add_compile_options(-Wall -g -O3)
 
-option(LT_ENABLE_GPU "Enable GPU acceleration" OFF)
+if(APPLE)
+
+  if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    option(LT_ENABLE_GPU "Enable GPU acceleration" ON)
+  else()
+    option(LT_ENABLE_GPU "Enable GPU acceleration" OFF)
+  endif()
+
+  execute_process(
+    COMMAND brew --prefix libomp
+    OUTPUT_VARIABLE OMP_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+
+else()
+  # LINUX
+
+  option(LT_ENABLE_GPU "Enable GPU acceleration" OFF)
+
+endif()
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/extern/extern.cmake)
 
 find_program(RAMPART_EXECUTABLE rampart)
 if(NOT RAMPART_EXECUTABLE)
   message(FATAL_ERROR "rampart not found in PATH")
 endif()
 
+# Get the install path of rampart
 execute_process(
   COMMAND ${RAMPART_EXECUTABLE} -c "console.log(process.installPath)"
   RESULT_VARIABLE _res
@@ -24,10 +47,9 @@ execute_process(
 )
 
 if(NOT _res EQUAL 0)
-  message(FATAL_ERROR "rampart failed: ${_err}")
+  message(FATAL_ERROR "rampart get installPath failed: ${_err}")
 endif()
 
-# Include directories (common)
 
 include_directories(
   ${RP_PATH}/include
@@ -73,6 +95,9 @@ endfunction()
 #   DIRS  <dir1>  [dir2  ...]
 #   [PREFIX <var_prefix>]           # default: LIB_
 # )
+
+# right now, we just need the list and are ignoring set vars
+
 function(find_libraries_in_dirs OUT_LIST_VAR)
     set(options)
     set(oneValueArgs PREFIX)
@@ -135,13 +160,6 @@ if(APPLE)
   if(LT_ENABLE_GPU AND NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") 
     message(FATAL_ERROR "Cannot build for GPU on Apple x86_64")
   endif()
-
-  execute_process(
-    COMMAND brew --prefix libomp
-    OUTPUT_VARIABLE OMP_PREFIX
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-  )
 
   if (NOT OMP_PREFIX)
     message(FATAL_ERROR "OpenMP not found, try brew install libomp")
@@ -260,7 +278,6 @@ else()
   )
 endif()
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/extern/extern.cmake)
 
 set_target_properties(
     rampart-langtools
