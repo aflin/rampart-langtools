@@ -865,7 +865,7 @@ static duk_ret_t gen_free(duk_context *ctx)
 #endif
 
 // --- CUDA availability check ---
-#if defined(LT_ENABLE_GPU)
+#if ( defined(LT_ENABLE_GPU) && !defined(__APPLE__) )
 #define HAVE_CUDA 1
 #include <cuda_runtime.h>
 #else
@@ -1444,11 +1444,16 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
 
     char *s = typek_str;
     while (*s)
-        *(s++) = toupper(*s);
-
+    {
+        *s = toupper(*s);
+        s++;
+    }
     s = typev_str;
     while (*s)
-        *(s++) = toupper(*s);
+    {
+        *s = toupper(*s);
+        s++;
+    }
 
     duk_push_string(ctx, typek_str);
     put_prop_readonly(ctx, -2, "kCacheType");
@@ -2121,9 +2126,10 @@ duk_ret_t detok_from_piecestring(duk_context *ctx, duk_idx_t stridx)
     const char *end;
     char *out = NULL;
     REMALLOC(out, mlen + 1);
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
-
+#endif
     wrote_any = 0;
     tok = piecestring;
     while (*tok)
@@ -2150,7 +2156,9 @@ duk_ret_t detok_from_piecestring(duk_context *ctx, duk_idx_t stridx)
         while (*tok == ' ')
             tok++;
     }
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
     duk_push_string(ctx, out);
     free(out);
     return 1;
