@@ -3092,6 +3092,130 @@ static void open_faiss(duk_context *ctx)
 /* ***********************************************************
                           UTILS
    *********************************************************** */
+
+static duk_ret_t avg_vec16(duk_context *ctx)
+{
+    REQUIRE_ARRAY(ctx, 0, "avgVecFp16 - first argument must be an array of Buffers");
+
+    duk_uarridx_t j=0, len=duk_get_length(ctx, 0);
+
+    if(!len)
+        RP_THROW(ctx, "avgVecFp16 - first argument must be an array of Buffers");
+
+    if(len==1)
+    {
+        duk_pull(ctx, 0);
+        return 1;
+    }
+
+    size_t vec_dim=0, lastsz=0;
+    float *avgvec=NULL;
+    for(;j<len;j++)
+    {
+        duk_get_prop_index(ctx, 0, j);
+        uint16_t *v_in=REQUIRE_BUFFER_DATA(ctx, -1, &lastsz, "avgVecFp16 - first argument must be an array of Buffers");
+        if(!vec_dim)
+        {
+            vec_dim=lastsz/2;
+            CALLOC(avgvec, vec_dim * sizeof(float));
+        }
+        else if (vec_dim != lastsz/2)
+        {
+            free(avgvec);
+            RP_THROW(ctx, "avgVecFp16 - vector size mismatch (expected %lu, got %lu in array[%lu]", vec_dim, lastsz/2, j);
+        }
+
+        float *v = vec_fp16_to_fp32(v_in, vec_dim);
+
+        for (int i = 0; i < vec_dim; ++i)
+        {
+            avgvec[i] += v[i];
+        }
+        free(v);
+        duk_pop(ctx);
+    }
+
+    double norm2 = 0.0;
+
+    for (int i = 0; i < vec_dim; ++i)
+    {
+        avgvec[i] /= (float)len;
+        norm2 += (double)avgvec[i] * (double)avgvec[i];
+    }
+
+    float inv = norm2 > 0.0 ? (float)(1.0 / (sqrt(norm2))) : 1;
+
+    for (int i = 0; i < vec_dim; ++i)
+    {
+        avgvec[i] *= inv;
+    }
+
+    uint16_t *out = duk_push_fixed_buffer(ctx, lastsz);
+    vec_fp32_to_fp16_buf(avgvec, out, vec_dim);
+
+    free(avgvec);
+
+    return 1;
+}
+
+static duk_ret_t avg_vec32(duk_context *ctx)
+{
+    REQUIRE_ARRAY(ctx, 0, "avgVecFp32 - first argument must be an array of Buffers");
+
+    duk_uarridx_t j=0, len=duk_get_length(ctx, 0);
+
+    if(!len)
+        RP_THROW(ctx, "avgVecFp32 - first argument must be an array of Buffers");
+
+    if(len==1)
+    {
+        duk_pull(ctx, 0);
+        return 1;
+    }
+
+    size_t vec_dim=0, lastsz=0;
+    float *avgvec=NULL;
+    for(;j<len;j++)
+    {
+        duk_get_prop_index(ctx, 0, j);
+        uint16_t *v=REQUIRE_BUFFER_DATA(ctx, -1, &lastsz, "avgVecFp32 - first argument must be an array of Buffers");
+        duk_pop(ctx);
+        if(!vec_dim)
+        {
+            vec_dim=lastsz/4;
+            avgvec = duk_push_fixed_buffer(ctx, lastsz);
+        }
+        else if (vec_dim != lastsz/4)
+        {
+            RP_THROW(ctx, "avgVecFp32 - vector size mismatch (expected %lu, got %lu in array[%lu]", vec_dim, lastsz/4, j);
+        }
+
+        for (int i = 0; i < vec_dim; ++i)
+        {
+            avgvec[i] += v[i];
+        }
+    }
+
+    double norm2 = 0.0;
+
+    for (int i = 0; i < vec_dim; ++i)
+    {
+        avgvec[i] /= (float)len;
+        norm2 += (double)avgvec[i] * (double)avgvec[i];
+    }
+
+    float inv = norm2 > 0.0 ? (float)(1.0 / (sqrt(norm2))) : 1;
+
+    for (int i = 0; i < vec_dim; ++i)
+    {
+        avgvec[i] *= inv;
+    }
+
+    return 1;
+}
+
+
+
 static duk_ret_t numbers_to(duk_context *ctx, duk_idx_t arridx, int wantfp16)
 {
     size_t i = 0, len = (size_t)duk_get_length(ctx, arridx);
@@ -3221,6 +3345,12 @@ static void open_utils(duk_context *ctx)
 
     duk_push_c_function(ctx, fp32_to_fp16, 1);
     duk_put_prop_string(ctx, -2, "fp32ToFp16");
+
+    duk_push_c_function(ctx, avg_vec32, 1);
+    duk_put_prop_string(ctx, -2, "avgVecFp32");
+
+    duk_push_c_function(ctx, avg_vec16, 1);
+    duk_put_prop_string(ctx, -2, "avgVecFp16");
 }
 
 /* **************************************************
