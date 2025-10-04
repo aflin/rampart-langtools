@@ -57,6 +57,7 @@ include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/faiss
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/sentencepiece/src
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/sentencepiece/wrapper
+  ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/include
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/ggml/include/
 )
@@ -154,7 +155,13 @@ function(find_libraries_in_dirs OUT_LIST_VAR)
 endfunction()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
-add_library(rampart-langtools SHARED rampart-langtools.c)
+add_library(rampart-langtools SHARED
+    rampart-langtools.c
+)
+
+if(LT_ENABLE_GPU)
+    target_compile_definitions(rampart-langtools PRIVATE LT_ENABLE_GPU=1)
+endif()
 
 if(APPLE)
 
@@ -266,8 +273,8 @@ else()
 
   if(LT_ENABLE_GPU)
     list(APPEND LIBS
-      ${FOUND_LIBS}
       ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-cuda/libggml-cuda.a
+      ${FOUND_LIBS}
     )
   else()
     list(APPEND LIBS
