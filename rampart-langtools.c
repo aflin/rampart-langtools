@@ -2327,9 +2327,11 @@ static duk_ret_t add_fp32(duk_context *ctx)
     }
     else
     {
-        id = (idx_t)REQUIRE_NUMBER(ctx, 0, "addFp16 requires a positive integer (id) as its first argument");
-        if (id < 0)
+        // idx_t is int64_t, but let's do it right:
+        double d = REQUIRE_NUMBER(ctx, 0, "addFp16 requires a positive integer (id) as its first argument");
+        if (d < 0.0)
             RP_THROW(ctx, "addFp16 requires a positive integer (id) as its first argument");
+        id = (idx_t) d;
     }
 
     float *v = REQUIRE_BUFFER_DATA(ctx, 1, &sz, "addFp32 requires a buffer as its second argument");
@@ -2381,9 +2383,10 @@ static duk_ret_t add_fp16(duk_context *ctx)
     }
     else
     {
-        id = (idx_t)REQUIRE_NUMBER(ctx, 0, "addFp16 requires a positive integer (id) as its first argument");
-        if (id < 0)
+        double d = REQUIRE_NUMBER(ctx, 0, "addFp16 requires a positive integer (id) as its first argument");
+        if (d < 0.0)
             RP_THROW(ctx, "addFp16 requires a positive integer (id) as its first argument");
+        id = (idx_t) d;
     }
 
     const uint16_t *v16 = REQUIRE_BUFFER_DATA(ctx, 1, &sz, "addFp16 requires a buffer as its second argument");
