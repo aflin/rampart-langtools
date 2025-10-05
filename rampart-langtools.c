@@ -2906,7 +2906,7 @@ static duk_ret_t new_trainer(duk_context *ctx)
             fclose(fh);
             RP_THROW(ctx, "faiss.trainer - invalid file size (%lu) for dim==%lu", st.st_size, vsize/4);
         }
-printf("%lu, %lu\n", st.st_size, vsize);
+
         duk_push_int(ctx, (int)(st.st_size/vsize));
         duk_put_prop_string(ctx, -2, "rowsAdded");
     }
