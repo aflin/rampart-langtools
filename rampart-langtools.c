@@ -2306,7 +2306,32 @@ static duk_ret_t add_fp32(duk_context *ctx)
 {
     duk_size_t sz;
     duk_size_t dim;
-    idx_t id = (idx_t)REQUIRE_UINT(ctx, 0, "addFp32 requires a positive integer (id) as its first argument");
+    idx_t id;
+    
+    if(duk_is_string(ctx, 0))
+    {
+        char *endptr;
+        const char *str = duk_get_string(ctx, 0);
+        errno = 0;
+        unsigned long long val = strtoull(str, &endptr, 10);
+
+        if (errno == ERANGE) {
+            RP_THROW(ctx, "addFp16 - First argument is out of range for a 64 bit number");
+        }
+        if (*endptr != '\0') {
+            RP_THROW(ctx, "addFp16 - First argument (id) must be a Number or String representation of a 64 bit value");
+        }
+
+        id = (idx_t) val;
+
+    }
+    else
+    {
+        id = (idx_t)REQUIRE_NUMBER(ctx, 0, "addFp16 requires a positive integer (id) as its first argument");
+        if (id < 0)
+            RP_THROW(ctx, "addFp16 requires a positive integer (id) as its first argument");
+    }
+
     float *v = REQUIRE_BUFFER_DATA(ctx, 1, &sz, "addFp32 requires a buffer as its second argument");
 
     duk_push_this(ctx);
@@ -2335,7 +2360,32 @@ static duk_ret_t add_fp16(duk_context *ctx)
 {
     duk_size_t sz;
     duk_size_t dim;
-    idx_t id = (idx_t)REQUIRE_UINT(ctx, 0, "addFp16 requires a positive integer (id) as its first argument");
+    idx_t id;
+    
+    if(duk_is_string(ctx, 0))
+    {
+        char *endptr;
+        const char *str = duk_get_string(ctx, 0);
+        errno = 0;
+        unsigned long long val = strtoull(str, &endptr, 10);
+
+        if (errno == ERANGE) {
+            RP_THROW(ctx, "addFp16 - First argument is out of range for a 64 bit number");
+        }
+        if (*endptr != '\0') {
+            RP_THROW(ctx, "addFp16 - First argument (id) must be a Number or String representation of a 64 bit value");
+        }
+
+        id = (idx_t) val;
+
+    }
+    else
+    {
+        id = (idx_t)REQUIRE_NUMBER(ctx, 0, "addFp16 requires a positive integer (id) as its first argument");
+        if (id < 0)
+            RP_THROW(ctx, "addFp16 requires a positive integer (id) as its first argument");
+    }
+
     const uint16_t *v16 = REQUIRE_BUFFER_DATA(ctx, 1, &sz, "addFp16 requires a buffer as its second argument");
 
     duk_push_this(ctx);
