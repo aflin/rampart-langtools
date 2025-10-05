@@ -4,9 +4,11 @@ project(rampart_langtools C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Common compile flags
 add_compile_options(-Wall -g -O3)
+set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -std=c++17")
 
 if(APPLE)
 
@@ -29,6 +31,9 @@ else()
   option(LT_ENABLE_GPU "Enable GPU acceleration" OFF)
 
 endif()
+
+
+
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/extern/extern.cmake)
 
@@ -159,6 +164,10 @@ add_library(rampart-langtools SHARED
     rampart-langtools.c
 )
 
+
+
+
+
 if(LT_ENABLE_GPU)
     target_compile_definitions(rampart-langtools PRIVATE LT_ENABLE_GPU=1)
 endif()
@@ -285,8 +294,47 @@ else()
   set(CMAKE_SHARED_LINKER_FLAGS
     "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-soname,rampart-langtools.so"
   )
-endif()
+  ## OLD LINUX
+  include(CheckCXXSourceCompiles)
 
+  set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -std=c++17")
+  set(FS_TEST_SRC "
+  #include <filesystem>
+  int main() {
+      auto p = std::filesystem::current_path();
+      (void)p;
+      return 0;
+  }")
+
+
+  # Try with no extra lib (GCC>=9 / modern Clang)
+  unset(CMAKE_REQUIRED_LIBRARIES)
+  check_cxx_source_compiles("${FS_TEST_SRC}" HAS_FS_NO_LINK)
+
+  if (HAS_FS_NO_LINK)
+      # nothing to do
+  else()
+      # Try libstdc++fs (older GCC / Clang+libstdc++)
+      set(CMAKE_REQUIRED_LIBRARIES stdc++fs)
+      check_cxx_source_compiles("${FS_TEST_SRC}" HAS_FS_STDCXXFS)
+      if (HAS_FS_STDCXXFS)
+          list(APPEND LIBS stdc++fs)
+      else()
+          # Try libc++fs (older Clang+libc++)
+          set(CMAKE_REQUIRED_LIBRARIES c++fs)
+          check_cxx_source_compiles("${FS_TEST_SRC}" HAS_FS_CXXFS)
+          if (HAS_FS_CXXFS)
+              list(APPEND LIBS stdc++fs)
+          else()
+              message(FATAL_ERROR "C++17 <filesystem> not available on this toolchain.")
+          endif()
+      endif()
+  endif()
+  ## end old linux
+
+
+endif()
+##end linux
 
 set_target_properties(
     rampart-langtools
@@ -352,6 +400,9 @@ else()
     faiss_c
   )
 endif()
+
+
+
 
 set(LT_ENABLE_GPU_LAST "${LT_ENABLE_GPU}" CACHE INTERNAL "Previous value of LT_ENABLE_GPU")
 
