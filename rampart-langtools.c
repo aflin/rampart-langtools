@@ -2404,7 +2404,7 @@ static duk_ret_t add_fp16(duk_context *ctx)
     FaissIndex *idx = duk_get_pointer(ctx, -1);
 
     if (!idx)
-        RP_THROW(ctx, "faiss.train - Internal error getting index handle");
+        RP_THROW(ctx, "faiss.addFp32 - Internal error getting index handle");
 
     float *v = vec_fp16_to_fp32(v16, (size_t)dim);
 
@@ -2412,7 +2412,7 @@ static duk_ret_t add_fp16(duk_context *ctx)
     if (faiss_add_one(idx, id, v, (int)dim, &err) == -1)
     {
         free(v);
-        RP_THROW(ctx, "addFp16 - %s", err);
+        RP_THROW(ctx, "faiss.addFp32 - %s", err);
     }
     free(v);
 
@@ -2661,7 +2661,7 @@ static duk_ret_t add_trainvec_fp32(duk_context *ctx)
 
     nrows++;
     duk_push_int(ctx, nrows);
-    duk_put_prop_string(ctx, -2, "rowsAdded");
+    put_prop_readonly(ctx, -2, "rowsAdded");
 
     return 0;
 }
@@ -2697,13 +2697,13 @@ static duk_ret_t add_trainvec_fp16(duk_context *ctx)
         RP_THROW(ctx, "addTrainingFp16 - Internal error getting file handle");
 
     if (write_vector_to_file(fh, v, dim) == -1)
-        RP_THROW(ctx, "addTrainingFp16 - error writing to tmpfile - %s", strerror(errno));
+        RP_THROW(ctx, "addTrainingFp16 - error writing to file - %s", strerror(errno));
 
     free(v);
 
     nrows++;
     duk_push_int(ctx, nrows);
-    duk_put_prop_string(ctx, -2, "rowsAdded");
+    put_prop_readonly(ctx, -2, "rowsAdded");
 
     return 0;
 }
@@ -2741,7 +2741,7 @@ int close_and_unlink(FILE *fh, const char *path, const char **err)
         {                                                                                                              \
             char tothrow[2048];                                                                                        \
             snprintf(tothrow, 2048, __VA_ARGS__);                                                                      \
-            duk_push_error_object(ctx, DUK_ERR_ERROR, "%s - Error closing temp file: %s", tothrow, __err);             \
+            duk_push_error_object(ctx, DUK_ERR_ERROR, "%s - Error closing file: %s", tothrow, __err);             \
         }                                                                                                              \
         else                                                                                                           \
             duk_push_error_object(ctx, DUK_ERR_ERROR, __VA_ARGS__);                                                    \
@@ -2754,21 +2754,23 @@ static duk_ret_t dotrain(duk_context *ctx)
     int nrows, fd;
     FILE *fh;
 
-    const char *filename;
+    //const char *filename;
 
     duk_push_this(ctx);
-    duk_get_prop_string(ctx, -1, "tempFile");
+    /*
+    duk_get_prop_string(ctx, -1, "trainFile");
     filename = duk_get_string(ctx, -1);
     duk_pop(ctx);
+    */
 
     duk_get_prop_string(ctx, -1, "settings");
     duk_get_prop_string(ctx, -1, "faissDim");
     dim = (duk_size_t)duk_get_int(ctx, -1);
-    duk_pop_2(ctx);
+    duk_pop(ctx);
 
     duk_get_prop_string(ctx, -1, "rowsAdded");
     nrows = duk_get_int_default(ctx, -1, 0);
-    duk_pop(ctx);
+    duk_pop_2(ctx);
 
     if (!nrows)
         RP_THROW(ctx, "faiss.train - no vectors have been added yet");
@@ -2792,26 +2794,25 @@ static duk_ret_t dotrain(duk_context *ctx)
     fd = fileno(fh);
     if (fd < 0)
     {
-        RP_THROW_AND_CLOSE(ctx, fh, filename, "faiss.train - Error :%s", strerror(errno));
+        RP_THROW(ctx, "faiss.train - Error :%s", strerror(errno));
     }
 
     struct stat st;
     if (fstat(fd, &st) != 0)
     {
-        RP_THROW_AND_CLOSE(ctx, fh, filename, "faiss.train - Internal error - cannot stat temp file");
+        RP_THROW(ctx, "faiss.train - Internal error - cannot stat training file");
     }
 
     off_t need_bytes = (off_t)nrows * (off_t)dim * sizeof(float);
 
     if ((off_t)need_bytes != st.st_size)
-        RP_THROW_AND_CLOSE(ctx, fh, filename,
-                           "faiss.train - Internal error - Training file is not expected size (wanted:%lu vs have:%lu)",
-                           (size_t)need_bytes, (size_t)st.st_size);
+        RP_THROW(ctx, "faiss.train - Internal error - Training file is not expected size (wanted:%lu vs have:%lu)",
+            (size_t)need_bytes, (size_t)st.st_size);
 
     void *addr = mmap(NULL, need_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
     if (addr == MAP_FAILED)
     {
-        RP_THROW_AND_CLOSE(ctx, fh, filename, "faiss.train - Internal error - cannot load temp file - %s",
+        RP_THROW(ctx, "faiss.train - Internal error - cannot load training file - %s",
                            strerror(errno));
     }
 
@@ -2824,7 +2825,7 @@ static duk_ret_t dotrain(duk_context *ctx)
     {
         const char *err = faiss_get_last_error();
         munmap(addr, need_bytes);
-        RP_THROW_AND_CLOSE(ctx, fh, filename, "faiss.train - training failed: %s", err);
+        RP_THROW(ctx, "faiss.train - training failed: %s", err);
     }
 
     if (munmap(addr, need_bytes) != 0)
@@ -2833,48 +2834,84 @@ static duk_ret_t dotrain(duk_context *ctx)
         return 0;
     }
 
-    const char *err;
-    if (close_and_unlink(fh, filename, &err))
-        fprintf(stderr, "faiss.train - training completed, but error closing temp file '%s' - %s\n", filename, err);
-
     return 0;
 }
 
 static duk_ret_t new_trainer(duk_context *ctx)
 {
-    const char *traindir = "/tmp";
+    const char *trainpath = "/tmp";
     char trainfile[PATH_MAX];
     static int counter = 0; /* monotonically increasing */
     FILE *fh = NULL;
+    struct stat st;
 
     if (!duk_is_undefined(ctx, 0))
-        traindir = REQUIRE_STRING(ctx, 0, "faiss.trainer - argument must be a String (directory path)");
+        trainpath = REQUIRE_STRING(ctx, 0, "faiss.trainer - argument must be a String (directory path)");
 
-    /* strip trailing slashes (except for root "/") */
-    size_t tlen = strlen(traindir);
-    while (tlen > 1 && traindir[tlen - 1] == '/')
-        tlen--;
+    errno=0;
+    if(stat(trainpath, &st) != 0)
+    {
+        fh = fopen(trainpath, "a+");
+        if(!fh)
+            RP_THROW(ctx, "faiss.trainer - can't open path '%s': %s", trainpath, strerror(errno));
+        if(stat(trainpath, &st) != 0)
+            RP_THROW(ctx, "faiss.trainer - error: stat path '%s': %s", trainpath, strerror(errno));
+    }
+    else
+    {
+        if (S_ISDIR(st.st_mode))
+        {
+            /* strip trailing slashes (except for root "/") */
+            size_t tlen = strlen(trainpath);
+            while (tlen > 1 && trainpath[tlen - 1] == '/')
+                tlen--;
 
-    /* build filename: <traindir>/faisstrainingdata.<counter>.<pid> */
-    pid_t pid = getpid();
-    int n = snprintf(trainfile, PATH_MAX, "%.*s/faisstrainingdata.%d.%ld", (int)tlen, traindir, counter++, (long)pid);
+            /* build filename: <trainpath>/faisstrainingdata.<counter>.<pid> */
+            pid_t pid = getpid();
+            int n = snprintf(trainfile, PATH_MAX, "%.*s/faisstrainingdata.%d.%ld", (int)tlen, trainpath, counter++, (long)pid);
 
-    if (n < 0 || n >= PATH_MAX)
-        RP_THROW(ctx, "faiss.trainer - training file path too long");
+            if (n < 0 || n >= PATH_MAX)
+                RP_THROW(ctx, "faiss.trainer - training file path too long");
+        }
+        else if (S_ISREG(st.st_mode))
+        {
+            strncpy(trainfile, trainpath, PATH_MAX);
+        }
+        else
+            RP_THROW(ctx, "faiss.trainer - path '%s' is something not a file or directory", trainpath);
 
-    fh = fopen(trainfile, "w+");
-    if (!fh)
-        RP_THROW(ctx, "faiss.trainer - failed to open temp file '%s' - %s", trainfile, strerror(errno));
+        fh = fopen(trainfile, "a+");
+        if (!fh)
+            RP_THROW(ctx, "faiss.trainer - failed to open training file '%s' - %s", trainfile, strerror(errno));
+    }
 
     duk_push_current_function(ctx);
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("idxthis"));
+
     duk_push_object(ctx);
 
     duk_get_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissIdx"));
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissIdx"));
 
     duk_get_prop_string(ctx, -2, "settings");
+    if(S_ISREG(st.st_mode))
+    {
+        duk_size_t vsize=0;
+        duk_get_prop_string(ctx, -1, "faissDim");
+        vsize = 4 * (duk_size_t)duk_get_int(ctx, -1);
+        duk_pop(ctx);
+        //check file against dim and set rows
+        if( (duk_size_t)st.st_size % vsize)
+        {
+            fclose(fh);
+            RP_THROW(ctx, "faiss.trainer - invalid file size (%lu) for dim==%lu", st.st_size, vsize/4);
+        }
+printf("%lu, %lu\n", st.st_size, vsize);
+        duk_push_int(ctx, (int)(st.st_size/vsize));
+        duk_put_prop_string(ctx, -2, "rowsAdded");
+    }
     duk_put_prop_string(ctx, -2, "settings");
+
 
     duk_push_pointer(ctx, fh);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("fh"));
@@ -2889,7 +2926,7 @@ static duk_ret_t new_trainer(duk_context *ctx)
     duk_put_prop_string(ctx, -2, "train");
 
     duk_push_string(ctx, trainfile);
-    put_prop_readonly(ctx, -2, "tempFile");
+    put_prop_readonly(ctx, -2, "trainFile");
 
     return 1;
 }
