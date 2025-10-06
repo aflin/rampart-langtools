@@ -2267,8 +2267,10 @@ static void open_sentencepiece(duk_context *ctx)
            FAISS
    ************************************************** */
 
-int faiss_add_one(FaissIndex *idx, idx_t id, float *v, int dim, const char **err)
+static idx_t _add_one(FaissIndex *idx, idx_t id, float *v, size_t sz, const char **err)
 {
+    int rc;
+
     if (!idx || !v)
     {
         if (err)
@@ -2276,16 +2278,22 @@ int faiss_add_one(FaissIndex *idx, idx_t id, float *v, int dim, const char **err
         return -1;
     }
 
-    // probably can get rid of this, as we check below.
-    int d = faiss_Index_d(idx);
-    if (dim != d)
+    int size = faiss_Index_d(idx) * sizeof(float);
+    if (size != sz)
     {
         if (err)
             *err = "Vector dimension does not match index dimension";
         return -1;
     }
 
-    int rc = faiss_Index_add_with_ids(idx, 1, v, &id);
+    if(id < 0 )
+    {
+        rc = faiss_Index_add(idx, 1, v);
+        id = faiss_Index_ntotal(idx);
+    }
+    else
+        rc = faiss_Index_add_with_ids(idx, 1, v, &id);
+
     if (rc != 0)
     {
         if (err)
@@ -2299,19 +2307,24 @@ int faiss_add_one(FaissIndex *idx, idx_t id, float *v, int dim, const char **err
 
     if (err)
         *err = NULL;
-    return 0;
+
+    return id;
 }
 
 static duk_ret_t add_fp32(duk_context *ctx)
 {
     duk_size_t sz;
-    duk_size_t dim;
     idx_t id;
+    const char *err = NULL;
+    double count = 0;
+    FaissIndex *idx = NULL;
+    float *v=NULL;
     
     if(duk_is_string(ctx, 0))
     {
         char *endptr;
         const char *str = duk_get_string(ctx, 0);
+
         errno = 0;
         unsigned long long val = strtoull(str, &endptr, 10);
 
@@ -2328,42 +2341,53 @@ static duk_ret_t add_fp32(duk_context *ctx)
     else
     {
         // idx_t is int64_t, but let's do it right:
-        double d = REQUIRE_NUMBER(ctx, 0, "addFp16 requires a positive integer (id) as its first argument");
-        if (d < 0.0)
-            RP_THROW(ctx, "addFp16 requires a positive integer (id) as its first argument");
+        double d = REQUIRE_NUMBER(ctx, 0, "addFp16 requires an integer (id|-1) as its first argument");
         id = (idx_t) d;
     }
 
-    float *v = REQUIRE_BUFFER_DATA(ctx, 1, &sz, "addFp32 requires a buffer as its second argument");
+    v = REQUIRE_BUFFER_DATA(ctx, 1, &sz, "addFp32 requires a buffer as its second argument");
 
     duk_push_this(ctx);
     duk_get_prop_string(ctx, -1, "settings");
-    duk_get_prop_string(ctx, -1, "faissDim");
-    dim = (duk_size_t)duk_get_int(ctx, -1);
-    duk_pop_2(ctx);
 
-    if (sz / 4 != dim)
-        RP_THROW(ctx, "addFp32 - buffer is %lu long, should be %lu (4 * %lu dimensions)", sz, dim * 4, dim);
+    duk_push_this(ctx);
 
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("faissIdx"));
-    FaissIndex *idx = duk_get_pointer(ctx, -1);
+    idx = duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
 
     if (!idx)
-        RP_THROW(ctx, "faiss.train - Internal error getting index handle");
+        RP_THROW(ctx, "faiss.addFp32 - Internal error getting index handle");
 
-    const char *err = NULL;
-    if (faiss_add_one(idx, id, v, (int)dim, &err) == -1)
+
+    err = NULL;
+    id = _add_one(idx, id, v, sz, &err);
+
+    if (id == -1)
         RP_THROW(ctx, "addFp32 - %s", err);
 
-    return 0;
+    count = (double)faiss_Index_ntotal(idx);
+
+    duk_get_prop_string(ctx, -1, "settings");
+    duk_push_number(ctx, count);
+    put_prop_readonly(ctx, -2, "count");
+
+    duk_push_number(ctx, (double)id);
+
+    return 1;
+
 }
 
 static duk_ret_t add_fp16(duk_context *ctx)
 {
     duk_size_t sz;
-    duk_size_t dim;
     idx_t id;
-    
+    const char *err = NULL;
+    double count = 0;
+    FaissIndex *idx = NULL;
+    const uint16_t *v16;
+    float *v=NULL;
+
     if(duk_is_string(ctx, 0))
     {
         char *endptr;
@@ -2384,39 +2408,39 @@ static duk_ret_t add_fp16(duk_context *ctx)
     else
     {
         double d = REQUIRE_NUMBER(ctx, 0, "addFp16 requires a positive integer (id) as its first argument");
-        if (d < 0.0)
-            RP_THROW(ctx, "addFp16 requires a positive integer (id) as its first argument");
         id = (idx_t) d;
     }
 
-    const uint16_t *v16 = REQUIRE_BUFFER_DATA(ctx, 1, &sz, "addFp16 requires a buffer as its second argument");
+    v16 = REQUIRE_BUFFER_DATA(ctx, 1, &sz, "addFp16 requires a buffer as its second argument");
 
     duk_push_this(ctx);
-    duk_get_prop_string(ctx, -1, "settings");
-    duk_get_prop_string(ctx, -1, "faissDim");
-    dim = (duk_size_t)duk_get_int(ctx, -1);
-    duk_pop_2(ctx);
-
-    if (sz / 2 != dim)
-        RP_THROW(ctx, "addFp32 - buffer is %lu long, should be %lu (2 * %lu dimensions)", sz, dim * 2, dim);
 
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("faissIdx"));
-    FaissIndex *idx = duk_get_pointer(ctx, -1);
+    idx = duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
 
     if (!idx)
-        RP_THROW(ctx, "faiss.addFp32 - Internal error getting index handle");
+        RP_THROW(ctx, "faiss.addFp16 - Internal error getting index handle");
 
-    float *v = vec_fp16_to_fp32(v16, (size_t)dim);
+    v = vec_fp16_to_fp32(v16, (size_t)sz/2);
 
-    const char *err = NULL;
-    if (faiss_add_one(idx, id, v, (int)dim, &err) == -1)
+    id = _add_one(idx, id, v, sz*2, &err);
+    if (id == -1)
     {
         free(v);
-        RP_THROW(ctx, "faiss.addFp32 - %s", err);
+        RP_THROW(ctx, "faiss.addFp16 - %s", err);
     }
+
+    count = (double)faiss_Index_ntotal(idx);
+    duk_get_prop_string(ctx, -1, "settings");
+    duk_push_number(ctx, count);
+    put_prop_readonly(ctx, -2, "count");
+
+    duk_push_number(ctx, (double)id);
+
     free(v);
 
-    return 0;
+    return 1;
 }
 
 /* Search top-k with optional IVF/HNSW parameters.
@@ -2634,17 +2658,12 @@ static duk_ret_t add_trainvec_fp32(duk_context *ctx)
     duk_size_t dim;
     FILE *fh = NULL;
     float *v = REQUIRE_BUFFER_DATA(ctx, 0, &sz, "addTrainingFp32 requires a Buffer as an argument");
-    int nrows = 0;
 
     duk_push_this(ctx);
     duk_get_prop_string(ctx, -1, "settings");
     duk_get_prop_string(ctx, -1, "faissDim");
     dim = (duk_size_t)duk_get_int(ctx, -1);
     duk_pop_2(ctx);
-
-    duk_get_prop_string(ctx, -1, "rowsAdded");
-    nrows = duk_get_int_default(ctx, -1, 0);
-    duk_pop(ctx);
 
     if (sz / 4 != dim)
         RP_THROW(ctx, "addFp32 - buffer is %lu long, should be %lu (4 * %lu dimensions)", sz, dim * 4, dim);
@@ -2659,10 +2678,6 @@ static duk_ret_t add_trainvec_fp32(duk_context *ctx)
     if (write_vector_to_file(fh, v, dim) == -1)
         RP_THROW(ctx, "addTrainingFp32 - error writing to tmpfile - %s", strerror(errno));
 
-    nrows++;
-    duk_push_int(ctx, nrows);
-    put_prop_readonly(ctx, -2, "rowsAdded");
-
     return 0;
 }
 
@@ -2671,7 +2686,6 @@ static duk_ret_t add_trainvec_fp16(duk_context *ctx)
     duk_size_t sz;
     duk_size_t dim;
     const uint16_t *v16 = REQUIRE_BUFFER_DATA(ctx, 0, &sz, "addTrainingFp16 requires a Buffer as an argument");
-    int nrows = 0;
     FILE *fh;
 
     duk_push_this(ctx);
@@ -2679,10 +2693,6 @@ static duk_ret_t add_trainvec_fp16(duk_context *ctx)
     duk_get_prop_string(ctx, -1, "faissDim");
     dim = (duk_size_t)duk_get_int(ctx, -1);
     duk_pop_2(ctx);
-
-    duk_get_prop_string(ctx, -1, "rowsAdded");
-    nrows = duk_get_int_default(ctx, -1, 0);
-    duk_pop(ctx);
 
     if (sz / 2 != dim)
         RP_THROW(ctx, "addTrainingFp16 - buffer is %lu long, should be %lu (2 * %lu dimensions)", sz, dim * 2, dim);
@@ -2700,10 +2710,6 @@ static duk_ret_t add_trainvec_fp16(duk_context *ctx)
         RP_THROW(ctx, "addTrainingFp16 - error writing to file - %s", strerror(errno));
 
     free(v);
-
-    nrows++;
-    duk_push_int(ctx, nrows);
-    put_prop_readonly(ctx, -2, "rowsAdded");
 
     return 0;
 }
@@ -2766,14 +2772,7 @@ static duk_ret_t dotrain(duk_context *ctx)
     duk_get_prop_string(ctx, -1, "settings");
     duk_get_prop_string(ctx, -1, "faissDim");
     dim = (duk_size_t)duk_get_int(ctx, -1);
-    duk_pop(ctx);
-
-    duk_get_prop_string(ctx, -1, "rowsAdded");
-    nrows = duk_get_int_default(ctx, -1, 0);
     duk_pop_2(ctx);
-
-    if (!nrows)
-        RP_THROW(ctx, "faiss.train - no vectors have been added yet");
 
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("fh"));
     fh = duk_get_pointer(ctx, -1);
@@ -2803,13 +2802,18 @@ static duk_ret_t dotrain(duk_context *ctx)
         RP_THROW(ctx, "faiss.train - Internal error - cannot stat training file");
     }
 
-    off_t need_bytes = (off_t)nrows * (off_t)dim * sizeof(float);
+    if( st.st_size % (off_t)dim * sizeof(float) )
+    {
+        RP_THROW(ctx, "faiss.train - Training file is not expected size ( size(%lu) % (dim * 4) != 0)", st.st_size);
+    }
+    nrows = (int)(st.st_size / ((off_t)dim * sizeof(float)));
 
-    if ((off_t)need_bytes != st.st_size)
-        RP_THROW(ctx, "faiss.train - Internal error - Training file is not expected size (wanted:%lu vs have:%lu)",
-            (size_t)need_bytes, (size_t)st.st_size);
+    if (!nrows)
+    {
+        RP_THROW(ctx, "faiss.train - no vectors have been added yet");
+    }
 
-    void *addr = mmap(NULL, need_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+    void *addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (addr == MAP_FAILED)
     {
         RP_THROW(ctx, "faiss.train - Internal error - cannot load training file - %s",
@@ -2824,11 +2828,11 @@ static duk_ret_t dotrain(duk_context *ctx)
     if (rc != 0)
     {
         const char *err = faiss_get_last_error();
-        munmap(addr, need_bytes);
+        munmap(addr, st.st_size);
         RP_THROW(ctx, "faiss.train - training failed: %s", err);
     }
 
-    if (munmap(addr, need_bytes) != 0)
+    if (munmap(addr, st.st_size) != 0)
     {
         fprintf(stderr, "faiss.train - training completed, but internal error in munmap: %s\n", strerror(errno));
         return 0;
@@ -2836,6 +2840,8 @@ static duk_ret_t dotrain(duk_context *ctx)
 
     return 0;
 }
+
+// TODO: close filehandle in a finalizer
 
 static duk_ret_t new_trainer(duk_context *ctx)
 {
@@ -2856,6 +2862,7 @@ static duk_ret_t new_trainer(duk_context *ctx)
             RP_THROW(ctx, "faiss.trainer - can't open path '%s': %s", trainpath, strerror(errno));
         if(stat(trainpath, &st) != 0)
             RP_THROW(ctx, "faiss.trainer - error: stat path '%s': %s", trainpath, strerror(errno));
+        strncpy(trainfile, trainpath, PATH_MAX);
     }
     else
     {
@@ -2908,7 +2915,7 @@ static duk_ret_t new_trainer(duk_context *ctx)
         }
 
         duk_push_int(ctx, (int)(st.st_size/vsize));
-        duk_put_prop_string(ctx, -2, "rowsAdded");
+        put_prop_readonly(ctx, -2, "loadedRows");
     }
     duk_put_prop_string(ctx, -2, "settings");
 
@@ -2933,35 +2940,29 @@ static duk_ret_t new_trainer(duk_context *ctx)
 
 /* end training */
 
-static void load_index(const char *fname, FaissIndex **out, const char **err)
+static void load_index(const char *fname, FaissIndex **out, const char **err, int ro)
 {
+    int flags = ro ? FAISS_IO_FLAG_MMAP | FAISS_IO_FLAG_READ_ONLY : 0;
+
     if (access(fname, R_OK) != 0)
     {
         *out = NULL;
         *err = "Could not access file";
     }
-    if (faiss_read_index_fname(fname, 0, out) != 0)
+    if (faiss_read_index_fname(fname, flags, out) != 0)
     {
         *out = NULL;
         *err = faiss_get_last_error();
     };
 }
 
-static void openidx_fromfile(duk_context *ctx, const char *fname, int addextras)
+FaissIndexType faiss_detect_type(FaissIndex* idx, int* pqM, int* pqBits, int *mapped);
+
+static void push_faiss_obj(duk_context *ctx, FaissIndex *idx, FaissMetricType mtype, int dim, double rows)
 {
-
-    FaissIndexType type = FAISS_INDEX_FLAT;
-    int dim = 1024;
-    FaissMetricType mtype = METRIC_INNER_PRODUCT;
-
-    const char *type_str = "Flat";
-    const char *mtype_str = "innerProduct";
-
-    FaissIndex *idx = NULL;
-    const char *err = NULL;
-    load_index(fname, &idx, &err);
-    if (!idx)
-        RP_THROW(ctx, "faiss open error: %s", err);
+    const char *mtype_str = "innerProduct", *type_str="Unknown";
+    int pqm, pqb, mapped;
+    FaissIndexType type = faiss_detect_type(idx, &pqm, &pqb, &mapped);
 
     switch (type)
     {
@@ -3048,19 +3049,49 @@ static void openidx_fromfile(duk_context *ctx, const char *fname, int addextras)
     duk_push_pointer(ctx, idx);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissIdx"));
 
-    duk_push_int(ctx, (int)type);
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissType"));
+    duk_push_int(ctx, get_thread_num());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("thread_num"));
+
+    //duk_push_int(ctx, (int)type);
+    //duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissType"));
 
     duk_push_object(ctx); // settings
 
     duk_push_int(ctx, dim);
     put_prop_readonly(ctx, -2, "faissDim");
 
-    duk_push_string(ctx, type_str);
-    put_prop_readonly(ctx, -2, "faissType");
+    duk_push_number(ctx, rows);
+    put_prop_readonly(ctx, -2, "count");
+
+    //duk_push_string(ctx, type_str);
+    //put_prop_readonly(ctx, -2, "faissType");
 
     duk_push_string(ctx, mtype_str);
     put_prop_readonly(ctx, -2, "faissMtype");
+
+    duk_push_string(ctx, type_str);
+    put_prop_readonly(ctx, -2, "faissType");
+
+    if(pqm)
+    {
+        duk_push_int(ctx, pqm);
+        put_prop_readonly(ctx, -2, "PQm");
+    }
+
+    if(pqb)
+    {
+        duk_push_int(ctx, pqb);
+        put_prop_readonly(ctx, -2, "PQbits");
+    }
+
+    if(mapped)
+    {
+        if(mapped==2)
+            duk_push_string(ctx, "IDMap2");
+        else
+            duk_push_string(ctx, "IDMap");
+        put_prop_readonly(ctx, -2, "map");
+    }
 
     put_prop_readonly(ctx, -2, "settings");
 
@@ -3088,13 +3119,6 @@ static void openidx_fromfile(duk_context *ctx, const char *fname, int addextras)
     }
 }
 
-static duk_ret_t faiss_openidx_fromfile(duk_context *ctx)
-{
-    const char *fname = REQUIRE_STRING(ctx, 0, "faiss.openIndexFromFile - argument must be a String (filename)");
-    openidx_fromfile(ctx, fname, 1);
-    return 1;
-}
-
 // https://github.com/facebookresearch/faiss/wiki/The-index-factory
 static duk_ret_t faiss_open_factory(duk_context *ctx)
 {
@@ -3103,9 +3127,6 @@ static duk_ret_t faiss_open_factory(duk_context *ctx)
     int dim =
         REQUIRE_UINT(ctx, 1, "faiss.openFactory - second argument must be a Positive Integer (vector dimensions)");
     const char *mtype_str = NULL;
-    char fn[256];
-    pid_t pid = getpid();
-    int thrno = get_thread_num();
     FaissIndex *idx;
     FaissMetricType mtype = METRIC_INNER_PRODUCT;
 
@@ -3118,7 +3139,6 @@ static duk_ret_t faiss_open_factory(duk_context *ctx)
         if (strcasecmp(mtype_str, "innerProduct") == 0 || strcasecmp(mtype_str, "ip") == 0)
         {
             mtype = METRIC_INNER_PRODUCT;
-            mtype_str = "innerProduct";
         }
         else if (strcasecmp(mtype_str, "l2") == 0)
         {
@@ -3128,12 +3148,10 @@ static duk_ret_t faiss_open_factory(duk_context *ctx)
                  strcasecmp(mtype_str, "cityBlock") == 0)
         {
             mtype = METRIC_L1;
-            mtype_str = "l1";
         }
         else if (strcasecmp(mtype_str, "linf") == 0 || strcasecmp(mtype_str, "infinity") == 0)
         {
             mtype = METRIC_Linf;
-            mtype_str = "infinity";
         }
         else if (strcasecmp(mtype_str, "lp") == 0)
         {
@@ -3146,13 +3164,13 @@ static duk_ret_t faiss_open_factory(duk_context *ctx)
         else if (strcasecmp(mtype_str, "braycurtis") == 0)
         {
             mtype = METRIC_BrayCurtis;
-            mtype_str = "brayCurtis";
         }
         else if (strcasecmp(mtype_str, "jensenshannon") == 0)
         {
             mtype = METRIC_JensenShannon;
-            mtype_str = "jensenShannon";
         }
+        else
+            RP_THROW(ctx, "faiss.openFactory - unknown metric type '%s'", mtype_str);
     }
 
     int err = faiss_index_factory(&idx, dim, desc, mtype);
@@ -3162,19 +3180,38 @@ static duk_ret_t faiss_open_factory(duk_context *ctx)
         RP_THROW(ctx, "Index creation failed for desc='%s': %s", desc, errmsg ? errmsg : "unknown error");
     }
 
-    snprintf(fn, 256, "/tmp/tmpind_%d_%d", (int)pid, thrno);
+    push_faiss_obj(ctx, idx, mtype, dim, 0.0);
 
-    int rc = faiss_write_index_fname(idx, fn);
-
-    if (rc)
-        RP_THROW(ctx, "faiss.openFactory - Internal error: Failed to save temp file '%s' - %s", fn,
-                 faiss_get_last_error());
-
-    openidx_fromfile(ctx, fn, 0);
-
-    unlink(fn);
     return 1;
 }
+
+static duk_ret_t faiss_openidx_fromfile(duk_context *ctx)
+{
+    const char *fname = REQUIRE_STRING(ctx, 0, "faiss.openIndexFromFile - argument must be a String (filename)");
+    int ro = 0;
+    int dim = 0;
+    double rows = 0.0;
+    FaissMetricType mtype = METRIC_INNER_PRODUCT;
+    FaissIndex *idx = NULL;
+    const char *err = NULL;
+    
+    if(!duk_is_undefined(ctx,1))
+        ro = REQUIRE_BOOL(ctx, 1, "faiss.openIndexFromFile - Second argument, if defined, must be a Boolean (open readonly w memmap)");
+
+    load_index(fname, &idx, &err, ro);
+
+    if (!idx)
+        RP_THROW(ctx, "faiss.openIndexFromFile - %s", err);
+
+    dim = faiss_Index_d(idx);
+    mtype = faiss_Index_metric_type(idx);
+    rows = (double)faiss_Index_ntotal(idx);
+
+    push_faiss_obj(ctx, idx, mtype, dim, rows);
+
+    return 1;
+}
+
 
 static void open_faiss(duk_context *ctx)
 {
@@ -3183,7 +3220,7 @@ static void open_faiss(duk_context *ctx)
     duk_push_c_function(ctx, faiss_open_factory, 3);
     duk_put_prop_string(ctx, -2, "openFactory");
 
-    duk_push_c_function(ctx, faiss_openidx_fromfile, 1);
+    duk_push_c_function(ctx, faiss_openidx_fromfile, 2);
     duk_put_prop_string(ctx, -2, "openIndexFromFile");
 }
 

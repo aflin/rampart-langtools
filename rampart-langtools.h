@@ -29,7 +29,7 @@ extern "C" {
 typedef struct FaissIndex_H        FaissIndex;
 typedef struct FaissIndexBinary_H  FaissIndexBinary;
 
-FaissIndexType faiss_load_and_detect_type(const char* filename, FaissIndex** idx, int* pqM, int* pqBits);
+FaissIndexType faiss_detect_type(FaissIndex* idx, int* pqM, int* pqBits, int *mapped);
 
 #ifdef __cplusplus
 }

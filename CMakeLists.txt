@@ -161,6 +161,7 @@ endfunction()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 add_library(rampart-langtools SHARED
+    faiss_detect.cpp
     rampart-langtools.c
 )
 
