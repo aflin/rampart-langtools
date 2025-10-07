@@ -269,7 +269,7 @@ if(APPLE)
   find_libraries_in_dirs(LLAMA_FOUND_LIBS FILES ${LLAMA_LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
 
   set(FAISS_LIB_FILES
-    llibomp.a
+    libomp.a
   )
 
   find_libraries_in_dirs(FAISS_FOUND_LIBS FILES ${FAISS_LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
@@ -298,22 +298,31 @@ if(APPLE)
   target_link_options(rampart-langtools PRIVATE
     "-Wl,-headerpad_max_install_names"
     "-Wl,-undefined,dynamic_lookup"
-    # install_name sets the “where to load me from at runtime”; use @rpath to respect the RPATH above
     "-Wl,-install_name,@rpath/rampart-langtools.so"
   )
 
   target_link_options(rampart-llamacpp PRIVATE
     "-Wl,-headerpad_max_install_names"
     "-Wl,-undefined,dynamic_lookup"
-    # install_name sets the “where to load me from at runtime”; use @rpath to respect the RPATH above
     "-Wl,-install_name,@rpath/rampart-llamacpp.so"
   )
 
   target_link_options(rampart-faiss PRIVATE
     "-Wl,-headerpad_max_install_names"
     "-Wl,-undefined,dynamic_lookup"
-    # install_name sets the “where to load me from at runtime”; use @rpath to respect the RPATH above
     "-Wl,-install_name,@rpath/rampart-faiss.so"
+  )
+
+  target_link_options(rampart-sentencepiece PRIVATE
+    "-Wl,-headerpad_max_install_names"
+    "-Wl,-undefined,dynamic_lookup"
+    "-Wl,-install_name,@rpath/rampart-sentencepiece.so"
+  )
+
+  target_link_options(rampart-vecutils PRIVATE
+    "-Wl,-headerpad_max_install_names"
+    "-Wl,-undefined,dynamic_lookup"
+    "-Wl,-install_name,@rpath/rampart-vecutils.so"
   )
 
   # Frameworks
