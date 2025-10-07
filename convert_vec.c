@@ -168,7 +168,6 @@ float *vec_fp16_to_fp32_buf(const uint16_t *src, float *dst, size_t n)
 
 float *vec_fp16_to_fp32_buf(const uint16_t *src, float *dst, size_t n)
 {
-    float *dst = (float *)malloc(n * sizeof(float));
     if (!dst)
         return NULL;
 
@@ -289,10 +288,11 @@ float *vec_fp16_to_fp32(const uint16_t *src, size_t n)
 
 /* ---------- Per-ISA implementations (static) ---------- */
 
-#if (defined(__aarch64__) || defined(__ARM_NEON)) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#if (defined(__aarch64__) || defined(__ARM_NEON))
 static void vec_fp32_to_fp16_buf(const float *src, uint16_t *dst, size_t n)
 {
     size_t i = 0;
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
     for (; i + 4 <= n; i += 4)
     {
         float32x4_t f32 = vld1q_f32(src + i);
@@ -300,6 +300,7 @@ static void vec_fp32_to_fp16_buf(const float *src, uint16_t *dst, size_t n)
         uint16x4_t u16 = vreinterpret_u16_f16(h4);
         vst1_u16(dst + i, u16);
     }
+#endif
     for (; i < n; ++i)
         dst[i] = fp32_to_fp16_scalar(src[i]);
 }
