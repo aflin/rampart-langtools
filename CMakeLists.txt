@@ -82,6 +82,29 @@ set(LIBS
     -lm
 )
 
+set(LLAMA_LIBS
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/common/libcommon.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/src/libllama.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml-cpu.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml-base.a
+    -lpthread
+    -lm
+)
+
+set(FAISS_LIBS
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/faiss/c_api/libfaiss_c.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/faiss/faiss/libfaiss.a
+    -lpthread
+    -lm
+)
+
+set(SP_LIBS
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/sentencepiece/src/libsentencepiece.a
+    spm_c_wrapper_obj
+    -lpthread
+)
+
 #Simple helper to find files
 function(find_library_in_dirs OUTVAR FILENAME)
     set(dirs ${ARGN})
@@ -159,19 +182,38 @@ function(find_libraries_in_dirs OUT_LIST_VAR)
     set(${OUT_LIST_VAR} "${_found_list}" PARENT_SCOPE)
 endfunction()
 
+# The big one
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 add_library(rampart-langtools SHARED
     faiss_detect.cpp
     rampart-langtools.c
 )
 
+# llama.cpp
+add_library(rampart-llamacpp SHARED
+    rampart-llamacpp.c
+)
 
+# faiss
+add_library(rampart-faiss SHARED
+    faiss_detect.cpp
+    rampart-faiss.c
+)
 
+# sentencepiece
+add_library(rampart-sentencepiece SHARED
+    rampart-sentencepiece.c
+)
 
+# sentencepiece
+add_library(rampart-vecutils SHARED
+    rampart-vecutils.c
+)
 
 if(LT_ENABLE_GPU)
     target_compile_definitions(rampart-langtools PRIVATE LT_ENABLE_GPU=1)
 endif()
+
 
 if(APPLE)
 
@@ -219,8 +261,18 @@ if(APPLE)
     libomp.a
     libcurl.tbd
   )
-
   find_libraries_in_dirs(FOUND_LIBS FILES ${LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
+
+  set(LLAMA_LIB_FILES
+    libcurl.tbd
+  )
+  find_libraries_in_dirs(LLAMA_FOUND_LIBS FILES ${LLAMA_LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
+
+  set(FAISS_LIB_FILES
+    llibomp.a
+  )
+
+  find_libraries_in_dirs(FAISS_FOUND_LIBS FILES ${FAISS_LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
 
   if(LT_ENABLE_GPU)
     list(APPEND LIBS
@@ -228,9 +280,18 @@ if(APPLE)
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-metal/libggml-metal.a
     )
+    list(APPEND LLAMA_LIBS
+          ${LLAMA_FOUND_LIBS}
+          ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
+          ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-metal/libggml-metal.a
+    )
   else()
     list(APPEND LIBS
           ${FOUND_LIBS}
+          ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
+    )
+    list(APPEND LLAMA_LIBS
+          ${LLAMA_FOUND_LIBS}
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
     )
   endif()
@@ -241,11 +302,35 @@ if(APPLE)
     "-Wl,-install_name,@rpath/rampart-langtools.so"
   )
 
-  # Frameworks (do NOT stuff these into global linker flags)
+  target_link_options(rampart-llamacpp PRIVATE
+    "-Wl,-headerpad_max_install_names"
+    "-Wl,-undefined,dynamic_lookup"
+    # install_name sets the “where to load me from at runtime”; use @rpath to respect the RPATH above
+    "-Wl,-install_name,@rpath/rampart-llamacpp.so"
+  )
+
+  target_link_options(rampart-faiss PRIVATE
+    "-Wl,-headerpad_max_install_names"
+    "-Wl,-undefined,dynamic_lookup"
+    # install_name sets the “where to load me from at runtime”; use @rpath to respect the RPATH above
+    "-Wl,-install_name,@rpath/rampart-faiss.so"
+  )
+
+  # Frameworks
   target_link_libraries(rampart-langtools PRIVATE
     "-framework Foundation"
     "-framework Metal"
     "-framework MetalKit"
+    "-framework Accelerate"
+  )
+  target_link_libraries(rampart-llamacpp PRIVATE
+    "-framework Foundation"
+    "-framework Metal"
+    "-framework MetalKit"
+    "-framework Accelerate"
+  )
+  target_link_libraries(rampart-faiss PRIVATE
+    "-framework Foundation"
     "-framework Accelerate"
   )
 
@@ -258,8 +343,10 @@ else()
     /usr/lib
     /usr/lib64
     /usr/local/lib
-    /usr/lib/x86_64-linux-gnu/
-    /usr/lib/i386-linux-gnu/
+    /usr/lib/x86_64-linux-gnu
+    /usr/lib/i386-linux-gnu
+    /usr/lib/aarch64-linux-gnu
+    /usr/lib/arm-linux-gnueabihf
   )
 
   if(LT_ENABLE_GPU)
@@ -286,15 +373,34 @@ else()
       ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-cuda/libggml-cuda.a
       ${FOUND_LIBS}
     )
+    list(APPEND LLAMA_LIBS
+      ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-cuda/libggml-cuda.a
+      ${FOUND_LIBS}
+    )
   else()
     list(APPEND LIBS
       ${FOUND_LIBS}
     )
+    list(APPEND LLAMA_LIBS
+      ${FOUND_LIBS}
+    )
+    list(APPEND FAISS_LIBS
+      ${FOUND_LIBS}
+    )
   endif()
 
-  set(CMAKE_SHARED_LINKER_FLAGS
-    "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-soname,rampart-langtools.so"
+  target_link_options(rampart-langtools PRIVATE
+    "-Wl,-soname,@rpath/rampart-langtools.so"
   )
+
+  target_link_options(rampart-llamacpp PRIVATE
+    "-Wl,-soname,@rpath/rampart-llamacpp.so"
+  )
+
+  target_link_options(rampart-faiss PRIVATE
+    "-Wl,-soname,@rpath/rampart-faiss.so"
+  )
+
   ## OLD LINUX
   include(CheckCXXSourceCompiles)
 
@@ -320,12 +426,14 @@ else()
       check_cxx_source_compiles("${FS_TEST_SRC}" HAS_FS_STDCXXFS)
       if (HAS_FS_STDCXXFS)
           list(APPEND LIBS stdc++fs)
+          list(APPEND LLAMA_LIBS stdc++fs)
       else()
           # Try libc++fs (older Clang+libc++)
           set(CMAKE_REQUIRED_LIBRARIES c++fs)
           check_cxx_source_compiles("${FS_TEST_SRC}" HAS_FS_CXXFS)
           if (HAS_FS_CXXFS)
               list(APPEND LIBS stdc++fs)
+              list(APPEND LLAMA_LIBS stdc++fs)
           else()
               message(FATAL_ERROR "C++17 <filesystem> not available on this toolchain.")
           endif()
@@ -339,6 +447,30 @@ endif()
 
 set_target_properties(
     rampart-langtools
+    PROPERTIES SUFFIX ".so"
+    PREFIX ""
+)
+
+set_target_properties(
+    rampart-llamacpp
+    PROPERTIES SUFFIX ".so"
+    PREFIX ""
+)
+
+set_target_properties(
+    rampart-faiss
+    PROPERTIES SUFFIX ".so"
+    PREFIX ""
+)
+
+set_target_properties(
+    rampart-sentencepiece
+    PROPERTIES SUFFIX ".so"
+    PREFIX ""
+)
+
+set_target_properties(
+    rampart-vecutils
     PROPERTIES SUFFIX ".so"
     PREFIX ""
 )
@@ -368,10 +500,19 @@ if("${LT_ENABLE_GPU}" STREQUAL "${LT_ENABLE_GPU_LAST}")
       faiss
       faiss_c
     )
+    add_dependencies(rampart-faiss
+      faiss
+      faiss_c
+    )
   endif()
 
   if(NOT EXISTS "${LLAMA_LIB}" OR NOT EXISTS "${GGML_LIB}")
     add_dependencies(rampart-langtools
+      llama
+      common
+      ggml
+    )
+    add_dependencies(rampart-llamacpp
       llama
       common
       ggml
@@ -400,6 +541,13 @@ else()
     faiss
     faiss_c
   )
+
+  add_dependencies(rampart-llamacpp
+    llama
+    common
+    ggml
+  )
+
 endif()
 
 
@@ -410,9 +558,23 @@ set(LT_ENABLE_GPU_LAST "${LT_ENABLE_GPU}" CACHE INTERNAL "Previous value of LT_E
 # Link with all libs
 target_link_libraries(rampart-langtools PRIVATE ${LIBS})
 
+# Link with selected libs
+target_link_libraries(rampart-llamacpp PRIVATE
+    ${LLAMA_LIBS}
+    stdc++
+)
+
+# Link with selected libs
+target_link_libraries(rampart-faiss PRIVATE ${FAISS_LIBS})
+
+target_link_libraries(rampart-sentencepiece PRIVATE  
+    ${SP_LIBS}
+)
+
 install(TARGETS rampart-langtools
   DESTINATION "${RP_PATH}/modules"
 )
 
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-langtools.so\")")
+install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llamacpp.so\")")
 
