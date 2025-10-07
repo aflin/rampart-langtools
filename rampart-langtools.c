@@ -2532,7 +2532,7 @@ static idx_t *faiss_search_topk_ids_params(FaissIndex *idx, const float *q, /* q
 static void do_search_(duk_context *ctx, const float *v, size_t dim, int is16)
 {
     duk_uarridx_t aidx = 0;
-    idx_t i = 0, k = 10;
+    idx_t i = 0, k = 10, np=0;
     const char *fname = "searchFp32";
 
     if (is16)
@@ -2541,6 +2541,9 @@ static void do_search_(duk_context *ctx, const float *v, size_t dim, int is16)
     if (!duk_is_undefined(ctx, 1))
         k = (idx_t)REQUIRE_UINT(ctx, 1, "%s requires a positive integer (nResults) as its second argument", fname);
 
+    if (!duk_is_undefined(ctx, 2))
+        np = (idx_t)REQUIRE_UINT(ctx, 2, "%s requires a positive integer (nProbe for IVF) as its third argument", fname);
+
     // this is still at -1
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("faissIdx"));
     FaissIndex *idx = duk_get_pointer(ctx, -1);
@@ -2548,7 +2551,7 @@ static void do_search_(duk_context *ctx, const float *v, size_t dim, int is16)
     const char *err = NULL;
     float *distances = NULL;
 
-    idx_t *ids = faiss_search_topk_ids_params(idx, v, k, 0, &distances, &err);
+    idx_t *ids = faiss_search_topk_ids_params(idx, v, k, np, &distances, &err);
 
     if (err)
         RP_THROW(ctx, "%s - Error: %s", fname, err);
@@ -2582,7 +2585,7 @@ static duk_ret_t do_search_fp16(duk_context *ctx)
 
     duk_push_this(ctx);
     duk_get_prop_string(ctx, -1, "settings");
-    duk_get_prop_string(ctx, -1, "faissDim");
+    duk_get_prop_string(ctx, -1, "dimension");
     dim = (duk_size_t)duk_get_int(ctx, -1);
     duk_pop_2(ctx);
 
@@ -2606,7 +2609,7 @@ static duk_ret_t do_search_fp32(duk_context *ctx)
 
     duk_push_this(ctx);
     duk_get_prop_string(ctx, -1, "settings");
-    duk_get_prop_string(ctx, -1, "faissDim");
+    duk_get_prop_string(ctx, -1, "dimension");
     dim = (duk_size_t)duk_get_int(ctx, -1);
     duk_pop_2(ctx);
 
@@ -2661,7 +2664,7 @@ static duk_ret_t add_trainvec_fp32(duk_context *ctx)
 
     duk_push_this(ctx);
     duk_get_prop_string(ctx, -1, "settings");
-    duk_get_prop_string(ctx, -1, "faissDim");
+    duk_get_prop_string(ctx, -1, "dimension");
     dim = (duk_size_t)duk_get_int(ctx, -1);
     duk_pop_2(ctx);
 
@@ -2690,7 +2693,7 @@ static duk_ret_t add_trainvec_fp16(duk_context *ctx)
 
     duk_push_this(ctx);
     duk_get_prop_string(ctx, -1, "settings");
-    duk_get_prop_string(ctx, -1, "faissDim");
+    duk_get_prop_string(ctx, -1, "dimension");
     dim = (duk_size_t)duk_get_int(ctx, -1);
     duk_pop_2(ctx);
 
@@ -2770,7 +2773,7 @@ static duk_ret_t dotrain(duk_context *ctx)
     */
 
     duk_get_prop_string(ctx, -1, "settings");
-    duk_get_prop_string(ctx, -1, "faissDim");
+    duk_get_prop_string(ctx, -1, "dimension");
     dim = (duk_size_t)duk_get_int(ctx, -1);
     duk_pop_2(ctx);
 
@@ -2802,7 +2805,7 @@ static duk_ret_t dotrain(duk_context *ctx)
         RP_THROW(ctx, "faiss.train - Internal error - cannot stat training file");
     }
 
-    if( st.st_size % (off_t)dim * sizeof(float) )
+    if( st.st_size % ((off_t)dim * sizeof(float)) )
     {
         RP_THROW(ctx, "faiss.train - Training file is not expected size ( size(%lu) % (dim * 4) != 0)", st.st_size);
     }
@@ -2862,7 +2865,7 @@ static duk_ret_t new_trainer(duk_context *ctx)
             RP_THROW(ctx, "faiss.trainer - can't open path '%s': %s", trainpath, strerror(errno));
         if(stat(trainpath, &st) != 0)
             RP_THROW(ctx, "faiss.trainer - error: stat path '%s': %s", trainpath, strerror(errno));
-        strncpy(trainfile, trainpath, PATH_MAX);
+        strncpy(trainfile, trainpath, PATH_MAX-1);
     }
     else
     {
@@ -2882,7 +2885,7 @@ static duk_ret_t new_trainer(duk_context *ctx)
         }
         else if (S_ISREG(st.st_mode))
         {
-            strncpy(trainfile, trainpath, PATH_MAX);
+            strncpy(trainfile, trainpath, PATH_MAX-1);
         }
         else
             RP_THROW(ctx, "faiss.trainer - path '%s' is something not a file or directory", trainpath);
@@ -2904,7 +2907,7 @@ static duk_ret_t new_trainer(duk_context *ctx)
     if(S_ISREG(st.st_mode))
     {
         duk_size_t vsize=0;
-        duk_get_prop_string(ctx, -1, "faissDim");
+        duk_get_prop_string(ctx, -1, "dimension");
         vsize = 4 * (duk_size_t)duk_get_int(ctx, -1);
         duk_pop(ctx);
         //check file against dim and set rows
@@ -2943,7 +2946,6 @@ static duk_ret_t new_trainer(duk_context *ctx)
 static void load_index(const char *fname, FaissIndex **out, const char **err, int ro)
 {
     int flags = ro ? FAISS_IO_FLAG_MMAP | FAISS_IO_FLAG_READ_ONLY : 0;
-
     if (access(fname, R_OK) != 0)
     {
         *out = NULL;
@@ -3053,24 +3055,24 @@ static void push_faiss_obj(duk_context *ctx, FaissIndex *idx, FaissMetricType mt
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("thread_num"));
 
     //duk_push_int(ctx, (int)type);
-    //duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissType"));
+    //duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("type"));
 
     duk_push_object(ctx); // settings
 
     duk_push_int(ctx, dim);
-    put_prop_readonly(ctx, -2, "faissDim");
+    put_prop_readonly(ctx, -2, "dimension");
 
     duk_push_number(ctx, rows);
     put_prop_readonly(ctx, -2, "count");
 
     //duk_push_string(ctx, type_str);
-    //put_prop_readonly(ctx, -2, "faissType");
+    //put_prop_readonly(ctx, -2, "type");
 
     duk_push_string(ctx, mtype_str);
-    put_prop_readonly(ctx, -2, "faissMtype");
+    put_prop_readonly(ctx, -2, "metricType");
 
     duk_push_string(ctx, type_str);
-    put_prop_readonly(ctx, -2, "faissType");
+    put_prop_readonly(ctx, -2, "type");
 
     if(pqm)
     {
@@ -3104,10 +3106,10 @@ static void push_faiss_obj(duk_context *ctx, FaissIndex *idx, FaissMetricType mt
     duk_push_c_function(ctx, save_index, 1);
     duk_put_prop_string(ctx, -2, "save");
 
-    duk_push_c_function(ctx, do_search_fp16, 2);
+    duk_push_c_function(ctx, do_search_fp16, 3);
     duk_put_prop_string(ctx, -2, "searchFp16");
 
-    duk_push_c_function(ctx, do_search_fp32, 2);
+    duk_push_c_function(ctx, do_search_fp32, 3);
     duk_put_prop_string(ctx, -2, "searchFp32");
 
     if (!faiss_Index_is_trained(idx))

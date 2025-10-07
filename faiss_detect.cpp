@@ -29,8 +29,8 @@ static const faiss::Index* unwrap_wrappers(const faiss::Index* idx, int *mapped)
     using namespace faiss;
     *mapped=0;
     for (int i = 0; i < 8 && idx; ++i) {
-        if (auto m  = dynamic_cast<const IndexIDMap*>(idx))        { idx = m->index; *mapped = 1; continue; }
         if (auto m2 = dynamic_cast<const IndexIDMap2*>(idx))       { idx = m2->index;*mapped = 2; continue; }
+        if (auto m  = dynamic_cast<const IndexIDMap*>(idx))        { idx = m->index; *mapped = 1; continue; }
         if (auto rf = dynamic_cast<const IndexRefineFlat*>(idx))   { idx = rf->base_index; continue; }
         if (auto pt = dynamic_cast<const IndexPreTransform*>(idx)) { idx = pt->index; continue; }
         /*
@@ -59,6 +59,26 @@ static FaissIndexType map_dense_index(const faiss::Index* idx, int* pqM, int* pq
     // IVF families
     if (dynamic_cast<const IndexIVFFlat*>(idx))         return FAISS_INDEX_IVFFLAT;
     if (dynamic_cast<const IndexScalarQuantizer*>(idx)) return FAISS_INDEX_IVFSCALAR;
+
+    if (auto ivf = dynamic_cast<const IndexIVF*>(idx)) {
+        // Distinguish by code_size pattern
+        const size_t d = (size_t)idx->d;
+        const size_t cs = (size_t)ivf->code_size;
+
+        // IVFFlat stores raw float vectors (4 bytes each)
+        if (cs == 4 * d) {
+            return FAISS_INDEX_IVFFLAT;
+        }
+        // Scalar-quantized IVF: SQ8 -> d bytes; SQ4 -> ceil(d/2) bytes, etc.
+        // (Covers IVF...,SQ8 and IVF...,SQ4 variants even if RTTI cast failed)
+        if (cs == d || cs == (d + 1) / 2 || cs < 4 * d) {
+            // We can’t know residual flag here; default to non-residual.
+            // If you must detect residual vs non-residual, keep the dynamic_cast path above.
+            return FAISS_INDEX_IVFSCALAR;
+        }
+        // Otherwise assume PQ-like if not flat and not scalar-sized
+        return FAISS_INDEX_IVFPQ;
+    }
 
     // PQ-bearing families: fill pqM/pqBits
     if (auto p = dynamic_cast<const IndexIVFPQ*>(idx)) {
