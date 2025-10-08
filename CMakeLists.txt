@@ -583,7 +583,22 @@ target_link_libraries(rampart-sentencepiece PRIVATE
 install(TARGETS rampart-langtools
   DESTINATION "${RP_PATH}/modules"
 )
+install(TARGETS rampart-llamacpp
+  DESTINATION "${RP_PATH}/modules"
+)
+install(TARGETS rampart-faiss
+  DESTINATION "${RP_PATH}/modules"
+)
+install(TARGETS rampart-sentencepiece
+  DESTINATION "${RP_PATH}/modules"
+)
+install(TARGETS rampart-vecutils
+  DESTINATION "${RP_PATH}/modules"
+)
 
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-langtools.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llamacpp.so\")")
+install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-faiss.so\")")
+install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-sentencepiece.so\")")
+install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-vecutils.so\")")
 
