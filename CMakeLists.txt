@@ -533,6 +533,11 @@ if("${LT_ENABLE_GPU}" STREQUAL "${LT_ENABLE_GPU_LAST}")
       sentencepiece
     )
   endif()
+  if(NOT EXISTS "${SP_LIB}")
+    add_dependencies(rampart-sentencepiece
+      sentencepiece
+    )
+  endif()
 else()
   # build/rebuild from scratch
   if(NOT "${LT_ENABLE_GPU_LAST}" STREQUAL "unset")
@@ -555,6 +560,13 @@ else()
     llama
     common
     ggml
+  )
+  add_dependencies(rampart-sentencepiece
+    sentencepiece
+  )
+  add_dependencies(rampart-faiss
+    faiss
+    faiss_c
   )
 
 endif()
