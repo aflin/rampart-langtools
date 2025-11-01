@@ -16,9 +16,22 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include "llama.h"
 #include "rampart.h"
-#include "convert_vec.c"
+
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
+
+// --- CUDA availability check ---
+#if ( defined(LT_ENABLE_GPU) && !defined(__APPLE__) )
+#define HAVE_CUDA 1
+#include <cuda_runtime.h>
+#else
+#define HAVE_CUDA 0
+#endif
 
 #endif
 
@@ -825,24 +838,6 @@ static duk_ret_t gen_free(duk_context *ctx)
 }
 
 // ===================== n_ctx auto-sizer (drop-in) =====================
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-
-#include <unistd.h>
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#include <sys/types.h>
-#endif
-
-// --- CUDA availability check ---
-#if ( defined(LT_ENABLE_GPU) && !defined(__APPLE__) )
-#define HAVE_CUDA 1
-#include <cuda_runtime.h>
-#else
-#define HAVE_CUDA 0
-#endif
 
 // ---- System RAM (total/free) ----
 static inline uint64_t sys_ram_total_bytes(void)
@@ -1605,7 +1600,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     {
         // FIXME: save and retrieve options.
 
-        printf("loading new context\n");
+        //printf("loading new context\n");
         lctx = new_embed_context(ctx, lmodel, -1);
 
         duk_push_pointer(ctx, lctx);
@@ -1752,7 +1747,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
                 v[i] = emb[i] * inv;
                 avgvec[i] += v[i];
             }
-            vec_fp32_to_fp16_buf(v, out, vec_dim);
+            rpvec_f32_to_f16(v, out, vec_dim);
         }
         else if (pack == PACK32)
         {
@@ -1819,7 +1814,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
             {
                 avgvec[i] *= inv;
             }
-            vec_fp32_to_fp16_buf(avgvec, out, vec_dim);
+            rpvec_f32_to_f16(avgvec, out, vec_dim);
         }
         else if (pack == PACK32)
         {
@@ -2016,9 +2011,6 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     duk_push_c_function(ctx, llamacpp_init_gen, 2);
     duk_put_prop_string(ctx, -2, "initGen");
-
-    // duk_push_c_function(ctx, f16_to_numbers, 1);
-    // duk_put_prop_string(ctx, -2, "fp16BufToNumbers");
 
     duk_push_c_function(ctx, getlog, 0);
     duk_put_prop_string(ctx, -2, "getLog");

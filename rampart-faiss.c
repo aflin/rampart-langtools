@@ -39,8 +39,6 @@
 #include <c_api/index_factory_c.h>
 #include <c_api/index_io_c.h>
 
-#include "convert_vec.c"
-
 #endif
 
 /* **************************************************
@@ -202,7 +200,9 @@ static duk_ret_t add_fp16(duk_context *ctx)
     if (!idx)
         RP_THROW(ctx, "faiss.addFp16 - Internal error getting index handle");
 
-    v = vec_fp16_to_fp32(v16, (size_t)sz/2);
+    size_t dim = (size_t)sz/2;
+    REMALLOC(v, sizeof(float) * dim);
+    rpvec_f16_to_f32(v16, v, dim);
 
     id = _add_one(idx, id, v, sz*2, &err);
     if (id == -1)
@@ -362,6 +362,7 @@ static duk_ret_t do_search_fp16(duk_context *ctx)
     duk_size_t sz;
     duk_size_t dim;
     const uint16_t *v16 = REQUIRE_BUFFER_DATA(ctx, 0, &sz, "addFp16 requires a buffer as its first argument");
+    float *v = NULL;
 
     duk_push_this(ctx);
     duk_get_prop_string(ctx, -1, "settings");
@@ -372,7 +373,8 @@ static duk_ret_t do_search_fp16(duk_context *ctx)
     if (sz / 2 != dim)
         RP_THROW(ctx, "searchFp16 - buffer is %lu long, should be %lu (2 * %lu dimensions)", sz, dim * 2, dim);
 
-    float *v = vec_fp16_to_fp32(v16, (size_t)dim);
+    REMALLOC(v, sizeof(float) * dim);
+    rpvec_f16_to_f32(v16, v, dim);
 
     do_search_(ctx, v, dim, 1);
 
@@ -470,6 +472,7 @@ static duk_ret_t add_trainvec_fp16(duk_context *ctx)
     duk_size_t dim;
     const uint16_t *v16 = REQUIRE_BUFFER_DATA(ctx, 0, &sz, "addTrainingFp16 requires a Buffer as an argument");
     FILE *fh;
+    float *v = NULL;
 
     duk_push_this(ctx);
     duk_get_prop_string(ctx, -1, "settings");
@@ -480,7 +483,8 @@ static duk_ret_t add_trainvec_fp16(duk_context *ctx)
     if (sz / 2 != dim)
         RP_THROW(ctx, "addTrainingFp16 - buffer is %lu long, should be %lu (2 * %lu dimensions)", sz, dim * 2, dim);
 
-    float *v = vec_fp16_to_fp32(v16, (size_t)dim);
+    REMALLOC(v, sizeof(float) * dim);
+    rpvec_f16_to_f32(v16, v, dim);
 
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("fh"));
     fh = duk_get_pointer(ctx, -1);

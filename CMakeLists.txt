@@ -205,11 +205,6 @@ add_library(rampart-sentencepiece SHARED
     rampart-sentencepiece.c
 )
 
-# sentencepiece
-add_library(rampart-vecutils SHARED
-    rampart-vecutils.c
-)
-
 if(LT_ENABLE_GPU)
     target_compile_definitions(rampart-langtools PRIVATE LT_ENABLE_GPU=1)
 endif()
@@ -317,12 +312,6 @@ if(APPLE)
     "-Wl,-headerpad_max_install_names"
     "-Wl,-undefined,dynamic_lookup"
     "-Wl,-install_name,@rpath/rampart-sentencepiece.so"
-  )
-
-  target_link_options(rampart-vecutils PRIVATE
-    "-Wl,-headerpad_max_install_names"
-    "-Wl,-undefined,dynamic_lookup"
-    "-Wl,-install_name,@rpath/rampart-vecutils.so"
   )
 
   # Frameworks
@@ -478,12 +467,6 @@ set_target_properties(
     PREFIX ""
 )
 
-set_target_properties(
-    rampart-vecutils
-    PROPERTIES SUFFIX ".so"
-    PREFIX ""
-)
-
 if(NOT DEFINED LT_ENABLE_GPU_LAST)
     set(LT_ENABLE_GPU_LAST "unset")
     message(STATUS "GPU set ${LT_ENABLE_GPU}, was not previously set")
@@ -604,13 +587,9 @@ install(TARGETS rampart-faiss
 install(TARGETS rampart-sentencepiece
   DESTINATION "${RP_PATH}/modules"
 )
-install(TARGETS rampart-vecutils
-  DESTINATION "${RP_PATH}/modules"
-)
 
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-langtools.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llamacpp.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-faiss.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-sentencepiece.so\")")
-install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-vecutils.so\")")
 

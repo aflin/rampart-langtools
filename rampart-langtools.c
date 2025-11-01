@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #include "llama.h"
 #include "rampart-langtools.h"
@@ -39,7 +40,19 @@
 #include <c_api/index_factory_c.h>
 #include <c_api/index_io_c.h>
 
-#include "convert_vec.c"
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
+
+// --- CUDA availability check ---
+#if ( defined(LT_ENABLE_GPU) && !defined(__APPLE__) )
+#define HAVE_CUDA 1
+#include <cuda_runtime.h>
+#else
+#define HAVE_CUDA 0
+#endif
+
 
 #define LANGTOOLS_MAIN_INCLUDE
 
@@ -62,12 +75,6 @@
 #include "rampart-faiss.c"
 
 
-/* ***********************************************************
-                    UTILS
-   *********************************************************** */
-
-#include "rampart-vecutils.c"
-
 /* **************************************************
    Initialize module
    ************************************************** */
@@ -83,9 +90,6 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     open_faiss(ctx);
     duk_put_prop_string(ctx, -2, "faiss");
-
-    open_utils(ctx);
-    duk_put_prop_string(ctx, -2, "vecutils");
 
     return 1;
 }
