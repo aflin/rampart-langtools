@@ -1548,6 +1548,11 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
     if (cp.n_ctx <= 0)
     {
         int n_train = llama_model_n_ctx_train(lmodel);
+
+        // don't go crazy and run out of memory, unless we explicitly set n_ctx - then it's user error
+        if (n_train > 8192)
+            n_train = 8192;
+
         if (n_train > 0)
             cp.n_ctx = n_train;
     }
@@ -1593,7 +1598,6 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_thread"));
     int thrno = duk_get_int(ctx, -1);
     duk_pop(ctx);
-
 
     int curthr = get_thread_num();
     // get a new context if in a new thread.  Model stays the same.
