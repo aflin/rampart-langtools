@@ -225,7 +225,6 @@ static duk_ret_t open_sentencepiece(duk_context *ctx)
 duk_ret_t duk_open_module(duk_context *ctx)
 #endif
 {
-printf("LOADING\n");
     duk_push_object(ctx);
     duk_push_c_function(ctx, sp_init, 2);
     duk_put_prop_string(ctx, -2, "init");
