@@ -1594,6 +1594,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     int thrno = duk_get_int(ctx, -1);
     duk_pop(ctx);
 
+
     int curthr = get_thread_num();
     // get a new context if in a new thread.  Model stays the same.
     if (curthr != thrno)
@@ -1677,8 +1678,12 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     duk_idx_t arr_idx = duk_push_array(ctx);
 
     int k = 0;
+
+    const enum llama_pooling_type p = llama_pooling_type(lctx);
+
     for (int start = 0; start < nw; start += stride, ++k)
     {
+        llama_memory_clear(llama_get_memory(lctx), /*clear_kv=*/true);
         int n = nw - start;
         if (n > chunk_tokens)
             n = chunk_tokens;
@@ -1709,20 +1714,21 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
             batch.logits[i] = 1;    // contribute to pooled embedding
         }
         batch.n_tokens = n;
+        batch.logits = false;
 
-        if (llama_encode(lctx, batch) != 0)
+        if (llama_decode(lctx, batch) != 0)
         {
             llama_batch_free(batch);
             free(toks);
             RP_THROW(ctx, "llama_decode failed on chunk %d (tokens %d..%d)", k, start, start + n - 1);
             return 0;
         }
-        llama_batch_free(batch);
 
         // read pooled embedding
-        const enum llama_pooling_type p = llama_pooling_type(lctx);
         const float *emb =
             (p == LLAMA_POOLING_TYPE_NONE) ? llama_get_embeddings_ith(lctx, n - 1) : llama_get_embeddings_seq(lctx, 0);
+
+        llama_batch_free(batch);
 
         if (!emb)
         {
