@@ -3,7 +3,6 @@
 // - Creates n_parallel (--parallel) contexts per model
 // - Runs inference in parallel on each context
 
-#include <array>
 #include <thread>
 #include <vector>
 #include <atomic>
@@ -39,14 +38,13 @@ int main(int argc, char ** argv) {
     cparams.n_seq_max = 1;
 
     int dev_count = ggml_backend_dev_count();
-    std::vector<std::array<ggml_backend_dev_t, 2>> gpus;
+    int gpu_dev_count = 0;
     for (int i = 0; i < dev_count; ++i) {
         auto * dev = ggml_backend_dev_get(i);
         if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            gpus.push_back({dev, nullptr});
+            gpu_dev_count++;
         }
     }
-    const int gpu_dev_count = (int)gpus.size();
     const int num_models = gpu_dev_count + 1 + 1; // GPUs + 1 CPU model + 1 layer split
     //const int num_models = std::max(1, gpu_dev_count);
     const int num_contexts = std::max(1, params.n_parallel);
@@ -60,12 +58,12 @@ int main(int argc, char ** argv) {
 
         if (m < gpu_dev_count) {
             mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
-            mparams.devices = gpus[m].data();
+            mparams.main_gpu = m;
         } else if (m == gpu_dev_count) {
             mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
             mparams.main_gpu = -1; // CPU model
         } else {
-            mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
+            mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;;
         }
 
         llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -131,14 +129,7 @@ int main(int argc, char ** argv) {
                     }
 
                     batch = llama_batch_get_one(&token, 1);
-
-                    int ret = llama_decode(ctx.get(), batch);
-                    if (ret == 1 && i > 0) {
-                        LOG_INF("Context full, stopping generation.\n");
-                        break;
-                    }
-
-                    if (ret != 0) {
+                    if (llama_decode(ctx.get(), batch)) {
                         LOG_ERR("Model %d/%d, Context %d/%d: failed to decode\n", m + 1, num_models, c + 1, num_contexts);
                         failed.store(true);
                         return;

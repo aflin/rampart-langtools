@@ -138,10 +138,7 @@ if model_path is None:
         "Model path must be specified either via --model-path argument or MODEL_PATH environment variable"
     )
 
-
-print("Loading model and tokenizer using AutoTokenizer:", model_path)
-tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+config = AutoConfig.from_pretrained(model_path)
 
 print("Model type:       ", config.model_type)
 print("Vocab size:       ", config.vocab_size)
@@ -149,6 +146,10 @@ print("Hidden size:      ", config.hidden_size)
 print("Number of layers: ", config.num_hidden_layers)
 print("BOS token id:     ", config.bos_token_id)
 print("EOS token id:     ", config.eos_token_id)
+
+print("Loading model and tokenizer using AutoTokenizer:", model_path)
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+config = AutoConfig.from_pretrained(model_path)
 
 if unreleased_model_name:
     model_name_lower = unreleased_model_name.lower()
@@ -170,7 +171,7 @@ if unreleased_model_name:
         exit(1)
 else:
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, device_map="auto", offload_folder="offload", trust_remote_code=True, config=config
+        model_path, device_map="auto", offload_folder="offload"
     )
 
 for name, module in model.named_modules():
@@ -192,7 +193,7 @@ print(f"Input text: {repr(prompt)}")
 print(f"Tokenized: {tokenizer.convert_ids_to_tokens(input_ids[0])}")
 
 with torch.no_grad():
-    outputs = model(input_ids.to(model.device))
+    outputs = model(input_ids)
     logits = outputs.logits
 
     # Extract logits for the last token (next token prediction)
