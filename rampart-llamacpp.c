@@ -1720,11 +1720,11 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
         batch.n_tokens = n;
         batch.logits = false;
 
-        if (llama_decode(lctx, batch) != 0)
+        if (llama_encode(lctx, batch) != 0)
         {
             llama_batch_free(batch);
             free(toks);
-            RP_THROW(ctx, "llama_decode failed on chunk %d (tokens %d..%d)", k, start, start + n - 1);
+            RP_THROW(ctx, "llama_encode failed on chunk %d (tokens %d..%d)", k, start, start + n - 1);
             return 0;
         }
 
@@ -1922,9 +1922,12 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     return 1;
 }
 
+#define MAX_LOG_BUFFER 10240
+
 struct llog_cap
 {
     char *buf;
+    char *pos;  // Current write position
     size_t len;
     size_t alloc;
 };
@@ -1933,28 +1936,43 @@ static void llamacpp_logger(enum ggml_log_level level, const char *text, void *u
 {
     (void)level; // or filter by level
     struct llog_cap *cap = (struct llog_cap *)ud;
-    size_t len = strlen(text);
+    size_t text_len = strlen(text);
 
-    cap->len += len;
-    if (cap->len + 1 > cap->alloc)
+    // Check if adding new text would exceed maximum
+    if (cap->len + text_len > MAX_LOG_BUFFER)
+    {
+        // Cut buffer in half, keep second half
+        size_t half = cap->len / 2;
+        memmove(cap->buf, cap->buf + half, cap->len - half);
+        cap->len = cap->len - half;
+        cap->buf[cap->len] = '\0';
+        cap->pos = cap->buf + cap->len;  // Update position pointer
+        fprintf(stderr, "WARN: log overflow\n");
+    }
+
+    // Ensure we have enough allocation
+    if (cap->len + text_len + 1 > cap->alloc)
     {
         if (cap->alloc == 0)
         {
-            cap->alloc = cap->len > 1023 ? cap->len * 2 : 1024;
+            cap->alloc = (cap->len + text_len) > 1023 ? (cap->len + text_len) * 2 : 1024;
             REMALLOC(cap->buf, cap->alloc);
             cap->buf[0] = '\0';
+            cap->pos = cap->buf;  // Initialize position
         }
         else
         {
+            size_t pos_offset = cap->pos - cap->buf;  // Save offset before realloc
             cap->alloc = (3 * cap->alloc) / 2;
-            if (cap->len + 1 > cap->alloc)
-                cap->alloc = cap->len * 2;
+            if (cap->len + text_len + 1 > cap->alloc)
+                cap->alloc = (cap->len + text_len + 1) * 2;
             REMALLOC(cap->buf, cap->alloc);
+            cap->pos = cap->buf + pos_offset;  // Restore position after realloc
         }
     }
-
-    cap->len += len;
-    strcat(cap->buf, text);
+    strcpy(cap->pos, text);
+    cap->pos += text_len;
+    cap->len += text_len;
 }
 
 static duk_ret_t getlog(duk_context *ctx)
@@ -2007,7 +2025,6 @@ duk_ret_t duk_open_module(duk_context *ctx)
     if (!isloaded)
     {
         CALLOC(cap, sizeof(struct llog_cap));
-
         llama_log_set(llamacpp_logger, cap);
 
         duk_push_pointer(ctx, cap);
