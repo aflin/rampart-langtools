@@ -41,6 +41,17 @@
 
 #endif
 
+// --- CUDA availability check ---
+#if ( defined(LT_ENABLE_GPU) && !defined(__APPLE__) )
+#define FAISS_GPU_AVAILABLE 1
+#include <c_api/gpu/GpuClonerOptions_c.h>
+#include <c_api/gpu/GpuIndex_c.h>
+#include <c_api/gpu/GpuResources_c.h>
+#include <c_api/gpu/StandardGpuResources_c.h>
+#include <c_api/gpu/GpuAutoTune_c.h>
+#endif
+
+
 /* **************************************************
            FAISS
    ************************************************** */
@@ -271,13 +282,25 @@ static idx_t *faiss_search_topk_ids_params(FaissIndex *idx, const float *q, /* q
             faiss_SearchParametersIVF_set_nprobe(sp_ivf, nprobe);
             sp = (const FaissSearchParameters *)sp_ivf;
         }
-        /* if allocation failed, we just fall back to defaults below */
+        else
+        {
+            if (err)
+                *err = "Failed to set nprobe";
+            return NULL;
+        }
+        if(!sp) //unnecessary?
+        {
+            if (err)
+                *err = "Failed to set nprobe";
+            return NULL;
+        }
     }
 
     if (sp)
     {
         rc = faiss_Index_search_with_params(idx, 1, q, k, sp, D, I);
         /* If the params are incompatible with the index type, try plain search as a fallback */
+        /* but maybe we want to report or fail ?? */
         if (rc != 0)
         {
             rc = faiss_Index_search(idx, 1, q, k, D, I);
@@ -406,17 +429,41 @@ static duk_ret_t do_search_fp32(duk_context *ctx)
 static duk_ret_t save_index(duk_context *ctx)
 {
     const char *fname = REQUIRE_STRING(ctx, 0, "faiss.save - argument must be a filename");
+    FaissIndex *idx = NULL;
+    int rc=1;
 
     duk_push_this(ctx);
 
-    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("faissIdx"));
-    FaissIndex *idx = duk_get_pointer(ctx, -1);
+#ifdef FAISS_GPU_AVAILABLE
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("isGpu"));
+    int is_gpu = duk_get_boolean_default(ctx, -1, 0);
     duk_pop(ctx);
 
-    int rc = faiss_write_index_fname(idx, fname);
+    if( is_gpu ) //it's on the gpu, move back to save
+    {
+        FaissIndex *gpu_idx = NULL;
+        duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("faissIdx"));
+        gpu_idx = duk_get_pointer(ctx, -1);
+        duk_pop(ctx);
+        rc = faiss_index_gpu_to_cpu(gpu_idx, &idx);
+        if(rc == 0 && idx)
+        {
+            rc = faiss_write_index_fname(idx, fname);
+            faiss_Index_free(idx);
+        }
+    }
+    else
+#endif
+    {
+        duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("faissIdx"));
+        idx = duk_get_pointer(ctx, -1);
+        duk_pop(ctx);
+        rc = faiss_write_index_fname(idx, fname);
+    }
 
     if (rc)
         RP_THROW(ctx, "Failed to save file - %s", faiss_get_last_error());
+
     return 0;
 }
 
@@ -742,6 +789,98 @@ static void load_index(const char *fname, FaissIndex **out, const char **err, in
     };
 }
 
+#ifdef FAISS_GPU_AVAILABLE
+/* Global GPU resources pointer - initialized on first GPU use */
+//static GpuResourcesProviderStandard *gpu_resources = NULL;
+static FaissGpuResourcesProvider *gpu_resources = NULL;
+static duk_ret_t enable_gpu(duk_context *ctx)
+{
+    FaissIndex *cpu_idx = NULL;
+    FaissIndex *gpu_idx = NULL;
+//    FaissGpuClonerOptions *options = NULL;
+    int device = 0;
+
+    /* Optional device ID argument */
+    if (!duk_is_undefined(ctx, 0))
+        device = REQUIRE_INT(ctx, 0, "enableGpu - first argument, if provided, must be an integer (GPU device ID)");
+
+    duk_push_this(ctx);
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("faissIdx"));
+    cpu_idx = duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    if (!cpu_idx)
+        RP_THROW(ctx, "faiss.enableGpu - Internal error getting index handle");
+
+    /* Check if already on GPU */
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("isGpu"));
+    if (duk_get_boolean_default(ctx, -1, 0))
+    {
+        duk_pop(ctx);
+        duk_push_boolean(ctx, 1);
+        return 1;
+    }
+    duk_pop(ctx);
+
+    /* Initialize GPU resources if needed */
+    if (!gpu_resources)
+    {
+        if (faiss_StandardGpuResources_new(&gpu_resources) != 0)
+        {
+            const char *err = faiss_get_last_error();
+            RP_THROW(ctx, "faiss.enableGpu - Failed to initialize GPU resources: %s", err ? err : "unknown error");
+        }
+    }
+
+    /* Create cloner options *
+    if (faiss_GpuClonerOptions_new(&options) != 0)
+    {
+        const char *err = faiss_get_last_error();
+        RP_THROW(ctx, "faiss.enableGpu - Failed to create cloner options: %s", err ? err : "unknown error");
+    } */
+
+    /* Clone index to GPU */
+    if (faiss_index_cpu_to_gpu(gpu_resources, device, cpu_idx, &gpu_idx) != 0)
+    {
+        const char *err = faiss_get_last_error();
+        //faiss_GpuClonerOptions_free(options);
+        RP_THROW(ctx, "faiss.enableGpu - Failed to transfer index to GPU: %s", err ? err : "unknown error");
+    }
+
+    //faiss_GpuClonerOptions_free(options);
+
+    if (!gpu_idx)
+        RP_THROW(ctx, "faiss.enableGpu - Failed to create GPU index");
+
+    /* Store the new GPU index pointer */
+    duk_push_pointer(ctx, gpu_idx);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissIdx"));
+
+    /* Store the CPU index for potential later use *
+    duk_push_pointer(ctx, cpu_idx);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissCpuIdx"));
+    */
+
+    // free old cpu index
+    faiss_Index_free(cpu_idx);
+
+    /* Mark as GPU index */
+    duk_push_boolean(ctx, 1);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("isGpu"));
+
+    /* Update settings to reflect GPU status */
+    duk_get_prop_string(ctx, -1, "settings");
+    duk_push_boolean(ctx, 1);
+    duk_rp_put_prop_string_ro(ctx, -2, "onGpu");
+    duk_push_int(ctx, device);
+    duk_rp_put_prop_string_ro(ctx, -2, "gpuDevice");
+    duk_pop(ctx);
+
+    duk_push_boolean(ctx, 1);
+    return 1;
+}
+#endif
+
 FaissIndexType faiss_detect_type(FaissIndex* idx, int* pqM, int* pqBits, int *mapped);
 
 static void push_faiss_obj(duk_context *ctx, FaissIndex *idx, FaissMetricType mtype, int dim, double rows)
@@ -895,6 +1034,11 @@ static void push_faiss_obj(duk_context *ctx, FaissIndex *idx, FaissMetricType mt
 
     duk_push_c_function(ctx, do_search_fp32, 3);
     duk_put_prop_string(ctx, -2, "searchFp32");
+
+#ifdef FAISS_GPU_AVAILABLE
+    duk_push_c_function(ctx, enable_gpu, 1);
+    duk_put_prop_string(ctx, -2, "enableGpu");
+#endif
 
     if (!faiss_Index_is_trained(idx))
     {
