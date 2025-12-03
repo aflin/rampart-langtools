@@ -1459,6 +1459,43 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
 }
 
 // LLAMA.CPP EMBEDDING MODELS
+
+static duk_ret_t emb_free(duk_context *ctx)
+{
+    struct llama_model *lmodel = NULL;
+    struct llama_context *lctx = NULL;
+
+    duk_push_this(ctx);
+
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("model"));
+    lmodel = duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("llama_ctx"));
+    lctx = duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rerank_toks")))
+    {
+        void *toks = duk_get_pointer(ctx, -1);
+        if(toks)
+            free(toks);
+    }
+    duk_pop(ctx);
+
+    llama_free(lctx);
+
+    llama_model_free(lmodel);
+
+    duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("model"));
+    duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("llama_ctx"));
+
+    duk_push_true(ctx);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("destroyed"));
+
+    return 0;
+}
+
 static struct llama_context *new_embed_context(duk_context *ctx, struct llama_model *lmodel, duk_idx_t opts_idx)
 {
     struct llama_context_params cp = llama_context_default_params();
@@ -1919,10 +1956,383 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     duk_push_c_function(ctx, embed_text_to_numbers, 1);
     duk_put_prop_string(ctx, -2, "embedTextToNumbers");
 
+    duk_push_c_function(ctx, emb_free, 0);
+    duk_put_prop_string(ctx, -2, "destroy");
+
+    duk_push_c_function(ctx, emb_free, 1);
+    duk_set_finalizer(ctx, -2);
+
     return 1;
 }
 
-#define MAX_LOG_BUFFER 10240
+typedef struct rp_rerank_toks {
+    const char *bos;
+    const char *sep;
+    const char *eos;
+    size_t len;
+} rp_rerank_toks;
+
+static void get_rr_toks(const struct llama_vocab *vocab, rp_rerank_toks *toks)
+{
+    if(!toks)
+        return;
+
+    // Get SEP and EOS tokens from vocabulary
+    llama_token bos_token = llama_vocab_bos(vocab);
+    llama_token sep_token = llama_vocab_sep(vocab);
+    llama_token eos_token = llama_vocab_eos(vocab);
+
+    // Check if these tokens should be added
+    bool add_bos = llama_vocab_get_add_bos(vocab);
+    bool add_sep = llama_vocab_get_add_sep(vocab);
+    bool add_eos = llama_vocab_get_add_eos(vocab);
+
+    // Get token text representations
+    toks->bos = add_bos ? llama_vocab_get_text(vocab, bos_token) : "";
+    toks->sep = add_sep ? llama_vocab_get_text(vocab, sep_token) : "";
+    toks->eos = add_eos ? llama_vocab_get_text(vocab, eos_token) : "";
+
+    toks->len = strlen(toks->bos) +
+                strlen(toks->sep) +
+                (strlen(toks->eos)*2);
+}
+
+// Build rerank input string using vocabulary's SEP and EOS tokens
+// Returns allocated string that caller must free()
+static char *build_rerank_input(rp_rerank_toks *toks, const char *query, const char *document)
+{
+    // Calculate total length needed
+    size_t total_len = strlen(query)    +
+                       strlen(document) +
+                       toks->len        + 1;
+    // Allocate buffer
+    char *input = (char *)malloc(total_len);
+    if (!input)
+        return NULL;
+
+    snprintf(input, total_len, "%s%s%s%s%s%s", toks->bos, query, toks->eos, toks->sep, document, toks->eos);
+
+    return input;
+}
+
+// Helper to tokenize text for reranking
+static llama_token *tokenize_for_rerank(duk_context *ctx, struct llama_context *lctx, const struct llama_vocab *vocab,
+                                        const char *text, int *n_tokens, bool add_special, bool parse_special)
+{
+    // Get rough estimate of tokens needed
+    int max_tokens = strlen(text) + 32;
+    llama_token *tokens = NULL;
+    REMALLOC(tokens, max_tokens * sizeof(llama_token));
+
+    int n = llama_tokenize(vocab, text, strlen(text), tokens, max_tokens, add_special, parse_special);
+
+    if (n < 0)
+    {
+        // Need more space
+        max_tokens = -n;
+        REMALLOC(tokens, max_tokens * sizeof(llama_token));
+        n = llama_tokenize(vocab, text, strlen(text), tokens, max_tokens, add_special, parse_special);
+    }
+
+    if (n < 0)
+    {
+        free(tokens);
+        RP_THROW(ctx, "Failed to tokenize text for reranking");
+        return NULL;
+    }
+
+    *n_tokens = n;
+    return tokens;
+}
+
+float rerank_one(duk_context *ctx, struct llama_context *lctx, struct llama_model *lmodel,
+    const struct llama_vocab *vocab, rp_rerank_toks *toks, const char *query, const char *text)
+{
+    // Build input string
+    char *input = build_rerank_input(toks, query, text);
+
+    // Tokenize the input
+    int n_tokens = 0;
+    llama_token *tokens = tokenize_for_rerank(ctx, lctx, vocab, input, &n_tokens, true, true);
+    free(input);
+
+    if (!tokens)
+        RP_THROW(ctx, "Failed to tokenize input for reranking");
+
+    // Clear the KV cache using llama_memory_clear (not llama_kv_cache_clear)
+    llama_memory_clear(llama_get_memory(lctx), true);
+
+    // sanity: must be a rerank model
+    if (llama_pooling_type(lctx) != LLAMA_POOLING_TYPE_RANK) {
+        // not a reranker; this would return a full embedding vector
+        return 0.0f;
+    }
+
+    // Create batch using llama_batch_init (not llama_batch_get_one)
+    struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits)
+    {
+        llama_batch_free(batch);
+        free(tokens);
+        RP_THROW(ctx, "llama_batch_init failed for reranking");
+        return 0;
+    }
+
+    // Fill the batch
+    for (int i = 0; i < n_tokens; i++)
+    {
+        batch.token[i] = tokens[i];
+        batch.pos[i] = i;           // position 0..n-1
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;     // single sequence id 0
+        batch.logits[i] = 1;        // contribute to pooled embedding
+    }
+    batch.n_tokens = n_tokens;
+
+    // Use llama_encode (not llama_decode) for embedding/reranking tasks
+    int ret = llama_encode(lctx, batch);
+
+    llama_batch_free(batch);
+    free(tokens);
+
+    if (ret != 0)
+        RP_THROW(ctx, "llama_encode failed for reranking");
+
+    // Get embeddings using llama_get_embeddings_seq
+    const float *emb = llama_get_embeddings_seq(lctx, 0);
+
+    if (!emb)
+        RP_THROW(ctx, "Failed to get embeddings for reranking");
+
+    // For reranking models with RANK pooling, the first value is the relevance score
+    return emb[0];
+}
+
+// Rerank function: takes query and text, returns a score
+static duk_ret_t rerank_text(duk_context *ctx)
+{
+    // Get the reranker context
+    duk_push_this(ctx);
+
+    // Check if destroyed
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("destroyed")))
+    {
+        if (duk_get_boolean_default(ctx, -1, 0))
+            RP_THROW(ctx, "reranker object was destroyed");
+    }
+    duk_pop(ctx);
+
+    // Get model and context pointers
+    struct llama_model *lmodel = NULL;
+    struct llama_context *lctx = NULL;
+    const struct llama_vocab *vocab = NULL;
+    rp_rerank_toks *toks=NULL;
+
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("model")))
+        lmodel = (struct llama_model *)duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("llama_ctx")))
+        lctx = (struct llama_context *)duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rerank_toks")))
+        toks = (rp_rerank_toks *)duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    if (!lmodel || !lctx || !toks)
+        RP_THROW(ctx, "rerank: Invalid model or context");
+
+    vocab = llama_model_get_vocab(lmodel);
+    if (!vocab)
+        RP_THROW(ctx, "rerank: Failed to get vocab from model");
+
+    duk_pop(ctx); // pop 'this'
+
+    // Get query and text arguments
+    const char *query = REQUIRE_STRING(ctx, 0, "rerank: argument 1 (query) must be a String");
+    if( duk_is_string(ctx, 1) )
+    {
+        double score = (double)rerank_one(ctx, lctx, lmodel, vocab, toks, query, duk_get_string(ctx, 1));
+        duk_push_number(ctx, score);
+        return 1;
+    }
+
+    REQUIRE_ARRAY(ctx, 1, "rerank: argument 2 (documents) must be a String or Array of Strings");
+    const char *text = NULL;
+
+    int scores_only = 0;
+    if(!duk_is_undefined(ctx, 2))
+    {
+        scores_only = REQUIRE_BOOL(ctx, 2, "rerank: argument 3 (scoresOnly), if present, must be a Boolean");
+    }
+    duk_uarridx_t i=0, len = (duk_uarridx_t) duk_get_length(ctx, 1);
+    double score;
+
+    duk_push_array(ctx); //return scores
+    if(scores_only)
+    {
+        for(;i<len;i++)
+        {
+            duk_get_prop_index(ctx, 1, i);
+            text = REQUIRE_STRING(ctx, -1, "rerank: argument 2 (documents) must be a String or Array of Strings");
+            duk_pop(ctx);
+            score = (double) rerank_one(ctx, lctx, lmodel, vocab, toks, query, text);
+            duk_push_number(ctx, score);
+            duk_put_prop_index(ctx, -2, i); //score into return scores array
+        }
+    }
+    else
+    {
+        for(;i<len;i++)
+        {
+            duk_push_object(ctx); //entry of {document:text, score: score}
+            duk_get_prop_index(ctx, 1, i);
+            text = REQUIRE_STRING(ctx, -1, "rerank: argument 2 (documents) must be a String or Array of Strings");
+            duk_put_prop_string(ctx, -2, "document");
+            score = (double) rerank_one(ctx, lctx, lmodel, vocab, toks, query, text);
+            duk_push_number(ctx, score);
+            duk_put_prop_string(ctx, -2, "score");
+            duk_put_prop_index(ctx, -2, i); //entry into return scores array
+        }
+    }
+    return 1;
+}
+
+// Initialize a reranking model
+static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
+{
+    const char *model = REQUIRE_STRING(ctx, 0, "init: argument 1 must be a string");
+    duk_idx_t obj_idx = -1;
+
+    if (duk_is_object(ctx, 1))
+        obj_idx = 1;
+
+    duk_push_object(ctx); // return object
+
+    struct llama_model *lmodel = NULL;
+    struct llama_context *lctx = NULL;
+
+    // Set up model parameters
+    struct llama_model_params mp = llama_model_default_params();
+
+    lmodel = llama_model_load_from_file(model, mp);
+
+    if (!lmodel)
+        RP_THROW(ctx, "rampart-llama-cpp:initRerank - Could not load ggml file '%s': %s", model, strerror(errno));
+
+    // Set up context parameters for reranking
+    struct llama_context_params cp = llama_context_default_params();
+
+    // Enable embeddings mode and set pooling to RANK
+    cp.embeddings = true;
+    cp.pooling_type = LLAMA_POOLING_TYPE_RANK;
+    cp.n_threads = 1;
+    cp.n_ctx = 0;        // will be set later if not specified
+    cp.n_ubatch = 0;     // will be set later if not specified
+    cp.n_threads_batch = 0;
+
+    // Get options from JavaScript object (matching user's existing option names)
+    if (obj_idx >= 0)
+    {
+        // nctx (context size)
+        if (duk_get_prop_string(ctx, obj_idx, "nctx"))
+        {
+            if (!duk_is_number(ctx, -1))
+                RP_THROW(ctx, "option nctx must be a Number");
+            cp.n_ctx = duk_get_int(ctx, -1);
+        }
+        duk_pop(ctx);
+
+        // ubatch (micro-batch size)
+        if (duk_get_prop_string(ctx, obj_idx, "ubatch"))
+        {
+            if (!duk_is_number(ctx, -1))
+                RP_THROW(ctx, "option ubatch must be a Number");
+            cp.n_ubatch = duk_get_int(ctx, -1);
+        }
+        duk_pop(ctx);
+
+        // nthreads
+        if (duk_get_prop_string(ctx, obj_idx, "nthreads"))
+        {
+            if (!duk_is_number(ctx, -1))
+                RP_THROW(ctx, "option nthreads must be a Number");
+            cp.n_threads = duk_get_int(ctx, -1);
+        }
+        duk_pop(ctx);
+
+        // nthreads_batch
+        if (duk_get_prop_string(ctx, obj_idx, "nthreads_batch"))
+        {
+            if (!duk_is_number(ctx, -1))
+                RP_THROW(ctx, "option nthreads_batch must be a Number");
+            cp.n_threads_batch = duk_get_int(ctx, -1);
+        }
+        duk_pop(ctx);
+
+    }
+
+    // If user didn't specify nctx or ubatch, set both to model's max
+    if (cp.n_ctx <= 0)
+    {
+        int n_train = llama_model_n_ctx_train(lmodel);
+
+        // don't go crazy and run out of memory
+        if (n_train > 8192)
+            n_train = 8192;
+
+        if (n_train > 0)
+            cp.n_ctx = n_train;
+    }
+
+    if (cp.n_ubatch <= 0)
+    {
+        // default ubatch to n_ctx so a full window fits in one micro-batch
+        cp.n_ubatch = cp.n_ctx > 0 ? cp.n_ctx : 0;
+    }
+
+    lctx = llama_init_from_model(lmodel, cp);
+
+    if (!lctx)
+    {
+        llama_model_free(lmodel);
+        RP_THROW(ctx, "rampart-llama-cpp:initRerank - Failed to init llama context from model");
+    }
+
+    // Store pointers
+    duk_push_pointer(ctx, lmodel);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("model"));
+
+    duk_push_pointer(ctx, lctx);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
+
+    duk_push_int(ctx, (int)get_thread_num());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
+
+    //get bos, sep, eos tokens
+    rp_rerank_toks *toks = NULL;
+    REMALLOC(toks, sizeof(rp_rerank_toks));
+
+    get_rr_toks(llama_model_get_vocab(lmodel), toks);
+
+    duk_push_pointer(ctx, toks);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rerank_toks"));
+
+    // Add the rerank function
+    duk_push_c_function(ctx, rerank_text, 3);
+    duk_put_prop_string(ctx, -2, "rerank");
+
+    duk_push_c_function(ctx, emb_free, 0);
+    duk_put_prop_string(ctx, -2, "destroy");
+
+    duk_push_c_function(ctx, emb_free, 1);
+    duk_set_finalizer(ctx, -2);
+
+    return 1;
+}
+
+#define MAX_LOG_BUFFER 40960
 
 struct llog_cap
 {
@@ -2038,6 +2448,9 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     duk_push_c_function(ctx, llamacpp_init_gen, 2);
     duk_put_prop_string(ctx, -2, "initGen");
+
+    duk_push_c_function(ctx, llamacpp_init_rerank, 2);
+    duk_put_prop_string(ctx, -2, "initRerank");
 
     duk_push_c_function(ctx, getlog, 0);
     duk_put_prop_string(ctx, -2, "getLog");
