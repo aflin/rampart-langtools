@@ -1504,8 +1504,7 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
     cp.n_threads = 1;
     cp.n_ctx = 0;
     cp.n_ubatch = 0;
-    // optional extras with safe defaults:
-    cp.n_threads_batch = 0;
+    cp.n_threads_batch = -1;
 
     if (opts_idx > -1)
     {
@@ -1593,11 +1592,16 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
         if (n_train > 0)
             cp.n_ctx = n_train;
     }
+
     if (cp.n_ubatch <= 0)
     {
         // default ubatch to n_ctx so a full window fits in one micro-batch
         cp.n_ubatch = cp.n_ctx > 0 ? cp.n_ctx : 0;
     }
+
+    // batch must be equal or greater, to prevent clamping
+    cp.n_batch = cp.n_ubatch;
+    
     // printf("setting ctx at %d\n", cp.n_ctx);
     return llama_init_from_model(lmodel, cp);
 }
@@ -1733,7 +1737,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
         if (n > n_ubatch)
         {
             free(toks);
-            RP_THROW(ctx, "chunk too large for micro-batch (n=%d > n_ubatch=%d). Increase cp.n_ubatch.", n, n_ubatch);
+            RP_THROW(ctx, "chunk too large for micro-batch (n=%d > n_ubatch=%d). Increase ubatch and/or batch.", n, n_ubatch);
             return 0;
         }
 
@@ -2053,13 +2057,15 @@ float rerank_one(duk_context *ctx, struct llama_context *lctx, struct llama_mode
 
     // Tokenize the input
     int n_tokens = 0;
+    int n_ubatch = llama_n_ubatch(lctx);
+
     llama_token *tokens = tokenize_for_rerank(ctx, lctx, vocab, input, &n_tokens, true, true);
     free(input);
 
     if (!tokens)
         RP_THROW(ctx, "Failed to tokenize input for reranking");
 
-    // Clear the KV cache using llama_memory_clear (not llama_kv_cache_clear)
+    // Clear the KV cache using llama_memory_clear
     llama_memory_clear(llama_get_memory(lctx), true);
 
     // sanity: must be a rerank model
@@ -2068,7 +2074,7 @@ float rerank_one(duk_context *ctx, struct llama_context *lctx, struct llama_mode
         return 0.0f;
     }
 
-    // Create batch using llama_batch_init (not llama_batch_get_one)
+    // Create batch using llama_batch_init
     struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits)
     {
@@ -2077,6 +2083,10 @@ float rerank_one(duk_context *ctx, struct llama_context *lctx, struct llama_mode
         RP_THROW(ctx, "llama_batch_init failed for reranking");
         return 0;
     }
+
+    //clamp to max batch size
+    if(n_tokens > n_ubatch)
+        n_tokens = n_ubatch;
 
     // Fill the batch
     for (int i = 0; i < n_tokens; i++)
@@ -2227,10 +2237,10 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     // Enable embeddings mode and set pooling to RANK
     cp.embeddings = true;
     cp.pooling_type = LLAMA_POOLING_TYPE_RANK;
-    cp.n_threads = 1;
+    cp.n_threads = -1;
     cp.n_ctx = 0;        // will be set later if not specified
     cp.n_ubatch = 0;     // will be set later if not specified
-    cp.n_threads_batch = 0;
+    cp.n_threads_batch = -1;
 
     // Get options from JavaScript object (matching user's existing option names)
     if (obj_idx >= 0)
@@ -2253,7 +2263,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
         }
         duk_pop(ctx);
 
-        // nthreads
+        // nthreads - not really relevant here?
         if (duk_get_prop_string(ctx, obj_idx, "nthreads"))
         {
             if (!duk_is_number(ctx, -1))
@@ -2278,9 +2288,9 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     {
         int n_train = llama_model_n_ctx_train(lmodel);
 
-        // don't go crazy and run out of memory
-        if (n_train > 8192)
-            n_train = 8192;
+        // keep it tighter for rerank
+        if (n_train > 1024)
+            n_train = 1024;
 
         if (n_train > 0)
             cp.n_ctx = n_train;
@@ -2288,9 +2298,12 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 
     if (cp.n_ubatch <= 0)
     {
-        // default ubatch to n_ctx so a full window fits in one micro-batch
-        cp.n_ubatch = cp.n_ctx > 0 ? cp.n_ctx : 0;
+        // default ubatch to 512, to keep it tight.  Unlike embeddings, extra is truncated.
+        cp.n_ubatch = 512;
     }
+
+    //prevent clamping
+    cp.n_batch = cp.n_ubatch;
 
     lctx = llama_init_from_model(lmodel, cp);
 
