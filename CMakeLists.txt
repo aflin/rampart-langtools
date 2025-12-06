@@ -207,6 +207,8 @@ add_library(rampart-sentencepiece SHARED
 
 if(LT_ENABLE_GPU)
     target_compile_definitions(rampart-langtools PRIVATE LT_ENABLE_GPU=1)
+    target_compile_definitions(rampart-llamacpp PRIVATE LT_ENABLE_GPU=1)
+    target_compile_definitions(rampart-faiss PRIVATE LT_ENABLE_GPU=1)
 endif()
 
 

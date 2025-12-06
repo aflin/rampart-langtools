@@ -25,15 +25,35 @@
 #include <sys/types.h>
 #endif
 
-// --- CUDA availability check ---
-#if ( defined(LT_ENABLE_GPU) && !defined(__APPLE__) )
-#define HAVE_CUDA 1
-#include <cuda_runtime.h>
-#else
-#define HAVE_CUDA 0
 #endif
 
+// --- CUDA availability check ---
+#if ( defined(LT_ENABLE_GPU) && !defined(__APPLE__) )
+    #define HAVE_CUDA 1
+
+    #include <cuda_runtime.h>
+    #include "ggml-backend.h"
+
+    static int has_gpu_backend()
+    {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+        {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU)
+            {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+#else
+
+    #define HAVE_CUDA 0
+
 #endif
+
 
 // LLAMA.CPP Generation funcs:
 
@@ -247,6 +267,9 @@ typedef struct rp_llama_info
     struct llama_sampler *smpl;
     int n_generated;
     int n_keep;
+    struct llama_context_params cp;
+    int init_thr;
+    int init_pid;
 
     // for async:
     duk_context *ctx;
@@ -513,6 +536,28 @@ rp_llama_info *prep_predict(duk_context *ctx, int is_async)
     const struct llama_vocab *vocab = linfo->vocab;
 
     uint32_t cur_pos = linfo->cur_pos;
+
+    int cur_thr = get_thread_num();
+    int cur_pid = (int)getpid();
+
+    // get a new context if in a new thread.  Model stays the same.
+    if (cur_thr != linfo->init_thr || cur_pid != linfo->init_pid )
+    {
+        // FIXME: save and retrieve options.
+#ifdef HAVE_CUDA
+        // forking after is bad, mkay
+        if(cur_pid != linfo->init_pid && has_gpu_backend() )
+        {
+            RP_THROW(ctx, "llama.cpp - cannot fork llama.cpp with CUDA initialized");
+        }
+#endif
+        lctx = linfo->lctx = llama_init_from_model(linfo->lmodel, linfo->cp);
+
+        linfo->init_thr = cur_thr;
+        linfo->init_pid = cur_pid;
+
+    }
+
 
     // generation params (defaults)
     int max_tokens = 12800;
@@ -1351,7 +1396,7 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
                                    /*cpu_free_cap_frac=*/0.50,      // if KV on CPU, use up to 50% of free RAM
                                    &base_bytes, &kv_bpt);
 
-        printf("suggest = %d\n", (int)n_ctx_suggest);
+        //printf("suggest = %d\n", (int)n_ctx_suggest);
         // int n_ctx_train = llama_n_ctx_train(model);   // if available in your llama.h
         if (n_ctx_suggest == 0)
             n_ctx_suggest = 2048; // fallback
@@ -1397,6 +1442,7 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
     info->ga_w = (uint32_t)ga_w;
     info->store_last = store_last;
     info->cur_pos = 0;
+    info->cp = cp;
 
     duk_push_object(ctx); // return object
 
@@ -1601,7 +1647,11 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
 
     // batch must be equal or greater, to prevent clamping
     cp.n_batch = cp.n_ubatch;
-    
+
+    void *cp_buf = duk_push_fixed_buffer(ctx, sizeof(struct llama_context_params));
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("cp_buf"));
+    memcpy(cp_buf, &cp, sizeof(struct llama_context_params));
+
     // printf("setting ctx at %d\n", cp.n_ctx);
     return llama_init_from_model(lmodel, cp);
 }
@@ -1640,14 +1690,30 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     int thrno = duk_get_int(ctx, -1);
     duk_pop(ctx);
 
-    int curthr = get_thread_num();
-    // get a new context if in a new thread.  Model stays the same.
-    if (curthr != thrno)
-    {
-        // FIXME: save and retrieve options.
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_pid"));
+    int pidno = duk_get_int(ctx, -1);
+    duk_pop(ctx);
 
-        //printf("loading new context\n");
-        lctx = new_embed_context(ctx, lmodel, -1);
+    int curthr = get_thread_num();
+    int curpid = (int)getpid();
+
+    // get a new context if in a new thread.  Model stays the same.
+    if (curthr != thrno || pidno != curpid )
+    {
+
+#ifdef HAVE_CUDA
+        // forking after is bad, mkay
+        if(pidno != curpid && has_gpu_backend() )
+        {
+            RP_THROW(ctx, "llama.cpp - cannot fork llama.cpp with CUDA initialized");
+        }
+#endif
+        duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("cp_buf"));
+        struct llama_context_params *cp_buf = duk_get_buffer_data(ctx, -1, NULL);
+        duk_pop(ctx);
+        lctx = llama_init_from_model(lmodel, *cp_buf);
+
+        //lctx = new_embed_context(ctx, lmodel, -1);
 
         duk_push_pointer(ctx, lctx);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
@@ -1942,6 +2008,9 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     duk_push_pointer(ctx, lmodel);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("model"));
 
+    duk_dup(ctx, 0);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("model_path"));
+
     duk_push_pointer(ctx, lctx);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
 
@@ -1950,6 +2019,9 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 
     duk_push_int(ctx, (int)get_thread_num());
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
+
+    duk_push_int(ctx, (int)getpid());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
 
     duk_push_c_function(ctx, embed_text_to_buf32, 1);
     duk_put_prop_string(ctx, -2, "embedTextToFp32Buf");
@@ -2150,6 +2222,40 @@ static duk_ret_t rerank_text(duk_context *ctx)
         toks = (rp_rerank_toks *)duk_get_pointer(ctx, -1);
     duk_pop(ctx);
 
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_thread"));
+    int thrno = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_pid"));
+    int pidno = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+
+    int curthr = get_thread_num();
+    int curpid = (int)getpid();
+
+    // get a new context if in a new thread.  Model stays the same.
+    if (curthr != thrno || pidno != curpid )
+    {
+#ifdef HAVE_CUDA
+        // forking after is bad, mkay
+        if(pidno != curpid && has_gpu_backend() )
+        {
+            RP_THROW(ctx, "llama.cpp - cannot fork llama.cpp with CUDA initialized");
+        }
+#endif
+        duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("cp_buf"));
+        struct llama_context_params *cp_buf = duk_get_buffer_data(ctx, -1, NULL);
+        duk_pop(ctx);
+        lctx = llama_init_from_model(lmodel, *cp_buf);
+
+        duk_push_pointer(ctx, lctx);
+        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
+
+        duk_push_int(ctx, curthr);
+        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
+    }
+
+
     if (!lmodel || !lctx || !toks)
         RP_THROW(ctx, "rerank: Invalid model or context");
 
@@ -2322,6 +2428,13 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 
     duk_push_int(ctx, (int)get_thread_num());
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
+
+    duk_push_int(ctx, (int)getpid());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
+
+    void *cp_buf = duk_push_fixed_buffer(ctx, sizeof(struct llama_context_params));
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("cp_buf"));
+    memcpy(cp_buf, &cp, sizeof(struct llama_context_params));
 
     //get bos, sep, eos tokens
     rp_rerank_toks *toks = NULL;
