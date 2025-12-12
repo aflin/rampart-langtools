@@ -2041,6 +2041,7 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     return 1;
 }
 
+
 typedef struct rp_rerank_toks {
     const char *bos;
     const char *sep;
@@ -2063,10 +2064,10 @@ static void get_rr_toks(const struct llama_vocab *vocab, rp_rerank_toks *toks)
     bool add_sep = llama_vocab_get_add_sep(vocab);
     bool add_eos = llama_vocab_get_add_eos(vocab);
 
-    // Get token text representations
-    toks->bos = add_bos ? llama_vocab_get_text(vocab, bos_token) : "";
-    toks->sep = add_sep ? llama_vocab_get_text(vocab, sep_token) : "";
-    toks->eos = add_eos ? llama_vocab_get_text(vocab, eos_token) : "";
+    // If llama.cpp auto-adds a special token, DO NOT include its text in the prompt.
+    toks->bos = (!add_bos && bos_token != LLAMA_TOKEN_NULL) ? llama_vocab_get_text(vocab, bos_token) : "";
+    toks->sep = (!add_sep && sep_token != LLAMA_TOKEN_NULL) ? llama_vocab_get_text(vocab, sep_token) : "";
+    toks->eos = (!add_eos && eos_token != LLAMA_TOKEN_NULL) ? llama_vocab_get_text(vocab, eos_token) : "";
 
     toks->len = strlen(toks->bos) +
                 strlen(toks->sep) +
