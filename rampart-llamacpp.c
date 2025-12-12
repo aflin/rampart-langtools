@@ -50,7 +50,7 @@
 
 #else
 
-    #define HAVE_CUDA 0
+    #undef HAVE_CUDA
 
 #endif
 
