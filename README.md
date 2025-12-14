@@ -62,7 +62,7 @@ var rr = langtools.llamacpp.initRerank(rrmodel, {ubatch:256});
 
 ## rampart-faiss
 ```
-rampart.globalize(rampart.utils); // for printf and repl
+rampart.globalize(rampart.utils); // for printf, dateFmt and repl
 
 //example building index for about 30m vectors from a sql table named vecs:
 var faiss = require('rampart-faiss');
@@ -80,9 +80,13 @@ printf("GPU Enabled\n");
 
 // if index requires training, idx.trainer will be defined.
 if( idx.trainer) {
+    // make a new trainer, save train vectors in new file ./tdata
+    // or reload vectors in ./tdata and skip/continue to insert
+
     var trainer = new idx.trainer('tdata');
     printf("%3J\n%s\n", trainer, dateFmt('%c %z'));
 
+    //insert vectors into ./tdata file
     sql.exec("select Id, Vec from vecs", {skipRows:0, maxRows: 10000000}, function(row) {
         trainer.addTrainingfp16(row.Vec); // or addTrainingfp32()
         i++;
@@ -93,6 +97,7 @@ if( idx.trainer) {
         }
     });
 
+    //train from vectors in ./tdata.
     printf("\n%s\nTraining, go get some coffee, read a book or two, don't touch the keyboard ...\n", dateFmt('%c %z'));
 
     trainer.train();
