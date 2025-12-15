@@ -61,6 +61,8 @@ var rr = langtools.llamacpp.initRerank(rrmodel, {ubatch:256});
 ```
 
 ## rampart-faiss
+
+### Creating index:
 ```
 rampart.globalize(rampart.utils); // for printf, dateFmt and repl
 
@@ -69,6 +71,9 @@ var faiss = require('rampart-faiss');
 
 // see https://github.com/facebookresearch/faiss/wiki/The-index-factory
 // and https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index
+// Highly recommended that IDMap or IDMap2 is used to store artbitrary ids
+// associated with each vector.  Otherwise the associated id will be sequentially
+// incremented starting with 0.
 var idx = langtools.faiss.openFactory("IDMap2,OPQ96,IVF262144,PQ48", 384);
 
 // the name we will eventually use for the saved index
@@ -113,7 +118,7 @@ var tot=res.tot
 
 sql.exec("select Id, Vec from vecs", {maxRows:-1}, function(row,i) {
     // add vector using addFp16() or addFp32()
-    idx.addFp16(row.Idsec, row.Vec);
+    idx.addFp16(row.Id, row.Vec);
     if( ! (i%10))
     {
         printf("inserted %d of %d: %llu\r", i, tot, row.Id);
@@ -154,6 +159,25 @@ while ( (l=rl.next()) ) {
     );
     rl.refresh();
 }
+```
+
+### Loading existing index:
+```
+var faiss = require('rampart-faiss');
+
+var indname = "all-minilm-vec.OPQ96_IVF262144_PQ48_faiss";
+
+// load index from file into ram
+var idx = faiss.openIndexFromFile(indname);
+// or open read only with memmap to serve from disk:
+var idx = faiss.openIndexFromFile(indname, true);
+
+// use just like in example above.
+var llamacpp = require('rampart-llamacpp');
+var emb = llamacpp.initEmbed('all-minilm-l6-v2_f16.gguf');
+var v = emb.embedTextToFp16Buf(myquery);
+var res = idx.searchFp16(x.avgVec, /*nres = */10, /* nprobe = */128);
+// res is an array of Ids inserted into the index
 ```
 
 ## sentencepiece
