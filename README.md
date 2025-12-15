@@ -6,7 +6,7 @@ git clone https://github.com/aflin/rampart-langtools.git
 mkdir rampart-langtools/build && cd rampart-langtools/build
 cmake ..
 ## or for CUDA build
-cmake LT_ENABLE_GPU=1 ..
+cmake -DLT_ENABLE_GPU=1 ..
 # make and copy modules to current rampart install dir
 make install
 ```
