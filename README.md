@@ -46,7 +46,7 @@ var rrmodel = process.scriptPath + '/data/models/bge-reranker-v2-m3-Q8_0.gguf';
 var rr = llamacpp.initRerank(rrmodel);
 
 // get the score of how well a document/paragraph answers a question:
-var score = rr.rerank = llama_rr.rerank(qestion, mydoc);
+var score = rr.rerank(qestion, mydoc);
 ```
 
 ### Options:
