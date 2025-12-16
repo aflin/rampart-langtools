@@ -189,8 +189,19 @@ var encoder = sp.init('./sentencepiece.bpe.model');
 
 var encoded = encoder.encode('hello there you goat');
 // encoded = ["▁hell","o","▁there","▁you","▁go","at"]
-
 var decoded = sp.decode(encoded); // = "hello there you goat"
 ```
 
+## langtools
+All the modules packaged into one.
+```
+var langtools = require('rampart-langtools');
+var faiss = langtools.faiss;
+var llamacpp = langtools.llamacpp;
+Var sp = langtools.sentencepiece;
+```
 
+## dependencies:
+* libgfortran.so.5
+* libomp.so.5
+* cuda libraries for gpu build on linux
