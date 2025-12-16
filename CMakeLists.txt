@@ -384,10 +384,11 @@ else()
     list(APPEND LLAMA_LIBS
       ${FOUND_LIBS}
     )
-    list(APPEND FAISS_LIBS
-      ${FOUND_LIBS}
-    )
   endif()
+
+  list(APPEND FAISS_LIBS
+    ${FOUND_LIBS}
+  )
 
   target_link_options(rampart-langtools PRIVATE
     "-Wl,-soname,@rpath/rampart-langtools.so"
