@@ -252,6 +252,7 @@ if(APPLE)
     /opt/local/lib
     "${OMP_PREFIX}/lib"
     /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib/
+    /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/
   )
 
   set(LIB_FILES
