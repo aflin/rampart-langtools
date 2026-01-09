@@ -14,6 +14,8 @@ if(APPLE)
 
   if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
     option(LT_ENABLE_GPU "Enable GPU acceleration" ON)
+    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mmacosx-version-min=11.0 -arch arm64")
+    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mmacosx-version-min=11.0 -arch arm64")
   else()
     option(LT_ENABLE_GPU "Enable GPU acceleration" OFF)
   endif()
