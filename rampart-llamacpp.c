@@ -2461,18 +2461,24 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 
 #define MAX_LOG_BUFFER 40960
 
+#include <pthread.h>
+
 struct llog_cap
 {
     char *buf;
     char *pos;  // Current write position
     size_t len;
     size_t alloc;
+    pthread_mutex_t mutex;
 };
 
 static void llamacpp_logger(enum ggml_log_level level, const char *text, void *ud)
 {
     (void)level; // or filter by level
     struct llog_cap *cap = (struct llog_cap *)ud;
+
+    pthread_mutex_lock(&cap->mutex);
+
     size_t text_len = strlen(text);
 
     // Check if adding new text would exceed maximum
@@ -2510,6 +2516,8 @@ static void llamacpp_logger(enum ggml_log_level level, const char *text, void *u
     strcpy(cap->pos, text);
     cap->pos += text_len;
     cap->len += text_len;
+
+    pthread_mutex_unlock(&cap->mutex);
 }
 
 static duk_ret_t getlog(duk_context *ctx)
@@ -2519,10 +2527,12 @@ static duk_ret_t getlog(duk_context *ctx)
     struct llog_cap *caplog = duk_get_pointer(ctx, -1);
     if (caplog)
     {
+        pthread_mutex_lock(&caplog->mutex);
         if (caplog->buf)
             duk_push_string(ctx, caplog->buf);
         else
             duk_push_string(ctx, "");
+        pthread_mutex_unlock(&caplog->mutex);
     }
     else
         RP_THROW(ctx, "Error getting log");
@@ -2535,10 +2545,13 @@ static duk_ret_t resetlog(duk_context *ctx)
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("caplog"));
     struct llog_cap *caplog = duk_get_pointer(ctx, -1);
 
+    pthread_mutex_lock(&caplog->mutex);
     free(caplog->buf);
     caplog->buf = NULL;
+    caplog->pos = NULL;
     caplog->alloc = 0;
     caplog->len = 0;
+    pthread_mutex_unlock(&caplog->mutex);
 
     return 0;
 }
@@ -2562,6 +2575,7 @@ duk_ret_t duk_open_module(duk_context *ctx)
     if (!isloaded)
     {
         CALLOC(cap, sizeof(struct llog_cap));
+        pthread_mutex_init(&cap->mutex, NULL);
         llama_log_set(llamacpp_logger, cap);
 
         duk_push_pointer(ctx, cap);
