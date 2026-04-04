@@ -2484,13 +2484,16 @@ static void llamacpp_logger(enum ggml_log_level level, const char *text, void *u
     // Check if adding new text would exceed maximum
     if (cap->len + text_len > MAX_LOG_BUFFER)
     {
-        // Cut buffer in half, keep second half
+        // Cut buffer in half, keep second half, prepend overflow warning
+        static const char *warn = "WARN: log overflow\n";
+        size_t wlen = strlen(warn);
         size_t half = cap->len / 2;
-        memmove(cap->buf, cap->buf + half, cap->len - half);
-        cap->len = cap->len - half;
+        size_t keep = cap->len - half;
+        memmove(cap->buf + wlen, cap->buf + half, keep);
+        memcpy(cap->buf, warn, wlen);
+        cap->len = wlen + keep;
         cap->buf[cap->len] = '\0';
-        cap->pos = cap->buf + cap->len;  // Update position pointer
-        fprintf(stderr, "WARN: log overflow\n");
+        cap->pos = cap->buf + cap->len;
     }
 
     // Ensure we have enough allocation

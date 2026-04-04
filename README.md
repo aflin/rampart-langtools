@@ -57,8 +57,31 @@ var llamacpp=require('rampart-llamacpp');
 
 // load model
 var rrmodel = process.scriptPath + '/data/models/bge-reranker-v2-m3-Q8_0.gguf';
-var rr = langtools.llamacpp.initRerank(rrmodel, {ubatch:256});
+var rr = llamacpp.initRerank(rrmodel, {ubatch:256});
 ```
+
+### Logging:
+llama.cpp produces log output during model loading and initialization.
+This output is captured in an internal buffer rather than printed to
+stdout/stderr.
+
+```
+var llamacpp=require('rampart-llamacpp');
+var emb = llamacpp.initEmbed('all-minilm-l6-v2_f16.gguf');
+
+// retrieve the captured log output as a string
+var log = llamacpp.getLog();
+console.log(log);
+
+// clear the log buffer
+llamacpp.resetLog();
+```
+
+Note: The log buffer has a maximum size of 40KB.  If it overflows, the
+oldest half of the log is discarded and the first line will read
+"WARN: log overflow".  The log callback is process-global, so in
+multi-threaded usage all threads write to the same buffer.  The buffer
+is protected by a mutex and is safe to use from multiple threads.
 
 ## rampart-faiss
 
@@ -74,7 +97,7 @@ var faiss = require('rampart-faiss');
 // Highly recommended that IDMap or IDMap2 is used to store artbitrary ids
 // associated with each vector.  Otherwise the associated id will be sequentially
 // incremented starting with 0.
-var idx = langtools.faiss.openFactory("IDMap2,OPQ96,IVF262144,PQ48", 384);
+var idx = faiss.openFactory("IDMap2,OPQ96,IVF262144,PQ48", 384);
 
 // the name we will eventually use for the saved index
 var indname = "all-minilm-vec.OPQ96_IVF262144_PQ48_faiss";
