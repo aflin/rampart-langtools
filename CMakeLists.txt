@@ -272,6 +272,7 @@ if(APPLE)
 
   set(LLAMA_LIB_FILES
     libcurl.tbd
+    libomp.a
   )
   find_libraries_in_dirs(LLAMA_FOUND_LIBS FILES ${LLAMA_LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
 
@@ -282,27 +283,17 @@ if(APPLE)
   find_libraries_in_dirs(FAISS_FOUND_LIBS FILES ${FAISS_LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
   list(APPEND FAISS_LIBS ${FAISS_FOUND_LIBS})
 
-  if(LT_ENABLE_GPU)
-    list(APPEND LIBS
+  list(APPEND LIBS
           ${FOUND_LIBS}
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-metal/libggml-metal.a
-    )
-    list(APPEND LLAMA_LIBS
+  )
+  list(APPEND LLAMA_LIBS
           ${LLAMA_FOUND_LIBS}
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-metal/libggml-metal.a
-    )
-  else()
-    list(APPEND LIBS
-          ${FOUND_LIBS}
-          ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
-    )
-    list(APPEND LLAMA_LIBS
-          ${LLAMA_FOUND_LIBS}
-          ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
-    )
-  endif()
+  )
+
   target_link_options(rampart-langtools PRIVATE
     "-Wl,-headerpad_max_install_names"
     "-Wl,-undefined,dynamic_lookup"
