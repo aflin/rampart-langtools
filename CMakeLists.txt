@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Optional suffix for GPU-related output files (e.g., -DSUFFIX=cuda)
+set(SUFFIX "" CACHE STRING "Suffix appended to GPU-related output filenames")
+if(SUFFIX)
+  set(LT_NAME_SUFFIX "_${SUFFIX}")
+else()
+  set(LT_NAME_SUFFIX "")
+endif()
+
 # Common compile flags
 add_compile_options(-Wall -g -O3)
 set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -std=c++17")
@@ -254,7 +262,6 @@ if(APPLE)
     /opt/local/lib
     "${OMP_PREFIX}/lib"
     /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib/
-    /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/
   )
 
   set(LIB_FILES
@@ -299,19 +306,19 @@ if(APPLE)
   target_link_options(rampart-langtools PRIVATE
     "-Wl,-headerpad_max_install_names"
     "-Wl,-undefined,dynamic_lookup"
-    "-Wl,-install_name,@rpath/rampart-langtools.so"
+    "-Wl,-install_name,@rpath/rampart-langtools${LT_NAME_SUFFIX}.so"
   )
 
   target_link_options(rampart-llamacpp PRIVATE
     "-Wl,-headerpad_max_install_names"
     "-Wl,-undefined,dynamic_lookup"
-    "-Wl,-install_name,@rpath/rampart-llamacpp.so"
+    "-Wl,-install_name,@rpath/rampart-llamacpp${LT_NAME_SUFFIX}.so"
   )
 
   target_link_options(rampart-faiss PRIVATE
     "-Wl,-headerpad_max_install_names"
     "-Wl,-undefined,dynamic_lookup"
-    "-Wl,-install_name,@rpath/rampart-faiss.so"
+    "-Wl,-install_name,@rpath/rampart-faiss${LT_NAME_SUFFIX}.so"
   )
 
   target_link_options(rampart-sentencepiece PRIVATE
@@ -395,15 +402,15 @@ else()
   )
 
   target_link_options(rampart-langtools PRIVATE
-    "-Wl,-soname,@rpath/rampart-langtools.so"
+    "-Wl,-soname,@rpath/rampart-langtools${LT_NAME_SUFFIX}.so"
   )
 
   target_link_options(rampart-llamacpp PRIVATE
-    "-Wl,-soname,@rpath/rampart-llamacpp.so"
+    "-Wl,-soname,@rpath/rampart-llamacpp${LT_NAME_SUFFIX}.so"
   )
 
   target_link_options(rampart-faiss PRIVATE
-    "-Wl,-soname,@rpath/rampart-faiss.so"
+    "-Wl,-soname,@rpath/rampart-faiss${LT_NAME_SUFFIX}.so"
   )
 
   ## OLD LINUX
@@ -454,18 +461,21 @@ set_target_properties(
     rampart-langtools
     PROPERTIES SUFFIX ".so"
     PREFIX ""
+    OUTPUT_NAME "rampart-langtools${LT_NAME_SUFFIX}"
 )
 
 set_target_properties(
     rampart-llamacpp
     PROPERTIES SUFFIX ".so"
     PREFIX ""
+    OUTPUT_NAME "rampart-llamacpp${LT_NAME_SUFFIX}"
 )
 
 set_target_properties(
     rampart-faiss
     PROPERTIES SUFFIX ".so"
     PREFIX ""
+    OUTPUT_NAME "rampart-faiss${LT_NAME_SUFFIX}"
 )
 
 set_target_properties(
@@ -480,7 +490,6 @@ if(NOT DEFINED LT_ENABLE_GPU_LAST)
 else()
     message(STATUS "GPU set ${LT_ENABLE_GPU}, was set ${LT_ENABLE_GPU_LAST}")
 endif()
-
 
 #always rebuild if we change to/from gpu build
 if("${LT_ENABLE_GPU}" STREQUAL "${LT_ENABLE_GPU_LAST}")
@@ -595,8 +604,8 @@ install(TARGETS rampart-sentencepiece
   DESTINATION "${RP_PATH}/modules"
 )
 
-install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-langtools.so\")")
-install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llamacpp.so\")")
-install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-faiss.so\")")
+install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-langtools${LT_NAME_SUFFIX}.so\")")
+install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llamacpp${LT_NAME_SUFFIX}.so\")")
+install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-faiss${LT_NAME_SUFFIX}.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-sentencepiece.so\")")
 
