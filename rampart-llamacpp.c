@@ -78,7 +78,7 @@ static int rp_check_stop(const struct llama_vocab *vocab, llama_token tok,
     if (token_index >= max_tokens)
         return 1;
 
-    // --- 4) check control token
+    // --- 4) check for special/template tokens in the text
     if (token_index && tokstr)
     {
         // make sure its terminated
@@ -86,6 +86,8 @@ static int rp_check_stop(const struct llama_vocab *vocab, llama_token tok,
         if (strstr(tokstr, "assistant"))
             return 1;
         if (strstr(tokstr, "end"))
+            return 1;
+        if (strstr(tokstr, "<|im_"))
             return 1;
     }
 
@@ -454,13 +456,7 @@ static int gen_async_one(void *arg, int stage)
 
         int is_control = llama_vocab_is_control(linfo->vocab, tok);
 
-        if (is_control && rp_check_stop(linfo->vocab, tok, linfo->n_generated + 1, linfo->max_tokens, piece, plen))
-        {
-            linfo->stop = 1;
-            duk_set_top(ctx, top);
-            return 1;
-        }
-        else if (rp_check_stop(linfo->vocab, tok, linfo->n_generated + 1, linfo->max_tokens, NULL, 0))
+        if (rp_check_stop(linfo->vocab, tok, linfo->n_generated + 1, linfo->max_tokens, piece, plen))
         {
             linfo->stop = 1;
             duk_set_top(ctx, top);
