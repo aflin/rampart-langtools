@@ -1693,6 +1693,8 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
     info->cur_pos = 0;
     info->cp = cp;
     info->mtmd_ctx = mtmd_ctx;
+    info->init_thr = get_thread_num();
+    info->init_pid = (int)getpid();
 
     duk_push_object(ctx); // return object
 
