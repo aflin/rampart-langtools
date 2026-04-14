@@ -17,6 +17,8 @@
 #include <stdbool.h>
 
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 #include "rampart-langtools.h"
 #include "rampart.h"
 #include "spm_c_wrapper.h"

@@ -49,7 +49,127 @@ var rr = llamacpp.initRerank(rrmodel);
 var score = rr.rerank(qestion, mydoc);
 ```
 
-### Options:
+### Text Generation:
+```
+var llamacpp = require('rampart-llamacpp');
+
+// load a text model
+var gen = llamacpp.initGen('/path/to/model.gguf', {
+    threads: 4,
+    nCtx: 4096
+});
+
+// generate with a simple prompt (callback receives each token as it is generated)
+gen.predict({
+    prompt: "Explain how a combustion engine works.",
+    maxTokens: 256,
+    temp: 0.7,
+    resetMem: true
+}, function(piece) {
+    rampart.utils.printf("%s", piece);
+});
+
+// or use chat-style messages
+gen.predict({
+    messages: [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user",   content: "What is the capital of France?" }
+    ],
+    maxTokens: 128,
+    resetMem: true
+}, function(piece) {
+    rampart.utils.printf("%s", piece);
+});
+
+// retrieve the full text of the last generation
+var fullText = gen.getLast();
+
+// free resources when done
+gen.destroy();
+```
+
+### Vision / Image Description (LLaVA):
+Vision models like LLaVA can describe images.  They require two GGUF files:
+the main text model and a multimodal projector (mmproj).
+
+```
+var llamacpp = require('rampart-llamacpp');
+
+// load model with the mmproj option
+var gen = llamacpp.initGen('/path/to/llava-model.gguf', {
+    mmproj: '/path/to/llava-mmproj-f16.gguf',
+    threads: 4,
+    nCtx: 2048
+});
+
+// describe an image
+gen.predict({
+    prompt: "Describe this image in detail.",
+    image: "/path/to/photo.jpg",
+    maxTokens: 256,
+    temp: 0.1,
+    resetMem: true
+}, function(piece) {
+    rampart.utils.printf("%s", piece);
+});
+
+gen.destroy();
+```
+
+The `image` option accepts a file path to a JPEG, PNG, BMP, or GIF image.
+The image marker is automatically inserted into the prompt before the
+chat template is applied.
+
+Tested models include:
+- LLaVA-Phi-3 Mini (xtuner/llava-phi-3-mini-gguf) - smallest, ~2.2 GB
+- LLaVA 1.6 Vicuna 7B (cjpais/llava-v1.6-vicuna-7b-gguf) - ~3.9 GB
+
+### initGen Options:
+```
+var gen = llamacpp.initGen('/path/to/model.gguf', {
+    // Model params
+    useMmap:    true,       // use memory-mapped IO (default: false)
+    useMlock:   false,      // lock model in RAM (default: false)
+    vocabOnly:  false,      // load vocabulary only (default: false)
+    mmproj:     undefined,  // path to mmproj .gguf for vision models
+
+    // Context params
+    nCtx:       0,          // context size (0 = auto from available memory)
+    threads:    1,          // number of threads
+    threadsBatch: 1,        // threads for batch processing
+    nBatch:     0,          // batch size
+    nUBatch:    0,          // micro-batch size
+    flashAttn:  false,      // enable flash attention
+    cacheType:  'F16',      // KV cache type: F16, F32, BF16, Q8_0, Q4_0, etc.
+    offloadKQV: false,      // offload KQV to GPU
+    opOffload:  false,      // offload operations to GPU
+});
+```
+
+### predict Options:
+```
+gen.predict({
+    // Prompt (use one or the other)
+    prompt:   "...",                   // simple text prompt
+    messages: [{role, content}, ...],  // chat-style messages
+
+    // Vision
+    image:    "/path/to/image.jpg",   // image file for vision models
+
+    // Generation params
+    maxTokens:     12800,  // maximum tokens to generate
+    temp:          0.8,    // temperature
+    topP:          0.95,   // top-p sampling
+    topK:          40,     // top-k sampling
+    repeatPenalty: 1.1,    // repetition penalty
+    repeatLastN:   -1,     // tokens to consider for repeat penalty (-1 = auto)
+    resetMem:      false,  // clear KV cache before this generation
+}, function(piece) {
+    // callback receives each generated token
+});
+```
+
+### Other Options:
 ```
 // options like nctx, n_threads_batch, batch, ubatch can also be set:
 // load module

@@ -10,7 +10,6 @@ endif()
 
 add_subdirectory(${EXTERN_DIR}/llama.cpp ${CMAKE_BINARY_DIR}/extern/llama.cpp EXCLUDE_FROM_ALL)
 
-
 # SENTENCEPIECE
 set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(${EXTERN_DIR}/sentencepiece EXCLUDE_FROM_ALL)

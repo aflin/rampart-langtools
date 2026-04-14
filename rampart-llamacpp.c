@@ -18,6 +18,8 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 #include "rampart.h"
 
 #ifdef __APPLE__
@@ -270,6 +272,7 @@ typedef struct rp_llama_info
     struct llama_context_params cp;
     int init_thr;
     int init_pid;
+    struct mtmd_context *mtmd_ctx; // NULL for text-only models
 
     // for async:
     duk_context *ctx;
@@ -492,7 +495,7 @@ static int gen_async_one(void *arg, int stage)
                     return 1;
                 }
             }
-            else // we are sync
+            else if (linfo->func_idx >= 0) // we are sync with callback
             {
                 duk_dup(ctx, linfo->func_idx);
                 duk_push_this(ctx);
@@ -500,14 +503,17 @@ static int gen_async_one(void *arg, int stage)
                 duk_call_method(ctx, 1);
             }
 
-            if (duk_get_boolean_default(ctx, -1, 0))
+            if (linfo->func_idx >= 0)
             {
-                linfo->stop = 1;
+                if (duk_get_boolean_default(ctx, -1, 0))
+                {
+                    linfo->stop = 1;
+                    duk_pop(ctx);
+                    duk_set_top(ctx, top);
+                    return 1;
+                }
                 duk_pop(ctx);
-                duk_set_top(ctx, top);
-                return 1;
             }
-            duk_pop(ctx);
         }
     }
 
@@ -640,75 +646,207 @@ rp_llama_info *prep_predict(duk_context *ctx, int is_async)
     }
     duk_pop(ctx);
 
+    // Check for image option (vision models)
+    char *image_path = NULL;
+    if (duk_get_prop_string(ctx, 0, "image"))
+    {
+        const char *tmp = REQUIRE_STRING(ctx, -1, "image must be a string (file path)");
+        image_path = strdup(tmp);
+    }
+    duk_pop(ctx);
+
+    if (image_path && !linfo->mtmd_ctx)
+    {
+        free(image_path);
+        RP_THROW(ctx, "image option requires model loaded with mmproj");
+    }
+
+    // If image is present, inject the media marker into the user's prompt/message
+    // BEFORE the chat template is applied, so it ends up inside the template
+    if (image_path)
+    {
+        const char *marker = mtmd_default_marker();
+
+        if (duk_get_prop_string(ctx, 0, "prompt"))
+        {
+            const char *orig = duk_get_string(ctx, -1);
+            if (orig && !strstr(orig, marker))
+            {
+                // build new string while orig is still on the stack
+                duk_push_sprintf(ctx, "%s\n%s", marker, orig);
+                duk_put_prop_string(ctx, 0, "prompt");
+            }
+            duk_pop(ctx); // pop original prompt value
+        }
+        else
+        {
+            duk_pop(ctx);
+            // For messages path: prepend marker to last user message content
+            if (duk_get_prop_string(ctx, 0, "messages") && duk_is_array(ctx, -1))
+            {
+                int n = (int)duk_get_length(ctx, -1);
+                for (int mi = n - 1; mi >= 0; mi--)
+                {
+                    duk_get_prop_index(ctx, -1, (duk_uarridx_t)mi);
+                    duk_get_prop_string(ctx, -1, "role");
+                    const char *role = duk_get_string(ctx, -1);
+                    duk_pop(ctx); // role string
+                    if (role && strcmp(role, "user") == 0)
+                    {
+                        duk_get_prop_string(ctx, -1, "content");
+                        const char *content = duk_get_string(ctx, -1);
+                        if (content && !strstr(content, marker))
+                        {
+                            duk_push_sprintf(ctx, "%s\n%s", marker, content);
+                            duk_put_prop_string(ctx, -3, "content");
+                        }
+                        duk_pop(ctx); // content (original)
+                        duk_pop(ctx); // message object
+                        break;
+                    }
+                    duk_pop(ctx); // message object
+                }
+            }
+            duk_pop(ctx); // messages array
+        }
+    }
+
     // Build the prompt string from {prompt} or {messages,...}
     size_t prompt_len = 0;
     char *prompt = rp_build_prompt(ctx, 0, lmodel, &prompt_len);
 
-    duk_push_this(ctx);
-    duk_push_string(ctx, prompt);
-    duk_put_prop_string(ctx, -2, "lastRawPrompt");
-    duk_pop(ctx);
-
-    // Tokenize the prompt
-    int cap = (int)(prompt_len + 8);
     llama_token *inp = NULL;
-    REMALLOC(inp, sizeof(llama_token) * (size_t)cap);
+    int n_inp = 0;
+    int n_keep;
 
-    int n_inp = llama_tokenize(vocab, prompt, (int)prompt_len, inp, cap, /*add_special*/ true, /*parse_special*/ true);
-
-    if (n_inp >= cap)
+    if (image_path && linfo->mtmd_ctx)
     {
-        cap = n_inp + 8;
-        REMALLOC(inp, sizeof(llama_token) * (size_t)cap);
-        n_inp = llama_tokenize(vocab, prompt, (int)prompt_len, inp, cap, true, true);
+        // === Vision path ===
+
+        duk_push_this(ctx);
+        duk_push_string(ctx, prompt);
+        duk_put_prop_string(ctx, -2, "lastRawPrompt");
+        duk_pop(ctx);
+
+        // Load image
+        mtmd_bitmap *bmp = mtmd_helper_bitmap_init_from_file(linfo->mtmd_ctx, image_path);
+        free(image_path);
+        image_path = NULL;
+
+        if (!bmp)
+        {
+            free(prompt);
+            RP_THROW(ctx, "Failed to load image");
+        }
+
+        // Tokenize with mtmd
+        mtmd_input_text text_input;
+        text_input.text = prompt;
+        text_input.add_special = true;
+        text_input.parse_special = true;
+
+        mtmd_input_chunks *chunks = mtmd_input_chunks_init();
+        const mtmd_bitmap *bitmaps[] = { bmp };
+
+        int32_t tok_res = mtmd_tokenize(linfo->mtmd_ctx, chunks, &text_input, bitmaps, 1);
+        mtmd_bitmap_free(bmp);
+
+        if (tok_res != 0)
+        {
+            mtmd_input_chunks_free(chunks);
+            free(prompt);
+            RP_THROW(ctx, "mtmd_tokenize failed (error %d)", tok_res);
+        }
+
+        // Eval all chunks (handles text + image encoding internally)
+        int32_t nbatch = linfo->cp.n_batch ? (int32_t)linfo->cp.n_batch : 2048;
+        llama_pos new_n_past = (llama_pos)cur_pos;
+
+        int32_t eval_res = mtmd_helper_eval_chunks(
+            linfo->mtmd_ctx, lctx, chunks,
+            new_n_past, /*seq_id*/ 0,
+            nbatch, /*logits_last*/ true, &new_n_past
+        );
+
+        mtmd_input_chunks_free(chunks);
+        free(prompt);
+
+        if (eval_res != 0)
+            RP_THROW(ctx, "Failed to evaluate prompt with image");
+
+        cur_pos = (uint32_t)new_n_past;
+        n_keep = (int)cur_pos;
     }
+    else
+    {
+        // === Text-only path ===
+        free(image_path); // NULL is fine
+
+        duk_push_this(ctx);
+        duk_push_string(ctx, prompt);
+        duk_put_prop_string(ctx, -2, "lastRawPrompt");
+        duk_pop(ctx);
+
+        // Tokenize the prompt
+        int cap = (int)(prompt_len + 8);
+        REMALLOC(inp, sizeof(llama_token) * (size_t)cap);
+
+        n_inp = llama_tokenize(vocab, prompt, (int)prompt_len, inp, cap, /*add_special*/ true, /*parse_special*/ true);
+
+        if (n_inp >= cap)
+        {
+            cap = n_inp + 8;
+            REMALLOC(inp, sizeof(llama_token) * (size_t)cap);
+            n_inp = llama_tokenize(vocab, prompt, (int)prompt_len, inp, cap, true, true);
+        }
 
 #ifdef GPT_IS_SMART_HAH
-    // 1) Ask the model if it wants a BOS token automatically
-    bool need_bos = llama_vocab_get_add_bos(vocab); // same predicate main.cpp uses
-    if (need_bos)
-    {
-        const llama_token bos = llama_token_bos(vocab);
-
-        // 2) If the first token is not already BOS, prepend it
-        if (n_inp == 0 || inp[0] != bos)
+        // 1) Ask the model if it wants a BOS token automatically
+        bool need_bos = llama_vocab_get_add_bos(vocab); // same predicate main.cpp uses
+        if (need_bos)
         {
-            // ensure capacity (grow if you're using a fixed buffer)
-            if (n_inp == cap)
+            const llama_token bos = llama_token_bos(vocab);
+
+            // 2) If the first token is not already BOS, prepend it
+            if (n_inp == 0 || inp[0] != bos)
             {
-                // reallocate inp[] to a larger buffer; or assert/grow your vector
-                // (do whatever you already do elsewhere on overflow)
+                // ensure capacity (grow if you're using a fixed buffer)
+                if (n_inp == cap)
+                {
+                    // reallocate inp[] to a larger buffer; or assert/grow your vector
+                    // (do whatever you already do elsewhere on overflow)
+                }
+                printf("needed bos\n");
+                memmove(&inp[1], &inp[0], n_inp * sizeof(inp[0]));
+                inp[0] = bos;
+                n_inp += 1;
             }
-            printf("needed bos\n");
-            memmove(&inp[1], &inp[0], n_inp * sizeof(inp[0]));
-            inp[0] = bos;
-            n_inp += 1;
         }
-    }
 #endif
 
-    int n_keep = n_inp; // keep at least the whole prompt by default
-    // track how many tokens are already in the KV after you decoded the prompt:
+        n_keep = n_inp; // keep at least the whole prompt by default
+        // track how many tokens are already in the KV after you decoded the prompt:
 
-    cur_pos += n_inp;
+        cur_pos += n_inp;
 
-    free(prompt);
+        free(prompt);
 
-    if (n_inp < 0)
-    {
-        free(inp);
-        // if (stops){for(int i=0;i<nstops;++i) free(stops[i].ptr); free(stops);}
-        RP_THROW(ctx, "tokenize prompt failed");
-    }
-
-    // Feed the prompt TODO: if we are near end of n_ctx, we need to compact here too.
-    {
-        struct llama_batch batch = llama_batch_get_one(inp, n_inp);
-        if (llama_decode(lctx, batch) != 0)
+        if (n_inp < 0)
         {
             free(inp);
             // if (stops){for(int i=0;i<nstops;++i) free(stops[i].ptr); free(stops);}
-            RP_THROW(ctx, "llama_decode(prompt) failed");
+            RP_THROW(ctx, "tokenize prompt failed");
+        }
+
+        // Feed the prompt TODO: if we are near end of n_ctx, we need to compact here too.
+        {
+            struct llama_batch batch = llama_batch_get_one(inp, n_inp);
+            if (llama_decode(lctx, batch) != 0)
+            {
+                free(inp);
+                // if (stops){for(int i=0;i<nstops;++i) free(stops[i].ptr); free(stops);}
+                RP_THROW(ctx, "llama_decode(prompt) failed");
+            }
         }
     }
 
@@ -858,6 +996,9 @@ duk_ret_t get_last_gen(duk_context *ctx)
 static duk_ret_t gen_free(duk_context *ctx)
 {
     rp_llama_info *info = rp_get_llama_info(ctx);
+
+    if (info->mtmd_ctx)
+        mtmd_free(info->mtmd_ctx);
 
     llama_free(info->lctx);
 
@@ -1043,6 +1184,7 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
     struct llama_model *lmodel = NULL;
     struct llama_context *lctx = NULL;
     int store_last = 1;
+    char *mmproj_path = NULL;
 
     // ---------------- Model params ----------------
     struct llama_model_params mp = llama_model_default_params();
@@ -1073,6 +1215,13 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
 
         if (duk_get_prop_string(ctx, obj_idx, "storeLastRawPrompt"))
             store_last = REQUIRE_BOOL(ctx, -1, "storeLastRawPrompt must be boolean");
+        duk_pop(ctx);
+
+        if (duk_get_prop_string(ctx, obj_idx, "mmproj"))
+        {
+            const char *tmp = REQUIRE_STRING(ctx, -1, "mmproj must be a string (path to mmproj .gguf)");
+            mmproj_path = strdup(tmp);
+        }
         duk_pop(ctx);
     }
 
@@ -1419,7 +1568,34 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
 
     lctx = llama_init_from_model(lmodel, cp);
     if (!lctx)
+    {
+        free(mmproj_path);
         RP_THROW(ctx, "rampart-llama-cpp:initGen - Failed to create llama context");
+    }
+
+    // Optional multimodal projector (for vision models like LLaVA)
+    struct mtmd_context *mtmd_ctx = NULL;
+    if (mmproj_path)
+    {
+        struct mtmd_context_params mparams = mtmd_context_params_default();
+#ifdef LT_ENABLE_GPU
+        mparams.use_gpu = true;
+#else
+        mparams.use_gpu = false;
+#endif
+        mparams.n_threads = cp.n_threads;
+        mparams.print_timings = false;
+
+        mtmd_ctx = mtmd_init_from_file(mmproj_path, lmodel, mparams);
+        free(mmproj_path);
+        mmproj_path = NULL;
+        if (!mtmd_ctx)
+        {
+            llama_free(lctx);
+            llama_model_free(lmodel);
+            RP_THROW(ctx, "rampart-llama-cpp:initGen - Failed to load mmproj");
+        }
+    }
 
     // Info
     const struct llama_vocab *vocab = llama_model_get_vocab(lmodel);
@@ -1443,6 +1619,7 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
     info->store_last = store_last;
     info->cur_pos = 0;
     info->cp = cp;
+    info->mtmd_ctx = mtmd_ctx;
 
     duk_push_object(ctx); // return object
 
