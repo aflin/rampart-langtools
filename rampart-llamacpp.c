@@ -337,6 +337,15 @@ static int batch_and_decode(duk_context *ctx, struct llama_context *lctx, llama_
 
 static int gen_async_one(void *arg, int unused);
 
+// append an error message to linfo->errmsg, separated by newline
+static void linfo_append_err(rp_llama_info *linfo, const char *msg)
+{
+    if (linfo->errmsg)
+        linfo->errmsg = (const char *)strjoin((char *)linfo->errmsg, (char *)msg, '\n');
+    else
+        linfo->errmsg = strdup(msg);
+}
+
 static int gen_cleanup(rp_llama_info *linfo)
 {
     duk_context *ctx = linfo->ctx;
@@ -352,13 +361,15 @@ static int gen_cleanup(rp_llama_info *linfo)
     {
         duk_push_sprintf(ctx, "llamathis_%p", linfo->func_ptr);
         duk_get_prop(ctx, -3);
-        if (duk_pcall_method(ctx, 0) != 0)
+        // pass error message (or undefined) to the final callback
+        if (linfo->errmsg)
+            duk_push_string(ctx, linfo->errmsg);
+        else
+            duk_push_undefined(ctx);
+        if (duk_pcall_method(ctx, 1) != 0)
         {
-            const char *errmsg;
-
-            errmsg = rp_push_error(ctx, -1, NULL, rp_print_error_lines);
-            fprintf(stderr, "In final callback: %s\n", errmsg);
-
+            const char *e = rp_push_error(ctx, -1, NULL, rp_print_error_lines);
+            linfo_append_err(linfo, e);
             duk_pop(ctx);
         }
     }
@@ -437,7 +448,7 @@ static int gen_async_one(void *arg, int stage)
         {
             linfo->stop = 1;
             duk_set_top(ctx, top);
-            linfo->errmsg = "llama_token_to_piece() failed";
+            linfo_append_err(linfo, "llama_token_to_piece() failed");
             return 1;
         }
 
@@ -484,11 +495,8 @@ static int gen_async_one(void *arg, int stage)
                 duk_push_lstring(ctx, piece, (duk_size_t)plen);
                 if (duk_pcall_method(ctx, 1) != 0)
                 {
-                    const char *errmsg;
-
-                    errmsg = rp_push_error(ctx, -1, NULL, rp_print_error_lines);
-                    fprintf(stderr, "In final callback: %s\n", errmsg);
-
+                    const char *e = rp_push_error(ctx, -1, NULL, rp_print_error_lines);
+                    linfo_append_err(linfo, e);
                     duk_pop(ctx);
                     linfo->stop = 1;
                     duk_set_top(ctx, top);
@@ -521,7 +529,7 @@ static int gen_async_one(void *arg, int stage)
     {
         linfo->stop = 1;
         duk_set_top(ctx, top);
-        linfo->errmsg = "llama_decode() failed";
+        linfo_append_err(linfo, "llama_decode() failed");
         return 1;
     }
 
@@ -963,6 +971,8 @@ static duk_ret_t gen_predict(duk_context *ctx)
 
     rp_llama_info *linfo = prep_predict(ctx, 0);
 
+    linfo->errmsg = NULL;
+
     while (1)
     {
         gen_async_one(linfo, 0);
@@ -971,6 +981,14 @@ static duk_ret_t gen_predict(duk_context *ctx)
             gen_async_one(linfo, 1); // cleanup
             break;
         }
+    }
+
+    if (linfo->errmsg)
+    {
+        duk_push_error_object(ctx, DUK_ERR_ERROR, "%s", linfo->errmsg);
+        free((char *)linfo->errmsg);
+        linfo->errmsg = NULL;
+        (void) duk_throw(ctx);
     }
 
     if (linfo->func_idx == -1) // no callback
