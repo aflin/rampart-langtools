@@ -192,11 +192,20 @@ struct clip_image_f32 {
 // logging
 //
 
+// Use ggml logging -ajf 2026-04-13
+//static void clip_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
+//    (void) level;
+//    (void) user_data;
+//    fputs(text, stderr);
+//    fflush(stderr);
+//}
+#ifdef __cplusplus
+extern "C"
+#endif
+void ggml_log_internal(enum ggml_log_level level, const char * format, ...);
 static void clip_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
     (void) user_data;
-    fputs(text, stderr);
-    fflush(stderr);
+    ggml_log_internal(level, "%s", text);
 }
 
 struct clip_logger_state {

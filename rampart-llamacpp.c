@@ -1603,6 +1603,7 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
 #endif
         mparams.n_threads = cp.n_threads;
         mparams.print_timings = false;
+        mparams.verbosity = GGML_LOG_LEVEL_WARN;
 
         mtmd_ctx = mtmd_init_from_file(mmproj_path, lmodel, mparams);
         free(mmproj_path);
