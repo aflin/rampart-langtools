@@ -11,6 +11,19 @@ cmake -DLT_ENABLE_GPU=1 ..
 make install
 ```
 ## rampart-llamacpp use:
+
+The primary use cases for rampart-llamacpp are **embedding generation**
+(`initEmbed`) and **reranking** (`initRerank`), where the model runs
+directly inside the rampart process.  Text generation (`initGen`) and
+vision/image description are also supported and useful for tasks like
+bulk image captioning, but for general-purpose LLM chat and inference,
+[llama.cpp's llama-server](https://github.com/ggml-org/llama.cpp) is
+more robust and performant.  The
+[rampart-llm.js](https://rampart.dev/docs/rampart-extras.html#rampart-llm)
+module provides a streaming client for llama-server (and Ollama) with
+an OpenAI-compatible API, and is the recommended approach for
+integrating LLM capabilities into rampart applications.
+
 ### Embeddings:
 ```
 // load module
