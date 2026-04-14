@@ -282,6 +282,60 @@ typedef struct rp_llama_info
     const char *errmsg;
 } rp_llama_info;
 
+// Trim trailing template/control junk from the output buffer.
+// Handles cases where multi-token sequences like "<|im_" + "end|>"
+// partially make it into the buffer before the stop triggers.
+static void rp_trim_output(rp_llama_info *linfo)
+{
+    if (!linfo->out || linfo->out_len == 0)
+        return;
+
+    // patterns that indicate template junk leaked into output
+    static const char *junk[] = {
+        "<|im_",
+        "<|",
+        "You are a helpful AI",
+        "<|assistant",
+        "<|user",
+        "<|system",
+        NULL
+    };
+
+    for (const char **p = junk; *p; p++)
+    {
+        size_t plen = strlen(*p);
+        char *buf = linfo->out;
+        char *found = NULL;
+        char *search = buf;
+
+        // find last occurrence
+        while (search < buf + linfo->out_len)
+        {
+            char *m = (char *)memmem(search, linfo->out_len - (size_t)(search - buf), *p, plen);
+            if (!m)
+                break;
+            found = m;
+            search = m + 1;
+        }
+
+        if (found)
+        {
+            // truncate at the junk
+            linfo->out_len = (size_t)(found - buf);
+        }
+    }
+
+    // trim trailing whitespace/newlines
+    while (linfo->out_len > 0 &&
+           (linfo->out[linfo->out_len - 1] == ' '  ||
+            linfo->out[linfo->out_len - 1] == '\n' ||
+            linfo->out[linfo->out_len - 1] == '\r' ||
+            linfo->out[linfo->out_len - 1] == '\t'))
+    {
+        linfo->out_len--;
+    }
+}
+
 static rp_llama_info *rp_get_llama_info(duk_context *ctx)
 {
     if (!ctx)
@@ -987,6 +1041,8 @@ static duk_ret_t gen_predict(duk_context *ctx)
         (void) duk_throw(ctx);
     }
 
+    rp_trim_output(linfo);
+
     if (linfo->func_idx == -1) // no callback
         duk_push_lstring(ctx, linfo->out, linfo->out_len);
     else
@@ -998,6 +1054,8 @@ static duk_ret_t gen_predict(duk_context *ctx)
 duk_ret_t get_last_gen(duk_context *ctx)
 {
     rp_llama_info *linfo = rp_get_llama_info(ctx);
+
+    rp_trim_output(linfo);
 
     if (linfo->out)
         duk_push_lstring(ctx, linfo->out, linfo->out_len);
