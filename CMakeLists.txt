@@ -88,6 +88,7 @@ set(LIBS
     ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml-base.a
     ${CMAKE_CURRENT_BINARY_DIR}/extern/sentencepiece/src/libsentencepiece.a
     spm_c_wrapper_obj
+    llama_gen_shim_obj
     ${CMAKE_CURRENT_BINARY_DIR}/extern/faiss/c_api/libfaiss_c.a
     ${CMAKE_CURRENT_BINARY_DIR}/extern/faiss/faiss/libfaiss.a
     -lpthread
@@ -115,6 +116,7 @@ set(FAISS_LIBS
 set(SP_LIBS
     ${CMAKE_CURRENT_BINARY_DIR}/extern/sentencepiece/src/libsentencepiece.a
     spm_c_wrapper_obj
+    llama_gen_shim_obj
     -lpthread
 )
 

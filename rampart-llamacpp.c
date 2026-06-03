@@ -1658,7 +1658,8 @@ static duk_ret_t llamacpp_init_gen(duk_context *ctx)
 #endif
         mparams.n_threads = cp.n_threads;
         mparams.print_timings = false;
-        mparams.verbosity = GGML_LOG_LEVEL_WARN;
+        // NOTE: mtmd_context_params.verbosity was removed in llama.cpp b9494;
+        // logging verbosity is now controlled globally via llama_log_set().
 
         mtmd_ctx = mtmd_init_from_file(mmproj_path, lmodel, mparams);
         free(mmproj_path);
@@ -1901,6 +1902,13 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
     // batch must be equal or greater, to prevent clamping
     cp.n_batch = cp.n_ubatch;
 
+    // b9494: match llama.cpp's embedding tool (examples/embedding/embedding.cpp).
+    // Enabling a unified KV cache makes the context actually allocate a memory;
+    // without it llama_decode produces no pooled output (NULL/NaN) and LLM-arch
+    // embedders (qwen2vl/qwen3) null-deref in the KV-cache code path.
+    cp.n_seq_max  = (uint32_t)llama_max_parallel_sequences();
+    cp.kv_unified = true;
+
     void *cp_buf = duk_push_fixed_buffer(ctx, sizeof(struct llama_context_params));
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("cp_buf"));
     memcpy(cp_buf, &cp, sizeof(struct llama_context_params));
@@ -2045,6 +2053,8 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
 
     const enum llama_pooling_type p = llama_pooling_type(lctx);
 
+    llama_set_embeddings(lctx, true); // b9494: ensure embeddings output mode is on
+
     for (int start = 0; start < nw; start += stride, ++k)
     {
         llama_memory_clear(llama_get_memory(lctx), /*clear_kv=*/true);
@@ -2078,13 +2088,15 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
             batch.logits[i] = 1;    // contribute to pooled embedding
         }
         batch.n_tokens = n;
-        batch.logits = false;
+        // NOTE (llama.cpp b9494): embedding/pooling now uses llama_decode with the
+        // per-token output flags (batch.logits[i]=1) set above; the old workaround
+        // of nulling batch.logits and calling llama_encode yields no pooled output.
 
-        if (llama_encode(lctx, batch) != 0)
+        if (llama_decode(lctx, batch) != 0)
         {
             llama_batch_free(batch);
             free(toks);
-            RP_THROW(ctx, "llama_encode failed on chunk %d (tokens %d..%d)", k, start, start + n - 1);
+            RP_THROW(ctx, "llama_decode failed on chunk %d (tokens %d..%d)", k, start, start + n - 1);
             return 0;
         }
 
@@ -2370,6 +2382,8 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
     h->cp.n_ctx     = n_train > 0 ? n_train : 0;
     h->cp.n_ubatch  = h->cp.n_ctx > 0 ? h->cp.n_ctx : 0;
     h->cp.n_batch   = h->cp.n_ubatch;
+    h->cp.n_seq_max  = (uint32_t)llama_max_parallel_sequences(); // b9494: unified KV
+    h->cp.kv_unified = true;
 
     h->lctx = llama_init_from_model(h->lmodel, h->cp);
     if (!h->lctx) {
@@ -2443,6 +2457,8 @@ static size_t rp_embed_compute_avgvec(rp_embed_handle_t *h,
     int k = 0;
     const enum llama_pooling_type p = llama_pooling_type(lctx);
 
+    llama_set_embeddings(lctx, true); // b9494: ensure embeddings output mode is on
+
     for (int start = 0; start < nw; start += stride, ++k) {
         llama_memory_clear(llama_get_memory(lctx), /*clear_kv=*/true);
         int n = nw - start;
@@ -2471,12 +2487,11 @@ static size_t rp_embed_compute_avgvec(rp_embed_handle_t *h,
             batch.logits[i]   = 1;
         }
         batch.n_tokens = n;
-        batch.logits   = false;
 
-        if (llama_encode(lctx, batch) != 0) {
+        if (llama_decode(lctx, batch) != 0) {
             llama_batch_free(batch);
             free(toks); free(avgvec);
-            if (err) snprintf(err, errlen, "llama_encode failed on chunk %d", k);
+            if (err) snprintf(err, errlen, "llama_decode failed on chunk %d", k);
             return 0;
         }
 
@@ -2798,14 +2813,17 @@ float rerank_one(duk_context *ctx, struct llama_context *lctx, struct llama_mode
     }
     batch.n_tokens = n_tokens;
 
-    // Use llama_encode (not llama_decode) for embedding/reranking tasks
-    int ret = llama_encode(lctx, batch);
+    // llama.cpp b9494: must explicitly enable embeddings output mode; setting
+    // cp.embeddings at context creation is no longer sufficient. Encoder models
+    // (BERT/RANK reranker) have no KV memory, so use llama_encode (not decode).
+    llama_set_embeddings(lctx, true);
+    int ret = llama_decode(lctx, batch);
 
     llama_batch_free(batch);
     free(tokens);
 
     if (ret != 0)
-        RP_THROW(ctx, "llama_encode failed for reranking");
+        RP_THROW(ctx, "llama_decode failed for reranking");
 
     // Get embeddings using llama_get_embeddings_seq
     const float *emb = llama_get_embeddings_seq(lctx, 0);
@@ -3037,6 +3055,11 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 
     //prevent clamping
     cp.n_batch = cp.n_ubatch;
+
+    // b9494: unified KV cache so the RANK context allocates memory (see
+    // examples/embedding/embedding.cpp); without it the rerank score reads as 0.
+    cp.n_seq_max  = (uint32_t)llama_max_parallel_sequences();
+    cp.kv_unified = true;
 
     lctx = llama_init_from_model(lmodel, cp);
 

@@ -8,6 +8,42 @@ if(NOT APPLE)
   set(GGML_CUDA ${LT_ENABLE_GPU} CACHE BOOL "" FORCE)
 endif()
 
+# Work around a clang/ggml interaction that breaks the build under
+# virtualization (e.g. macOS guests in UTM).  ggml's -mcpu=native build probes
+# CPU features by *running* a test binary; when the host advertises i8mm but the
+# guest cannot execute it (sysctl hw.optional.arm.FEAT_I8MM == 0), ggml appends
+# +noi8mm to -mcpu=native.  clang still defines __ARM_FEATURE_MATMUL_INT8 for
+# that flag combination, so the i8mm code path compiles in while codegen has the
+# feature disabled, failing with "always_inline 'vmmlaq_s32' requires target
+# feature 'i8mm'".  On bare metal (i8mm present) -mcpu=native is fine, so only
+# disable GGML_NATIVE and pin an explicit -march when i8mm is actually missing.
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+  execute_process(
+    COMMAND sysctl -n hw.optional.arm.FEAT_I8MM
+    OUTPUT_VARIABLE LT_FEAT_I8MM
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(NOT LT_FEAT_I8MM STREQUAL "1")
+    # Build an arch string from the features this CPU really exposes.
+    set(LT_ARM_ARCH "armv8.2-a")
+    execute_process(COMMAND sysctl -n hw.optional.arm.FEAT_DotProd
+      OUTPUT_VARIABLE LT_FEAT_DOTPROD OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(COMMAND sysctl -n hw.optional.arm.FEAT_FP16
+      OUTPUT_VARIABLE LT_FEAT_FP16 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(LT_FEAT_DOTPROD STREQUAL "1")
+      string(APPEND LT_ARM_ARCH "+dotprod")
+    endif()
+    if(LT_FEAT_FP16 STREQUAL "1")
+      string(APPEND LT_ARM_ARCH "+fp16")
+    endif()
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    set(GGML_CPU_ARM_ARCH "${LT_ARM_ARCH}" CACHE STRING "" FORCE)
+    message(STATUS "rampart-langtools: i8mm not available (virtualized CPU?); "
+      "disabling GGML_NATIVE, using -march=${LT_ARM_ARCH}")
+  endif()
+endif()
+
 add_subdirectory(${EXTERN_DIR}/llama.cpp ${CMAKE_BINARY_DIR}/extern/llama.cpp EXCLUDE_FROM_ALL)
 
 # SENTENCEPIECE
@@ -70,3 +106,23 @@ add_subdirectory(${EXTERN_DIR}/faiss EXCLUDE_FROM_ALL)
 add_library(spm_c_wrapper_obj OBJECT
     ${CMAKE_CURRENT_SOURCE_DIR}/extern/sentencepiece/wrapper/spm_c_wrapper.cc
 )
+
+# C++ shim: multi-session slot-based generation engine over llama.cpp + libcommon.
+# Compiled as its own object and linked into rampart-llamacpp.so (mirrors the spm
+# wrapper above). C ABI in llama_gen_shim.h keeps rampart-llamacpp.c pure C.
+add_library(llama_gen_shim_obj OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern/llamacpp/wrapper/llama_gen_shim.cc
+)
+set_target_properties(llama_gen_shim_obj PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(llama_gen_shim_obj PRIVATE
+    ${EXTERN_DIR}/llama.cpp
+    ${EXTERN_DIR}/llama.cpp/include
+    ${EXTERN_DIR}/llama.cpp/common
+    ${EXTERN_DIR}/llama.cpp/vendor        # nlohmann/json (pulled in by common/chat.h)
+    ${EXTERN_DIR}/llama.cpp/ggml/include
+    ${EXTERN_DIR}/llama.cpp/tools/mtmd
+)
+add_dependencies(llama_gen_shim_obj llama-common llama ggml)
