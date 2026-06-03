@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <pthread.h>
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -2226,6 +2227,379 @@ static duk_ret_t embed_text_to_numbers(duk_context *ctx)
 {
     return embed_text_to_(ctx, NOPACK);
 }
+
+/* ============================================================
+ * C API for non-JS callers (rampart-sql.c et al.)
+ *
+ * Symbols (rp_embed_*) are externally visible.  Rampart's module
+ * loader uses RTLD_GLOBAL|RTLD_NOW (see core/module.c:724), so
+ * after `require("rampart-llamacpp")` succeeds in the JS layer,
+ * dlsym(RTLD_DEFAULT, "rp_embed_load") finds these from anywhere.
+ *
+ * Lifecycle:
+ *   rp_embed_load(path)        → opaque rp_embed_handle*, refcounted
+ *   rp_embed_text(h, ...)      → avgVec (L2-normalized mean of
+ *                                 L2-normalized per-chunk vecs)
+ *   rp_embed_dim(h)            → model embedding dim
+ *   rp_embed_release(h)        → decrement; free if last ref
+ *
+ * Per-handle pthread_mutex serializes llama_context use; the
+ * model is shared read-only (mmap'd weights).  v1 uses mutex
+ * Two modes (selected at runtime via rp_embed_set_per_thread()):
+ *
+ *   per_thread = 1 (default):
+ *     One llama_model is shared across all calling threads, but each
+ *     thread gets its own llama_context lazily on first use.  No mutex
+ *     is held during llama_encode → multiple threads embed concurrently
+ *     (real parallelism on GPU; multiple threads on CPU).
+ *     Memory: per-thread KV/scratch (~10-50 MB CPU; tiny VRAM since
+ *     weights are deduped).
+ *
+ *   per_thread = 0:
+ *     One model AND one context shared by all callers, protected by a
+ *     mutex around the entire embed call.  Serialized but minimal
+ *     memory.  Useful in tightly memory-constrained environments.
+ * ============================================================ */
+
+/* Shared-model variant: one llama_model owned by the handle, each
+ * thread gets its own llama_context (no per-thread model load). */
+typedef struct {
+    int                    thread_num;
+    struct llama_context  *lctx;
+} rp_thread_ctx_t;
+
+typedef struct rp_embed_handle_s {
+    char                       *path;       /* strdup'd absolute path */
+    struct llama_model         *lmodel;
+    struct llama_context       *lctx;       /* shared single ctx (per_thread=0 mode) */
+    struct llama_context_params cp;
+    int                         vec_dim;
+    int                         refcount;
+    pthread_mutex_t             mtx;        /* guards lctx + thread_ctxs[] */
+    rp_thread_ctx_t            *thread_ctxs;
+    int                         n_thread_ctxs;
+    int                         cap_thread_ctxs;
+    struct rp_embed_handle_s   *next;       /* cache linked list */
+} rp_embed_handle_t;
+
+/* Process-global mode flag.  Default = per-thread on. */
+static int g_embed_per_thread = 1;
+
+void rp_embed_set_per_thread(int on)
+{
+    g_embed_per_thread = on ? 1 : 0;
+}
+
+int rp_embed_get_per_thread(void)
+{
+    return g_embed_per_thread;
+}
+
+static rp_embed_handle_t *rp_embed_cache_head = NULL;
+static pthread_mutex_t    rp_embed_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static rp_embed_handle_t *rp_embed_cache_get(const char *path)
+{
+    pthread_mutex_lock(&rp_embed_cache_lock);
+    rp_embed_handle_t *h = NULL;
+    for (rp_embed_handle_t *c = rp_embed_cache_head; c; c = c->next) {
+        if (strcmp(c->path, path) == 0) { h = c; h->refcount++; break; }
+    }
+    pthread_mutex_unlock(&rp_embed_cache_lock);
+    return h;
+}
+
+static void rp_embed_cache_put(rp_embed_handle_t *h)
+{
+    pthread_mutex_lock(&rp_embed_cache_lock);
+    h->next = rp_embed_cache_head;
+    rp_embed_cache_head = h;
+    pthread_mutex_unlock(&rp_embed_cache_lock);
+}
+
+void *rp_embed_load(const char *path, char *err, size_t errlen)
+{
+    if (!path) {
+        if (err && errlen) snprintf(err, errlen, "rp_embed_load: null path");
+        return NULL;
+    }
+
+    rp_embed_handle_t *h = rp_embed_cache_get(path);
+    if (h) return h;
+
+    h = (rp_embed_handle_t *)calloc(1, sizeof(*h));
+    if (!h) {
+        if (err && errlen) snprintf(err, errlen, "rp_embed_load: oom");
+        return NULL;
+    }
+    h->path = strdup(path);
+    pthread_mutex_init(&h->mtx, NULL);
+
+    struct llama_model_params mp = llama_model_default_params();
+    h->lmodel = llama_model_load_from_file(path, mp);
+    if (!h->lmodel) {
+        if (err && errlen)
+            snprintf(err, errlen, "rp_embed_load: could not load '%s': %s",
+                     path, strerror(errno));
+        free(h->path);
+        pthread_mutex_destroy(&h->mtx);
+        free(h);
+        return NULL;
+    }
+
+    h->vec_dim = llama_model_n_embd(h->lmodel);
+    if (h->vec_dim <= 0) {
+        if (err && errlen)
+            snprintf(err, errlen, "rp_embed_load: bad vec dim %d", h->vec_dim);
+        llama_model_free(h->lmodel);
+        free(h->path);
+        pthread_mutex_destroy(&h->mtx);
+        free(h);
+        return NULL;
+    }
+
+    /* Build context params mirroring new_embed_context's defaults
+     * (without duktape opts — we don't expose tuning here). */
+    h->cp = llama_context_default_params();
+    h->cp.embeddings     = true;
+    h->cp.pooling_type   = LLAMA_POOLING_TYPE_MEAN;
+    h->cp.n_threads      = 1;
+    h->cp.n_threads_batch = -1;
+    int n_train = llama_model_n_ctx_train(h->lmodel);
+    if (n_train > 8192) n_train = 8192;
+    h->cp.n_ctx     = n_train > 0 ? n_train : 0;
+    h->cp.n_ubatch  = h->cp.n_ctx > 0 ? h->cp.n_ctx : 0;
+    h->cp.n_batch   = h->cp.n_ubatch;
+
+    h->lctx = llama_init_from_model(h->lmodel, h->cp);
+    if (!h->lctx) {
+        if (err && errlen)
+            snprintf(err, errlen, "rp_embed_load: llama_init_from_model failed");
+        llama_model_free(h->lmodel);
+        free(h->path);
+        pthread_mutex_destroy(&h->mtx);
+        free(h);
+        return NULL;
+    }
+
+    h->refcount = 1;
+    rp_embed_cache_put(h);
+    return h;
+}
+
+int rp_embed_dim(void *handle)
+{
+    if (!handle) return 0;
+    return ((rp_embed_handle_t *)handle)->vec_dim;
+}
+
+/* avgVec compute path, mirrors lines 1985-2207 of embed_text_to_
+ * minus the duktape array building / NOPACK / PACK16 paths.
+ * Always returns a freshly malloc'd L2-normalized f32 vec of dim.
+ * Takes lctx explicitly so per-thread variants can pass their own;
+ * lmodel comes from h (shared). */
+static size_t rp_embed_compute_avgvec(rp_embed_handle_t *h,
+                                      struct llama_context *lctx,
+                                      const char *text, size_t tlen,
+                                      float **out_vec,
+                                      char *err, size_t errlen)
+{
+    *out_vec = NULL;
+    if (!h || !lctx || !text || tlen == 0) return 0;
+
+    const struct llama_vocab *vocab = llama_model_get_vocab(h->lmodel);
+    int need = llama_tokenize(vocab, text, (int)tlen,
+                              NULL, 0, /*add_special*/true, /*parse_special*/true);
+    if (need <= 0) need = -need;
+    if (need <= 0) return 0;   /* empty/whitespace text */
+
+    llama_token *toks = (llama_token *)calloc((size_t)need, sizeof(*toks));
+    if (!toks) { if (err) snprintf(err, errlen, "oom tokens"); return 0; }
+
+    int nw = llama_tokenize(vocab, text, (int)tlen, toks, need,
+                            /*add_special*/true, /*parse_special*/true);
+    if (nw <= 0) nw = -nw;
+    if (nw > need) nw = need;
+
+    const int n_ctx     = llama_n_ctx(lctx);
+    int       n_ubatch  = llama_n_ubatch(lctx);
+    if (n_ubatch <= 0) n_ubatch = n_ctx;
+
+    int chunk_tokens = (n_ctx < n_ubatch ? n_ctx : n_ubatch);
+    int overlap      = chunk_tokens / 8;
+    if (chunk_tokens <= 0) {
+        free(toks);
+        if (err) snprintf(err, errlen, "invalid limits (n_ctx=%d ubatch=%d)",
+                          n_ctx, n_ubatch);
+        return 0;
+    }
+    if (overlap < 0) overlap = 0;
+    if (overlap >= chunk_tokens) overlap = chunk_tokens - 1;
+    int stride = chunk_tokens - overlap;
+
+    float *avgvec = (float *)calloc((size_t)h->vec_dim, sizeof(float));
+    if (!avgvec) { free(toks); if (err) snprintf(err, errlen, "oom avgvec"); return 0; }
+
+    int k = 0;
+    const enum llama_pooling_type p = llama_pooling_type(lctx);
+
+    for (int start = 0; start < nw; start += stride, ++k) {
+        llama_memory_clear(llama_get_memory(lctx), /*clear_kv=*/true);
+        int n = nw - start;
+        if (n > chunk_tokens) n = chunk_tokens;
+        if (n > n_ubatch) {
+            free(toks); free(avgvec);
+            if (err) snprintf(err, errlen, "chunk too large (n=%d > ubatch=%d)",
+                              n, n_ubatch);
+            return 0;
+        }
+
+        struct llama_batch batch =
+            llama_batch_init(/*capacity*/n, /*embd*/0, /*n_seq_max*/1);
+        if (!batch.token || !batch.pos || !batch.n_seq_id ||
+            !batch.seq_id || !batch.logits) {
+            llama_batch_free(batch);
+            free(toks); free(avgvec);
+            if (err) snprintf(err, errlen, "llama_batch_init failed");
+            return 0;
+        }
+        for (int i = 0; i < n; ++i) {
+            batch.token[i]    = toks[start + i];
+            batch.pos[i]      = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]   = 1;
+        }
+        batch.n_tokens = n;
+        batch.logits   = false;
+
+        if (llama_encode(lctx, batch) != 0) {
+            llama_batch_free(batch);
+            free(toks); free(avgvec);
+            if (err) snprintf(err, errlen, "llama_encode failed on chunk %d", k);
+            return 0;
+        }
+
+        const float *emb = (p == LLAMA_POOLING_TYPE_NONE)
+                         ? llama_get_embeddings_ith(lctx, n - 1)
+                         : llama_get_embeddings_seq(lctx, 0);
+        llama_batch_free(batch);
+
+        if (!emb) {
+            free(toks); free(avgvec);
+            if (err) snprintf(err, errlen, "no embedding on chunk %d", k);
+            return 0;
+        }
+
+        /* L2-normalize this chunk and accumulate */
+        double norm2 = 0.0;
+        for (int i = 0; i < h->vec_dim; ++i)
+            norm2 += (double)emb[i] * (double)emb[i];
+        float inv = norm2 > 0.0 ? (float)(1.0 / sqrt(norm2)) : 1.0f;
+        for (int i = 0; i < h->vec_dim; ++i)
+            avgvec[i] += emb[i] * inv;
+    }
+    free(toks);
+
+    if (k == 0) {
+        free(avgvec);
+        return 0;
+    }
+
+    /* Mean across chunks, then L2-normalize.  For k==1 this is a
+     * no-op (avgvec is already a unit-norm vector) but the math
+     * comes out identical so no special case needed. */
+    double norm2 = 0.0;
+    for (int i = 0; i < h->vec_dim; ++i) {
+        avgvec[i] /= (float)k;
+        norm2 += (double)avgvec[i] * (double)avgvec[i];
+    }
+    float inv = norm2 > 0.0 ? (float)(1.0 / sqrt(norm2)) : 1.0f;
+    for (int i = 0; i < h->vec_dim; ++i) avgvec[i] *= inv;
+
+    *out_vec = avgvec;
+    return (size_t)h->vec_dim;
+}
+
+/* Find or create the calling thread's llama_context (shared lmodel
+ * comes from h).  Returns NULL on failure.  Mutex briefly during
+ * map lookup and lazy llama_init_from_model. */
+static struct llama_context *
+get_per_thread_ctx(rp_embed_handle_t *h)
+{
+    int thrno = (int)get_thread_num();
+    struct llama_context *lctx = NULL;
+
+    pthread_mutex_lock(&h->mtx);
+    for (int i = 0; i < h->n_thread_ctxs; i++) {
+        if (h->thread_ctxs[i].thread_num == thrno) {
+            lctx = h->thread_ctxs[i].lctx;
+            goto out;
+        }
+    }
+    if (h->n_thread_ctxs >= h->cap_thread_ctxs) {
+        int new_cap = h->cap_thread_ctxs ? h->cap_thread_ctxs * 2 : 4;
+        rp_thread_ctx_t *g = (rp_thread_ctx_t *)realloc(h->thread_ctxs,
+            (size_t)new_cap * sizeof *g);
+        if (!g) goto out;
+        h->thread_ctxs = g;
+        h->cap_thread_ctxs = new_cap;
+    }
+    lctx = llama_init_from_model(h->lmodel, h->cp);
+    if (lctx) {
+        h->thread_ctxs[h->n_thread_ctxs].thread_num = thrno;
+        h->thread_ctxs[h->n_thread_ctxs].lctx       = lctx;
+        h->n_thread_ctxs++;
+    }
+out:
+    pthread_mutex_unlock(&h->mtx);
+    return lctx;
+}
+
+size_t rp_embed_text(void *handle, const char *text, size_t tlen, float **out_vec)
+{
+    if (!handle || !out_vec) return 0;
+    rp_embed_handle_t *h = (rp_embed_handle_t *)handle;
+    char err[256] = {0};
+    size_t dim = 0;
+
+    if (g_embed_per_thread) {
+        struct llama_context *lctx = get_per_thread_ctx(h);
+        if (!lctx) {
+            fprintf(stderr, "rp_embed_text: failed to allocate per-thread context\n");
+            return 0;
+        }
+        /* No mutex around the embed — each thread owns its lctx.
+         * Shares h->lmodel with all other threads. */
+        dim = rp_embed_compute_avgvec(h, lctx, text, tlen,
+                                      out_vec, err, sizeof err);
+    } else {
+        /* Serialized path: one shared (model, ctx), full embed under mutex. */
+        pthread_mutex_lock(&h->mtx);
+        dim = rp_embed_compute_avgvec(h, h->lctx, text, tlen,
+                                      out_vec, err, sizeof err);
+        pthread_mutex_unlock(&h->mtx);
+    }
+
+    if (dim == 0 && err[0])
+        fprintf(stderr, "rp_embed_text: %s\n", err);
+    return dim;
+}
+
+void rp_embed_release(void *handle)
+{
+    if (!handle) return;
+    rp_embed_handle_t *h = (rp_embed_handle_t *)handle;
+
+    pthread_mutex_lock(&rp_embed_cache_lock);
+    h->refcount--;
+    /* v1: never actually free; embedding models are heavy and the
+     * common pattern is process-lifetime ownership.  Unlink/free
+     * path can be added when there's a real use case. */
+    pthread_mutex_unlock(&rp_embed_cache_lock);
+}
+
+/* ============================================================ */
 
 static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 {
