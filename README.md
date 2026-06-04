@@ -14,15 +14,13 @@ make install
 
 The primary use cases for rampart-llamacpp are **embedding generation**
 (`initEmbed`) and **reranking** (`initRerank`), where the model runs
-directly inside the rampart process.  Text generation (`initGen`) and
-vision/image description are also supported and useful for tasks like
-bulk image captioning, but for general-purpose LLM chat and inference,
-[llama.cpp's llama-server](https://github.com/ggml-org/llama.cpp) is
-more robust and performant.  The
-[rampart-llm.js](https://rampart.dev/docs/rampart-extras.html#rampart-llm)
-module provides a streaming client for llama-server (and Ollama) with
-an OpenAI-compatible API, and is the recommended approach for
-integrating LLM capabilities into rampart applications.
+directly inside the rampart process.
+
+Text generation (`initGen` / `predict`) is also supported but is
+**experimental** — its API and internals are still evolving.  `initGen`
+runs a single shared, continuously-batched context: when a `gen` handle
+is shared across rampart threads, their requests are transparently pooled
+into one engine (one copy of the model in memory, batched decoding).
 
 ### Embeddings:
 ```
@@ -62,124 +60,90 @@ var rr = llamacpp.initRerank(rrmodel);
 var score = rr.rerank(qestion, mydoc);
 ```
 
-### Text Generation:
+### Text Generation (experimental):
+
+> **Experimental.**  `initGen`/`predict`/`predictAsync` are under active
+> development and the API may change.  Vision/image generation is **not**
+> supported by this engine (image vectors are handled separately by
+> `rampart-clip`).
+
 ```
 var llamacpp = require('rampart-llamacpp');
 
-// load a text model
+// load a text model.  nSeqMax sets how many requests may decode together
+// (batched) in the one shared context.
 var gen = llamacpp.initGen('/path/to/model.gguf', {
-    threads: 4,
-    nCtx: 4096
+    nCtx:    4096,
+    nSeqMax: 4
 });
 
-// generate with a simple prompt (callback receives each token as it is generated)
-gen.predict({
-    prompt: "Explain how a combustion engine works.",
-    maxTokens: 256,
-    temp: 0.7,
-    resetMem: true
-}, function(piece) {
-    rampart.utils.printf("%s", piece);
-});
-
-// or use chat-style messages
-gen.predict({
+// SYNC: predict() blocks the calling thread and returns the full text.
+var text = gen.predict({
     messages: [
         { role: "system", content: "You are a helpful assistant." },
         { role: "user",   content: "What is the capital of France?" }
     ],
-    maxTokens: 128,
-    resetMem: true
-}, function(piece) {
-    rampart.utils.printf("%s", piece);
+    maxTokens: 128
 });
+rampart.utils.printf("%s\n", text);
 
-// retrieve the full text of the last generation
+// ASYNC/STREAMING: predictAsync(opts, onToken, onDone) is non-blocking and
+// streams tokens as they are produced.  Multiple in-flight calls (across
+// threads or from one event loop) batch together through the shared engine.
+gen.predictAsync(
+    { prompt: "Explain how a combustion engine works.", maxTokens: 256, temp: 0.7 },
+    function(res) { if (!res.done && !res.error) rampart.utils.printf("%s", res.token); },
+    function(res) { rampart.utils.printf("\n[done]\n"); }   // res.fullText, res.error
+);
+
+// retrieve the full text of the last sync predict()
 var fullText = gen.getLast();
 
 // free resources when done
 gen.destroy();
 ```
 
-### Vision / Image Description (LLaVA):
-Vision models like LLaVA can describe images.  They require two GGUF files:
-the main text model and a multimodal projector (mmproj).
-
-```
-var llamacpp = require('rampart-llamacpp');
-
-// load model with the mmproj option
-var gen = llamacpp.initGen('/path/to/llava-model.gguf', {
-    mmproj: '/path/to/llava-mmproj-f16.gguf',
-    threads: 4,
-    nCtx: 2048
-});
-
-// describe an image
-gen.predict({
-    prompt: "Describe this image in detail.",
-    image: "/path/to/photo.jpg",
-    maxTokens: 256,
-    temp: 0.1,
-    resetMem: true
-}, function(piece) {
-    rampart.utils.printf("%s", piece);
-});
-
-gen.destroy();
-```
-
-The `image` option accepts a file path to a JPEG, PNG, BMP, or GIF image.
-The image marker is automatically inserted into the prompt before the
-chat template is applied.
-
-Tested models include:
-- LLaVA-Phi-3 Mini (xtuner/llava-phi-3-mini-gguf) - smallest, ~2.2 GB
-- LLaVA 1.6 Vicuna 7B (cjpais/llava-v1.6-vicuna-7b-gguf) - ~3.9 GB
-
 ### initGen Options:
 ```
 var gen = llamacpp.initGen('/path/to/model.gguf', {
     // Model params
-    useMmap:    true,       // use memory-mapped IO (default: false)
+    useMmap:    false,      // use memory-mapped IO (default: false)
     useMlock:   false,      // lock model in RAM (default: false)
-    vocabOnly:  false,      // load vocabulary only (default: false)
-    mmproj:     undefined,  // path to mmproj .gguf for vision models
 
-    // Context params
-    nCtx:       0,          // context size (0 = auto from available memory)
-    threads:    1,          // number of threads
+    // Context / batching params
+    nCtx:        0,         // context size (0 = auto from available memory)
+    nSeqMax:     1,         // max requests batched together in the one context
+    kvUnified:   false,     // share one KV cache across slots (default: false)
+    threads:     1,         // number of threads
     threadsBatch: 1,        // threads for batch processing
-    nBatch:     0,          // batch size
-    nUBatch:    0,          // micro-batch size
-    flashAttn:  false,      // enable flash attention
-    cacheType:  'F16',      // KV cache type: F16, F32, BF16, Q8_0, Q4_0, etc.
-    offloadKQV: false,      // offload KQV to GPU
-    opOffload:  false,      // offload operations to GPU
+    nBatch:      0,         // batch size
+    nUBatch:     0,         // micro-batch size
+    offloadKQV:  false,     // offload KQV to GPU
+    opOffload:   false,     // offload operations to GPU
 });
 ```
 
 ### predict Options:
 ```
+// the same options object is accepted by predict() and predictAsync()
 gen.predict({
     // Prompt (use one or the other)
     prompt:   "...",                   // simple text prompt
     messages: [{role, content}, ...],  // chat-style messages
-
-    // Vision
-    image:    "/path/to/image.jpg",   // image file for vision models
 
     // Generation params
     maxTokens:     12800,  // maximum tokens to generate
     temp:          0.8,    // temperature
     topP:          0.95,   // top-p sampling
     topK:          40,     // top-k sampling
+    minP:          0.05,   // min-p sampling
     repeatPenalty: 1.1,    // repetition penalty
     repeatLastN:   -1,     // tokens to consider for repeat penalty (-1 = auto)
-    resetMem:      false,  // clear KV cache before this generation
-}, function(piece) {
-    // callback receives each generated token
+    seed:          -1,     // RNG seed (-1 = random)
+    stop:          [],     // array of stop strings
 });
+// predict() returns the full generated string.  For token-by-token
+// streaming use predictAsync(opts, onToken, onDone) instead.
 ```
 
 ### Other Options:

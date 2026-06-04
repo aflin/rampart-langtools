@@ -19,8 +19,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include "llama.h"
-#include "mtmd.h"
-#include "mtmd-helper.h"
+#include "llama_gen_shim.h"   /* C ABI for the multi-session generation engine */
 #include "rampart.h"
 
 #ifdef __APPLE__
@@ -58,197 +57,6 @@
 #endif
 
 
-// LLAMA.CPP Generation funcs:
-
-// Returns 1 if we should stop generation, 0 otherwise.
-static int rp_check_stop(const struct llama_vocab *vocab, llama_token tok,
-                         int token_index, // how many tokens generated so far
-                         int max_tokens,  // hard cap
-                         char *tokstr, int tokstrlen)
-{
-
-    // --- 1) EOG token ---
-    if (llama_vocab_is_eog(vocab, tok))
-        return 1;
-
-    // --- 2) EOS token ---
-    if (tok == llama_vocab_eos(vocab))
-        return 1;
-
-    // --- 3) max tokens cap ---
-    if (token_index >= max_tokens)
-        return 1;
-
-    // --- 4) check for special/template tokens in the text
-    if (token_index && tokstr)
-    {
-        // make sure its terminated
-        tokstr[tokstrlen] = '\0';
-        if (strstr(tokstr, "assistant"))
-            return 1;
-        if (strstr(tokstr, "end"))
-            return 1;
-        if (strstr(tokstr, "<|im_"))
-            return 1;
-    }
-
-    return 0; // keep going
-}
-
-// Try to use llama_chat_apply_template if compiled in; otherwise fallback.
-static char *rp_build_prompt(duk_context *ctx, duk_idx_t obj_idx, struct llama_model *lmodel, size_t *out_len)
-{
-    char *buf = NULL;
-    bool add_assistant = true;
-
-    // 1) If plain "prompt" is given, use it directly (but wrap it in a default template)
-    if (duk_get_prop_string(ctx, obj_idx, "prompt"))
-    {
-        const char *p = REQUIRE_STRING(ctx, -1, "prompt must be a string");
-
-        struct llama_chat_message *msgs = NULL;
-        REMALLOC(msgs, sizeof(*msgs) * 2);
-
-        msgs[0].role = "system";
-        msgs[0].content = "You are a helpful AI assistant";
-
-        msgs[1].role = "user";
-        msgs[1].content = p;
-
-        // optional template name
-        const char *tmpl = NULL;
-
-        if (!tmpl)
-            tmpl = llama_model_chat_template(lmodel, NULL);
-        int32_t need = llama_chat_apply_template(tmpl, msgs, 2, add_assistant, NULL, 0);
-
-        if (need == 0)
-        {
-            free(msgs);
-            RP_THROW(ctx, "chat template failed (size query)");
-        }
-
-        REMALLOC(buf, (size_t)need + 1);
-
-        // FIXME: don't do this twice if possible.  Look at notes in ../extern/llama.cpp/include/llama.h
-        need = llama_chat_apply_template(tmpl, msgs, 2, add_assistant, buf, need);
-        free(msgs);
-        if (need == 0)
-        {
-            free(buf);
-            RP_THROW(ctx, "chat template failed");
-            return NULL;
-        }
-
-        buf[need] = '\0';
-        if (out_len)
-            *out_len = need;
-    }
-
-    // 2) Else expect { messages: [ {role, content}, ... ] }
-    if (duk_get_prop_string(ctx, obj_idx, "messages"))
-    {
-        if (buf)
-        {
-            free(buf);
-            RP_THROW(ctx, "Input must be prompt OR messages, not both");
-        }
-
-        if (!duk_is_array(ctx, -1))
-            RP_THROW(ctx, "messages must be an Array");
-
-        // Build C array of llama_chat_message
-        int n = (int)duk_get_length(ctx, -1);
-
-        if (n <= 0)
-        {
-            duk_pop(ctx);
-            RP_THROW(ctx, "messages must be non-empty");
-        }
-
-        struct llama_chat_message *msgs = NULL;
-        REMALLOC(msgs, sizeof(*msgs) * (size_t)n);
-
-        for (int i = 0; i < n; ++i)
-        {
-            duk_get_prop_index(ctx, -1, (duk_uarridx_t)i);
-
-            if (!duk_is_object(ctx, -1) || !duk_get_prop_string(ctx, -1, "role") || !duk_is_string(ctx, -1))
-            {
-                free(msgs);
-                RP_THROW(ctx, "messages must contain Object Array members with {role:String, content:String}");
-            }
-            msgs[i].role = duk_get_string(ctx, -1);
-            duk_pop(ctx);
-
-            if (!duk_get_prop_string(ctx, -1, "content") || !duk_is_string(ctx, -1))
-            {
-                free(msgs);
-                RP_THROW(ctx, "messages must contain Object Array members with {role:String, content:String}");
-            }
-
-            msgs[i].content = duk_get_string(ctx, -1);
-            duk_pop_2(ctx); // string, msg object
-        }
-
-        // optional template name
-        const char *tmpl = NULL;
-
-        if (duk_get_prop_string(ctx, obj_idx, "template"))
-        {
-            if (!duk_is_string(ctx, -1))
-            {
-                free(msgs);
-                RP_THROW(ctx, "option template must be a String");
-            }
-            tmpl = duk_get_string(ctx, -1);
-        }
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "addAssistant"))
-        {
-            if (!duk_is_boolean(ctx, -1))
-            {
-                free(msgs);
-                RP_THROW(ctx, "option addAssistant must be a Boolean");
-            }
-            add_assistant = (bool)duk_get_boolean(ctx, -1);
-        }
-        duk_pop(ctx);
-
-        // probe buffer size: call with NULL to get required size (llama.cpp supports this pattern)
-
-        if (!tmpl)
-            tmpl = llama_model_chat_template(lmodel, NULL);
-        int32_t need = llama_chat_apply_template(tmpl, msgs, (size_t)n, add_assistant, NULL, 0);
-
-        if (need == 0)
-        {
-            free(msgs);
-            RP_THROW(ctx, "chat template failed (size query)");
-        }
-
-        REMALLOC(buf, (size_t)need + 1);
-
-        // FIXME: maybe don't do this twice if possible.  Look at notes in ../extern/llama.cpp/include/llama.h
-        need = llama_chat_apply_template(tmpl, msgs, (size_t)n, add_assistant, buf, need);
-        free(msgs);
-        if (need == 0)
-        {
-            free(buf);
-            RP_THROW(ctx, "chat template failed");
-            return NULL; // suppress warning
-        }
-
-        buf[need] = '\0';
-        if (out_len)
-            *out_len = need;
-    }
-    duk_pop(ctx);
-
-    return buf;
-}
-
 typedef struct rp_llama_info
 {
     RPTHR *thr;
@@ -275,1497 +83,663 @@ typedef struct rp_llama_info
     struct llama_context_params cp;
     int init_thr;
     int init_pid;
-    struct mtmd_context *mtmd_ctx; // NULL for text-only models
 
     // for async:
     duk_context *ctx;
     void *func_ptr;
     const char *errmsg;
+
+    // multi-session generation engine (new path; replaces lctx-based gen)
+    lgen_engine  *eng;        // per-thread slot engine (context pinned to this thread)
+    char         *last_out;   // last generation text (for getLast)
+    size_t        last_out_len;
+    uint8_t       armed;      // 1 while the predictAsync step-pump timeout is scheduled
+    uint8_t       destroyed;  // set by destroy when a pump is still armed (deferred free)
 } rp_llama_info;
 
-// Trim trailing template/control junk from the output buffer.
-// Handles cases where multi-token sequences like "<|im_" + "end|>"
-// partially make it into the buffer before the stop triggers.
-static void rp_trim_output(rp_llama_info *linfo)
+/* ==================================================================
+ * New multi-session generation engine (P1): C glue over llama_gen_shim.
+ * The slot scheduler lives in extern/llamacpp/wrapper/llama_gen_shim.cc.
+ * ================================================================== */
+
+// Build a malloc'd const char** of stop strings from options.stop (JS array).
+static const char **lg_build_stops(duk_context *ctx, duk_idx_t obj_idx, size_t *n)
 {
-    if (!linfo->out || linfo->out_len == 0)
-        return;
-
-    // patterns that indicate template junk leaked into output
-    static const char *junk[] = {
-        "<|im_",
-        "<|",
-        "You are a helpful AI",
-        "<|assistant",
-        "<|user",
-        "<|system",
-        NULL
-    };
-
-    for (const char **p = junk; *p; p++)
-    {
-        size_t plen = strlen(*p);
-        char *buf = linfo->out;
-        char *found = NULL;
-        char *search = buf;
-
-        // find last occurrence
-        while (search < buf + linfo->out_len)
-        {
-            char *m = (char *)memmem(search, linfo->out_len - (size_t)(search - buf), *p, plen);
-            if (!m)
-                break;
-            found = m;
-            search = m + 1;
-        }
-
-        if (found)
-        {
-            // truncate at the junk
-            linfo->out_len = (size_t)(found - buf);
-        }
+    *n = 0;
+    if (!duk_get_prop_string(ctx, obj_idx, "stop")) { duk_pop(ctx); return NULL; }
+    if (!duk_is_array(ctx, -1)) { duk_pop(ctx); return NULL; }
+    duk_size_t len = duk_get_length(ctx, -1);
+    if (!len) { duk_pop(ctx); return NULL; }
+    const char **stops = NULL;
+    REMALLOC(stops, sizeof(char *) * len);
+    size_t k = 0;
+    for (duk_size_t i = 0; i < len; i++) {
+        duk_get_prop_index(ctx, -1, (duk_uarridx_t)i);
+        if (duk_is_string(ctx, -1)) stops[k++] = strdup(duk_get_string(ctx, -1));
+        duk_pop(ctx);
     }
-
-    // trim trailing whitespace/newlines
-    while (linfo->out_len > 0 &&
-           (linfo->out[linfo->out_len - 1] == ' '  ||
-            linfo->out[linfo->out_len - 1] == '\n' ||
-            linfo->out[linfo->out_len - 1] == '\r' ||
-            linfo->out[linfo->out_len - 1] == '\t'))
-    {
-        linfo->out_len--;
-    }
+    duk_pop(ctx);
+    *n = k;
+    return stops;
+}
+static void lg_free_stops(const char **stops, size_t n)
+{
+    if (!stops) return;
+    for (size_t i = 0; i < n; i++) free((void *)stops[i]);
+    free((void *)stops);
 }
 
-static rp_llama_info *rp_get_llama_info(duk_context *ctx)
+// Fill an lgen_request from the options object at obj_idx. The prompt /
+// messages_json strings are left on the duk stack (valid until the caller
+// restores the stack); they are only needed during lgen_session_submit().
+static void lg_build_request(duk_context *ctx, duk_idx_t obj_idx, lgen_request *req,
+                             const char ***stops_out, size_t *n_stops)
 {
-    if (!ctx)
-    {
-        RPTHR *t = get_current_thread();
-        ctx = t->ctx;
+    memset(req, 0, sizeof(*req));
+    req->max_tokens = 512;
+    req->temp = -1; req->top_p = -1; req->min_p = -1; req->typ_p = -1; req->top_k = 0;
+    req->penalty_repeat = -1; req->penalty_last_n = -1;
+    req->dry_multiplier = -1; req->dry_base = -1; req->dry_allowed_length = -1;
+    req->seed = (uint32_t)time(NULL);
+    req->add_assistant = 1;
+
+    if (duk_get_prop_string(ctx, obj_idx, "prompt")) {
+        req->prompt = REQUIRE_STRING(ctx, -1, "prompt must be a string"); // leave on stack
+    } else {
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, obj_idx, "messages")) {
+            if (!duk_is_array(ctx, -1)) RP_THROW(ctx, "messages must be an Array");
+            duk_dup(ctx, -1);
+            req->messages_json = duk_json_encode(ctx, -1); // leave encoded string on stack
+        } else {
+            duk_pop(ctx);
+            RP_THROW(ctx, "predict requires 'prompt' or 'messages'");
+        }
     }
 
-    duk_push_this(ctx);
-
-    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("destroyed"));
-
-    if (duk_get_boolean_default(ctx, -1, 0))
-        RP_THROW(ctx, "generation object was destroyed");
+    if (duk_get_prop_string(ctx, obj_idx, "maxTokens")) req->max_tokens = (int)REQUIRE_UINT(ctx, -1, "maxTokens must be a positive integer");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, obj_idx, "temp")) req->temp = (float)REQUIRE_NUMBER(ctx, -1, "temp must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, obj_idx, "topP")) req->top_p = (float)REQUIRE_NUMBER(ctx, -1, "topP must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, obj_idx, "topK")) req->top_k = (int)REQUIRE_UINT(ctx, -1, "topK must be a positive integer");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, obj_idx, "minP")) req->min_p = (float)REQUIRE_NUMBER(ctx, -1, "minP must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, obj_idx, "repeatPenalty")) req->penalty_repeat = (float)REQUIRE_NUMBER(ctx, -1, "repeatPenalty must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, obj_idx, "repeatLastN")) req->penalty_last_n = (int)REQUIRE_UINT(ctx, -1, "repeatLastN must be a positive integer");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, obj_idx, "seed")) req->seed = (uint32_t)REQUIRE_UINT(ctx, -1, "seed must be a positive integer");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, obj_idx, "addAssistant")) req->add_assistant = REQUIRE_BOOL(ctx, -1, "addAssistant must be a Boolean");
     duk_pop(ctx);
 
-    rp_llama_info *ret = NULL;
-
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rp_llama_info")))
-        ret = (rp_llama_info *)duk_get_pointer(ctx, -1);
-    duk_pop_2(ctx); // info and this
-
-    if (!ret)
-    {
-        RP_THROW(ctx, "internal error getting llama info");
-        return NULL; // silence warning
-    }
-
-    if (ret->thr->ctx != ctx)
-        RP_THROW(ctx, "cannot use llama from a thread other than where it was created");
-
-    return ret;
+    *stops_out = lg_build_stops(ctx, obj_idx, n_stops);
+    req->stop = *stops_out;
+    req->n_stop = *n_stops;
 }
 
-static int batch_and_decode(duk_context *ctx, struct llama_context *lctx, llama_memory_t mem, llama_token *tok,
-                            int32_t len, uint32_t cur_pos)
-{
-    struct llama_batch b = llama_batch_get_one(tok, len);
-    int ret = llama_decode(lctx, b);
+/* libevent cross-thread delivery. Declared locally (minimal prototypes) rather
+ * than including <event2/event.h>, whose event-config.h lives in rampart's build
+ * tree; the symbols resolve from the host rampart binary (RTLD_GLOBAL). struct
+ * event / struct event_base are already forward-declared via rampart.h. */
+#include <sys/time.h>
+typedef int rp_evutil_socket_t;
+extern struct event *event_new(struct event_base *base, rp_evutil_socket_t fd, short events,
+                               void (*cb)(rp_evutil_socket_t, short, void *), void *arg);
+extern int  event_add(struct event *ev, const struct timeval *timeout);
+extern void event_free(struct event *ev);
+#define evutil_socket_t rp_evutil_socket_t
 
-    /*
-        if(ret == 1)
-        {
-            printf("\ndoing stupid copy to reset; no idea what I'm doing wrong here\n");
-            llama_memory_seq_cp(mem, 0, 1, cur_pos, -1);
-            llama_memory_seq_rm(mem, 0, 0, -1);
-            llama_memory_seq_cp(mem, 1, 0, cur_pos, -1);
-            llama_memory_seq_rm(mem, 1, 0, -1);
-            struct llama_batch b = llama_batch_get_one(tok, len);
-            ret = llama_decode(lctx, b);
-        }
-    */
-    return ret;
+// Build a fresh per-thread engine + info from creation params. The model is
+// shared via the shim's refcounted cache, so this only allocates a new context
+// + slots on the current thread (cheap next to loading weights).
+static rp_llama_info *lg_new_info(duk_context *ctx, const lgen_engine_params *p)
+{
+    char err[256];
+    lgen_engine *eng = lgen_engine_create(p, err, sizeof err);
+    if (!eng) RP_THROW(ctx, "initGen: %s", err);
+    rp_llama_info *info = NULL;
+    CALLOC(info, sizeof(rp_llama_info));
+    info->thr = get_current_thread();
+    info->eng = eng;
+    info->init_thr = get_thread_num();
+    info->init_pid = (int)getpid();
+    return info;
 }
 
-static int gen_async_one(void *arg, int unused);
-
-// append an error message to linfo->errmsg, separated by newline
-static void linfo_append_err(rp_llama_info *linfo, const char *msg)
+// Resolve the engine for the gen handle `this` refers to. Each thread-copy of
+// the handle keeps its OWN engine, built lazily on first use from the stored
+// path+params (the model is shared via the cache) — the same "rebuild per
+// thread" trick the embedding path uses, applied to the whole engine. It is
+// additive: a thread never touches another thread's engine, so there is no
+// shared mutable state and no cross-thread guard needed. Ownership is tracked
+// in per-copy hidden props (lg_thr/lg_pid), never by reading another thread's
+// struct.
+static rp_llama_info *lg_get_info(duk_context *ctx)
 {
-    if (linfo->errmsg)
-        linfo->errmsg = (const char *)strjoin((char *)linfo->errmsg, (char *)msg, '\n');
-    else
-        linfo->errmsg = strdup(msg);
-}
+    duk_push_this(ctx); // [this]
 
-static int gen_cleanup(rp_llama_info *linfo)
-{
-    duk_context *ctx = linfo->ctx;
-
-    duk_push_global_stash(ctx);
-
-    duk_push_sprintf(ctx, "llamacb_%p", linfo->func_ptr);
-    duk_del_prop(ctx, -2);
-
-    duk_push_sprintf(ctx, "llamacb_final_%p", linfo->func_ptr);
-
-    if (duk_get_prop(ctx, -2))
-    {
-        duk_push_sprintf(ctx, "llamathis_%p", linfo->func_ptr);
-        duk_get_prop(ctx, -3);
-        // pass error message (or undefined) to the final callback
-        if (linfo->errmsg)
-            duk_push_string(ctx, linfo->errmsg);
-        else
-            duk_push_undefined(ctx);
-        if (duk_pcall_method(ctx, 1) != 0)
-        {
-            const char *e = rp_push_error(ctx, -1, NULL, rp_print_error_lines);
-            linfo_append_err(linfo, e);
-            duk_pop(ctx);
-        }
-    }
-    duk_pop(ctx); // undef or return value from call
-
-    duk_push_sprintf(ctx, "llamacb_final_%p", linfo->func_ptr);
-    duk_del_prop(ctx, -2);
-
-    duk_push_sprintf(ctx, "llamathis_%p", linfo->func_ptr);
-    duk_del_prop(ctx, -2);
-
-    if (linfo->smpl)
-        llama_sampler_free(linfo->smpl);
-    linfo->smpl = NULL;
-
-    duk_pop(ctx); // the stash
-
-    return 0;
-}
-
-static int gen_async_one(void *arg, int stage)
-{
-    rp_llama_info *linfo = (rp_llama_info *)arg;
-
-    if (stage)
-    {
-        if (linfo->stop)
-        {
-            gen_cleanup(linfo);
-            return 0;
-        }
-        // return 1 from stage 1 to go again
-        return 1;
-    }
-
-    // stage 0
-    duk_context *ctx = linfo->ctx;
-    llama_memory_t mem = linfo->mem;
-
-    duk_idx_t top = duk_get_top(ctx);
-
-    if (linfo->cur_pos + 1 >= linfo->n_ctx)
-    {
-        int n_keep = linfo->n_keep;
-        int cur_pos = linfo->cur_pos;
-        const int n_left = cur_pos - n_keep; // tokens after the kept prompt
-        const int n_discard = n_left > 0 ? n_left / 2 : 0;
-        if (n_discard > 0)
-        {
-
-            // remove [n_keep, n_keep + n_discard)
-            llama_memory_seq_rm(mem, linfo->seq_id, n_keep, n_keep + n_discard);
-
-            // shift [n_keep + n_discard, cur_pos) left by n_discard
-            llama_memory_seq_add(mem, linfo->seq_id, n_keep + n_discard, cur_pos, -n_discard);
-
-            linfo->cur_pos -= n_discard;
-        }
-        else
-        {
-            linfo->stop = 1;
-            return 1; // continue so we can clean up
-        }
-    }
-    linfo->cur_pos++;
-
-    // sample next token
-    llama_token tok = llama_sampler_sample(linfo->smpl, linfo->lctx, /*pos*/ -1);
-    llama_sampler_accept(linfo->smpl, tok); // update repetition/mirostat/etc. inside the chain
-
-    // ---- detokenize and output/stream ----
-    {
-        char piece[256];
-        int plen = llama_token_to_piece(linfo->vocab, tok, piece, (int)sizeof(piece), /*lstrip*/ 0, /*special*/ true);
-        if (plen < 0)
-        {
-            linfo->stop = 1;
-            duk_set_top(ctx, top);
-            linfo_append_err(linfo, "llama_token_to_piece() failed");
-            return 1;
-        }
-
-        int is_control = llama_vocab_is_control(linfo->vocab, tok);
-
-        if (rp_check_stop(linfo->vocab, tok, linfo->n_generated + 1, linfo->max_tokens, piece, plen))
-        {
-            linfo->stop = 1;
-            duk_set_top(ctx, top);
-            return 1;
-        }
-
-        if (!is_control)
-        {
-            // append to output buffer
-            if (!linfo->out)
-            {
-                REMALLOC(linfo->out, 4096);
-                linfo->out_cap = 4096;
-            }
-            if (linfo->out_len + (size_t)plen > linfo->out_cap)
-            {
-                size_t new_cap = ((linfo->out_len + (size_t)plen) * 3) / 2;
-                REMALLOC(linfo->out, new_cap);
-                linfo->out_cap = new_cap;
-            }
-            memcpy(linfo->out + linfo->out_len, piece, (size_t)plen);
-            linfo->out_len += (size_t)plen;
-
-            if (linfo->func_ptr) // we are async
-            {
-                duk_push_global_stash(ctx);
-                duk_push_sprintf(ctx, "llamacb_%p", linfo->func_ptr);
-                duk_get_prop(ctx, -2);
-                duk_push_sprintf(ctx, "llamathis_%p", linfo->func_ptr);
-                duk_get_prop(ctx, -3);
-                duk_remove(ctx, -3); // stash
-                duk_push_lstring(ctx, piece, (duk_size_t)plen);
-                if (duk_pcall_method(ctx, 1) != 0)
-                {
-                    const char *e = rp_push_error(ctx, -1, NULL, rp_print_error_lines);
-                    linfo_append_err(linfo, e);
-                    duk_pop(ctx);
-                    linfo->stop = 1;
-                    duk_set_top(ctx, top);
-                    return 1;
-                }
-            }
-            else if (linfo->func_idx >= 0) // we are sync with callback
-            {
-                duk_dup(ctx, linfo->func_idx);
-                duk_push_this(ctx);
-                duk_push_lstring(ctx, piece, (duk_size_t)plen);
-                duk_call_method(ctx, 1);
-            }
-
-            if (linfo->func_idx >= 0)
-            {
-                if (duk_get_boolean_default(ctx, -1, 0))
-                {
-                    linfo->stop = 1;
-                    duk_pop(ctx);
-                    duk_set_top(ctx, top);
-                    return 1;
-                }
-                duk_pop(ctx);
-            }
-        }
-    }
-
-    if (batch_and_decode(ctx, linfo->lctx, mem, &tok, 1, linfo->cur_pos))
-    {
-        linfo->stop = 1;
-        duk_set_top(ctx, top);
-        linfo_append_err(linfo, "llama_decode() failed");
-        return 1;
-    }
-
-    // one more token successfully generated
-    linfo->n_generated++;
-
-    duk_set_top(ctx, top);
-
-    return 1;
-}
-
-rp_llama_info *prep_predict(duk_context *ctx, int is_async)
-{
-    rp_llama_info *linfo = rp_get_llama_info(ctx);
-
-    struct llama_context *lctx = linfo->lctx;
-    struct llama_model *lmodel = linfo->lmodel;
-    const struct llama_vocab *vocab = linfo->vocab;
-
-    uint32_t cur_pos = linfo->cur_pos;
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("destroyed")) &&
+        duk_get_boolean_default(ctx, -1, 0))
+        RP_THROW(ctx, "generation object was destroyed");
+    duk_pop(ctx);
 
     int cur_thr = get_thread_num();
     int cur_pid = (int)getpid();
 
-    // get a new context if in a new thread.  Model stays the same.
-    if (cur_thr != linfo->init_thr || cur_pid != linfo->init_pid )
-    {
-        // FIXME: save and retrieve options.
-#ifdef HAVE_CUDA
-        // forking after is bad, mkay
-        if(cur_pid != linfo->init_pid && has_gpu_backend() )
-        {
-            RP_THROW(ctx, "llama.cpp - cannot fork llama.cpp with CUDA initialized");
-        }
-#endif
-        lctx = linfo->lctx = llama_init_from_model(linfo->lmodel, linfo->cp);
-
-        linfo->init_thr = cur_thr;
-        linfo->init_pid = cur_pid;
-
-    }
-
-
-    // generation params (defaults)
-    int max_tokens = 12800;
-    float temp = 0.8f;
-    float top_p = 0.95f;
-    int top_k = 40;
-    float repeat_penalty = 1.1f;
-    int repeat_last_n = -1;
-
-    REQUIRE_OBJECT(ctx, 0, "First argument must be an Object");
-
-    if (is_async)
-    {
-        REQUIRE_FUNCTION(ctx, 1, "Second argument must be a Function (piece callback)");
-        // put function where it will not be GCed and store its pointer for easy access
-        linfo->func_ptr = duk_get_heapptr(ctx, 1);
-
-        duk_push_global_stash(ctx);
-
-        duk_push_sprintf(ctx, "llamacb_%p", linfo->func_ptr);
-        duk_dup(ctx, 1);
-        duk_put_prop(ctx, -3);
-
-        duk_push_sprintf(ctx, "llamathis_%p", linfo->func_ptr);
-        duk_push_this(ctx);
-        duk_put_prop(ctx, -3);
-
-        if (duk_is_function(ctx, 2))
-        {
-            duk_push_sprintf(ctx, "llamacb_final_%p", linfo->func_ptr);
-            duk_dup(ctx, 2);
-            duk_put_prop(ctx, -3);
-        }
-
-        duk_pop(ctx); // stash
-    }
-    else
-    {
-        linfo->func_idx = -1;
-        if (duk_is_function(ctx, 1))
-        {
-            linfo->func_idx = 1;
-        }
-    }
-
-    if (duk_get_prop_string(ctx, 0, "maxTokens"))
-        max_tokens = (int)REQUIRE_UINT(ctx, -1, "maxTokens must be a positive integer");
+    int owner_thr = -1, owner_pid = -1;
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("lg_thr"))) owner_thr = duk_get_int(ctx, -1);
     duk_pop(ctx);
-
-    if (duk_get_prop_string(ctx, 0, "temp"))
-        temp = (float)REQUIRE_NUMBER(ctx, -1, "temp must be a number");
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("lg_pid"))) owner_pid = duk_get_int(ctx, -1);
     duk_pop(ctx);
-
-    if (duk_get_prop_string(ctx, 0, "topP"))
-        top_p = (float)REQUIRE_NUMBER(ctx, -1, "topP must be a number");
-    duk_pop(ctx);
-
-    if (duk_get_prop_string(ctx, 0, "topK"))
-        top_k = (int)REQUIRE_UINT(ctx, -1, "topK must be a positive integer");
-    duk_pop(ctx);
-
-    if (duk_get_prop_string(ctx, 0, "repeatPenalty"))
-        repeat_penalty = (float)REQUIRE_NUMBER(ctx, -1, "repeatPenalty must be a number");
-    duk_pop(ctx);
-
-    if (duk_get_prop_string(ctx, 0, "repeatLastN"))
-        repeat_last_n = (int)REQUIRE_UINT(ctx, -1, "repeatLastN must be a positive integer");
-    duk_pop(ctx);
-
-    // reset
-    llama_memory_t mem = llama_get_memory(lctx);
-
-    if (duk_get_prop_string(ctx, 0, "resetMem"))
-    {
-        if (REQUIRE_BOOL(ctx, -1, "resetMem must be a Boolean"))
-        {
-            llama_memory_clear(mem, /*clear_kv_data*/ true);
-            linfo->cur_pos = cur_pos = 0;
-        }
-    }
-    duk_pop(ctx);
-
-    // Check for image option (vision models)
-    char *image_path = NULL;
-    if (duk_get_prop_string(ctx, 0, "image"))
-    {
-        const char *tmp = REQUIRE_STRING(ctx, -1, "image must be a string (file path)");
-        image_path = strdup(tmp);
-    }
-    duk_pop(ctx);
-
-    if (image_path && !linfo->mtmd_ctx)
-    {
-        free(image_path);
-        RP_THROW(ctx, "image option requires model loaded with mmproj");
-    }
-
-    // If image is present, inject the media marker into the user's prompt/message
-    // BEFORE the chat template is applied, so it ends up inside the template
-    if (image_path)
-    {
-        const char *marker = mtmd_default_marker();
-
-        if (duk_get_prop_string(ctx, 0, "prompt"))
-        {
-            const char *orig = duk_get_string(ctx, -1);
-            if (orig && !strstr(orig, marker))
-            {
-                // build new string while orig is still on the stack
-                duk_push_sprintf(ctx, "%s\n%s", marker, orig);
-                duk_put_prop_string(ctx, 0, "prompt");
-            }
-            duk_pop(ctx); // pop original prompt value
-        }
-        else
-        {
-            duk_pop(ctx);
-            // For messages path: prepend marker to last user message content
-            if (duk_get_prop_string(ctx, 0, "messages") && duk_is_array(ctx, -1))
-            {
-                int n = (int)duk_get_length(ctx, -1);
-                for (int mi = n - 1; mi >= 0; mi--)
-                {
-                    duk_get_prop_index(ctx, -1, (duk_uarridx_t)mi);
-                    duk_get_prop_string(ctx, -1, "role");
-                    const char *role = duk_get_string(ctx, -1);
-                    duk_pop(ctx); // role string
-                    if (role && strcmp(role, "user") == 0)
-                    {
-                        duk_get_prop_string(ctx, -1, "content");
-                        const char *content = duk_get_string(ctx, -1);
-                        if (content && !strstr(content, marker))
-                        {
-                            duk_push_sprintf(ctx, "%s\n%s", marker, content);
-                            duk_put_prop_string(ctx, -3, "content");
-                        }
-                        duk_pop(ctx); // content (original)
-                        duk_pop(ctx); // message object
-                        break;
-                    }
-                    duk_pop(ctx); // message object
-                }
-            }
-            duk_pop(ctx); // messages array
-        }
-    }
-
-    // Build the prompt string from {prompt} or {messages,...}
-    size_t prompt_len = 0;
-    char *prompt = rp_build_prompt(ctx, 0, lmodel, &prompt_len);
-
-    llama_token *inp = NULL;
-    int n_inp = 0;
-    int n_keep;
-
-    if (image_path && linfo->mtmd_ctx)
-    {
-        // === Vision path ===
-
-        duk_push_this(ctx);
-        duk_push_string(ctx, prompt);
-        duk_put_prop_string(ctx, -2, "lastRawPrompt");
-        duk_pop(ctx);
-
-        // Load image
-        mtmd_bitmap *bmp = mtmd_helper_bitmap_init_from_file(linfo->mtmd_ctx, image_path);
-        free(image_path);
-        image_path = NULL;
-
-        if (!bmp)
-        {
-            free(prompt);
-            RP_THROW(ctx, "Failed to load image");
-        }
-
-        // Tokenize with mtmd
-        mtmd_input_text text_input;
-        text_input.text = prompt;
-        text_input.add_special = true;
-        text_input.parse_special = true;
-
-        mtmd_input_chunks *chunks = mtmd_input_chunks_init();
-        const mtmd_bitmap *bitmaps[] = { bmp };
-
-        int32_t tok_res = mtmd_tokenize(linfo->mtmd_ctx, chunks, &text_input, bitmaps, 1);
-        mtmd_bitmap_free(bmp);
-
-        if (tok_res != 0)
-        {
-            mtmd_input_chunks_free(chunks);
-            free(prompt);
-            RP_THROW(ctx, "mtmd_tokenize failed (error %d)", tok_res);
-        }
-
-        // Eval all chunks (handles text + image encoding internally)
-        int32_t nbatch = linfo->cp.n_batch ? (int32_t)linfo->cp.n_batch : 2048;
-        llama_pos new_n_past = (llama_pos)cur_pos;
-
-        int32_t eval_res = mtmd_helper_eval_chunks(
-            linfo->mtmd_ctx, lctx, chunks,
-            new_n_past, /*seq_id*/ 0,
-            nbatch, /*logits_last*/ true, &new_n_past
-        );
-
-        mtmd_input_chunks_free(chunks);
-        free(prompt);
-
-        if (eval_res != 0)
-            RP_THROW(ctx, "Failed to evaluate prompt with image");
-
-        cur_pos = (uint32_t)new_n_past;
-        n_keep = (int)cur_pos;
-    }
-    else
-    {
-        // === Text-only path ===
-        free(image_path); // NULL is fine
-
-        duk_push_this(ctx);
-        duk_push_string(ctx, prompt);
-        duk_put_prop_string(ctx, -2, "lastRawPrompt");
-        duk_pop(ctx);
-
-        // Tokenize the prompt
-        int cap = (int)(prompt_len + 8);
-        REMALLOC(inp, sizeof(llama_token) * (size_t)cap);
-
-        n_inp = llama_tokenize(vocab, prompt, (int)prompt_len, inp, cap, /*add_special*/ true, /*parse_special*/ true);
-
-        if (n_inp >= cap)
-        {
-            cap = n_inp + 8;
-            REMALLOC(inp, sizeof(llama_token) * (size_t)cap);
-            n_inp = llama_tokenize(vocab, prompt, (int)prompt_len, inp, cap, true, true);
-        }
-
-#ifdef GPT_IS_SMART_HAH
-        // 1) Ask the model if it wants a BOS token automatically
-        bool need_bos = llama_vocab_get_add_bos(vocab); // same predicate main.cpp uses
-        if (need_bos)
-        {
-            const llama_token bos = llama_token_bos(vocab);
-
-            // 2) If the first token is not already BOS, prepend it
-            if (n_inp == 0 || inp[0] != bos)
-            {
-                // ensure capacity (grow if you're using a fixed buffer)
-                if (n_inp == cap)
-                {
-                    // reallocate inp[] to a larger buffer; or assert/grow your vector
-                    // (do whatever you already do elsewhere on overflow)
-                }
-                printf("needed bos\n");
-                memmove(&inp[1], &inp[0], n_inp * sizeof(inp[0]));
-                inp[0] = bos;
-                n_inp += 1;
-            }
-        }
-#endif
-
-        n_keep = n_inp; // keep at least the whole prompt by default
-        // track how many tokens are already in the KV after you decoded the prompt:
-
-        cur_pos += n_inp;
-
-        free(prompt);
-
-        if (n_inp < 0)
-        {
-            free(inp);
-            // if (stops){for(int i=0;i<nstops;++i) free(stops[i].ptr); free(stops);}
-            RP_THROW(ctx, "tokenize prompt failed");
-        }
-
-        // Feed the prompt TODO: if we are near end of n_ctx, we need to compact here too.
-        {
-            struct llama_batch batch = llama_batch_get_one(inp, n_inp);
-            if (llama_decode(lctx, batch) != 0)
-            {
-                free(inp);
-                // if (stops){for(int i=0;i<nstops;++i) free(stops[i].ptr); free(stops);}
-                RP_THROW(ctx, "llama_decode(prompt) failed");
-            }
-        }
-    }
-
-    if (repeat_last_n == -1)
-        repeat_last_n = 64;
-
-    // sampler
-    struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
-
-    sparams.no_perf = 0;
-    struct llama_sampler *smpl = llama_sampler_chain_init(sparams);
-    if (!smpl)
-    {
-        free(inp);
-        RP_THROW(ctx, "sampler_chain_init failed");
-    }
-
-    // --- 0) Penalties (same as you had) ---
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
-                                      /*penalty_last_n*/ repeat_last_n,  // e.g. 64 unless user overrides
-                                      /*penalty_repeat*/ repeat_penalty, // e.g. 1.1
-                                      /*penalty_freq*/ 0.0f,
-                                      /*penalty_present*/ 0.0f));
-
-    // --- 1) DRY (needs vocab + extra args) ---
-    const int32_t n_ctx_train = llama_model_n_ctx_train(lmodel); // model's train ctx (or 0)
-
-    // Optional “sequence breakers” like llama-cli defaults:
-    static const char *dry_breakers[] = {"\n", ":", "\"", "*"};
-    const size_t n_breakers = sizeof(dry_breakers) / sizeof(dry_breakers[0]);
-
-    llama_sampler_chain_add(smpl, llama_sampler_init_dry(
-                                      /*vocab*/ vocab,
-                                      /*n_ctx_train*/ n_ctx_train, // use model value; 0 is also accepted
-                                      /*dry_multiplier*/ 1.00f,    // start modest; tune if needed
-                                      /*dry_base*/ 1.75f,          // common default
-                                      /*dry_allowed_length*/ 2,
-                                      /*dry_penalty_last_n*/ -1,     // -1 = auto (use ctx size)
-                                      /*seq_breakers*/ dry_breakers, // or NULL
-                                      /*num_breakers*/ n_breakers)); // or 0
-
-    // --- 2) Top-n-sigma (variance cull; 0.0 disables) ---
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_n_sigma(/*n_sigma*/ 0.0f));
-
-    // --- 3) Top-K ---
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
-
-    // --- 4) Typical (needs min_keep) ---
-    llama_sampler_chain_add(smpl, llama_sampler_init_typical(/*typ_p*/ 1.0f, /*min_keep*/ 1));
-    // set typ_p<1.0f (e.g. 0.95f) to enable
-
-    // --- 5) Top-P (you already had) ---
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, /*min_keep*/ 1));
-
-    // --- 6) Min-P (you already had) ---
-    llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.01f, /*min_keep*/ 1));
-
-    // --- 7) XTC (4 args; keep disabled by default) ---
-    uint32_t seed32 = (uint32_t)time(NULL);
-    llama_sampler_chain_add(smpl, llama_sampler_init_xtc(
-                                      /*probability*/ 0.0f, // 0 = off; e.g. 1.0f to always apply
-                                      /*threshold*/ 1.0f,   // 1.0 = off; e.g. 0.10f commonly used
-                                      /*min_keep*/ 1,
-                                      /*seed*/ seed32));
-
-    // --- 8) Temperature ---
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp));
-
-    // --- 9) Final draw (stochastic, not greedy) ---
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed32));
-
-    for (int i = 0; i < n_inp; ++i)
-    {
-        // no grammar for prompt; llama-cli passes accept_grammar=false there
-        llama_sampler_accept(smpl, inp[i]);
-    }
-
-    free(inp);
-
-    linfo->n_generated = 0;
-    linfo->mem = mem;
-    linfo->max_tokens = max_tokens;
-    linfo->smpl = smpl;
-    linfo->n_keep = n_keep;
-    linfo->stop = 0;
-    linfo->seq_id = 0;
-    linfo->ctx = ctx;
-
-    if (linfo->out)
-    {
-        free(linfo->out);
-        linfo->out = NULL;
-        linfo->out_cap = 0;
-        linfo->out_len = 0;
-    }
-
-    return linfo;
-}
-
-static duk_ret_t gen_predict_async(duk_context *ctx)
-{
-
-    rp_llama_info *linfo = prep_predict(ctx, 1);
-
-    // get the ball rolling
-    (void)duk_rp_insert_timeout(ctx, 0, "predictAsync", gen_async_one, (void *)linfo, DUK_INVALID_INDEX,
-                                DUK_INVALID_INDEX, 0.0);
-
-    return 0;
-}
-
-static duk_ret_t gen_predict(duk_context *ctx)
-{
-
-    rp_llama_info *linfo = prep_predict(ctx, 0);
-
-    linfo->errmsg = NULL;
-
-    while (1)
-    {
-        gen_async_one(linfo, 0);
-        if (linfo->stop)
-        {
-            gen_async_one(linfo, 1); // cleanup
-            break;
-        }
-    }
-
-    if (linfo->errmsg)
-    {
-        duk_push_error_object(ctx, DUK_ERR_ERROR, "%s", linfo->errmsg);
-        free((char *)linfo->errmsg);
-        linfo->errmsg = NULL;
-        (void) duk_throw(ctx);
-    }
-
-    rp_trim_output(linfo);
-
-    if (linfo->func_idx == -1) // no callback
-        duk_push_lstring(ctx, linfo->out, linfo->out_len);
-    else
-        duk_push_int(ctx, linfo->n_generated);
-
-    return 1;
-}
-
-duk_ret_t get_last_gen(duk_context *ctx)
-{
-    rp_llama_info *linfo = rp_get_llama_info(ctx);
-
-    rp_trim_output(linfo);
-
-    if (linfo->out)
-        duk_push_lstring(ctx, linfo->out, linfo->out_len);
-    else
-        duk_push_string(ctx, "");
-
-    return 1;
-}
-
-static duk_ret_t gen_free(duk_context *ctx)
-{
-    rp_llama_info *info = rp_get_llama_info(ctx);
-
-    if (info->mtmd_ctx)
-        mtmd_free(info->mtmd_ctx);
-
-    llama_free(info->lctx);
-
-    llama_model_free(info->lmodel);
-
-    if (info->out)
-        free(info->out);
-
-    if (info->smpl)
-        llama_sampler_free(info->smpl);
-
-    free(info);
-
-    duk_push_this(ctx);
-
-    duk_push_pointer(ctx, NULL);
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rp_llama_info"));
-
-    duk_push_true(ctx);
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("destroyed"));
-
-    return 0;
-}
-
-// ===================== n_ctx auto-sizer (drop-in) =====================
-
-// ---- System RAM (total/free) ----
-static inline uint64_t sys_ram_total_bytes(void)
-{
-#ifdef __APPLE__
-    uint64_t mem = 0;
-    size_t sz = sizeof(mem);
-    int mib[2] = {CTL_HW, HW_MEMSIZE};
-    if (sysctl(mib, 2, &mem, &sz, NULL, 0) == 0)
-        return mem;
-    return 0;
-#else
-    long pages = sysconf(_SC_PHYS_PAGES);
-    long psize = sysconf(_SC_PAGESIZE);
-    return (pages > 0 && psize > 0) ? (uint64_t)pages * (uint64_t)psize : 0;
-#endif
-}
-
-static inline uint64_t sys_ram_free_bytes(void)
-{
-#ifdef __APPLE__
-    // macOS “free” is fuzzy; be conservative (40% of total)
-    uint64_t tot = sys_ram_total_bytes();
-    return tot ? (tot * 40) / 100 : 0;
-#else
-#ifdef _SC_AVPHYS_PAGES
-    long apages = sysconf(_SC_AVPHYS_PAGES);
-    long psize = sysconf(_SC_PAGESIZE);
-    if (apages > 0 && psize > 0)
-        return (uint64_t)apages * (uint64_t)psize;
-#endif
-    uint64_t tot = sys_ram_total_bytes();
-    return tot ? (tot * 40) / 100 : 0;
-#endif
-}
-
-// ---- CUDA VRAM (free) ----
-static inline bool cuda_free_bytes(uint64_t *free_b, uint64_t *total_b)
-{
-#if HAVE_CUDA
-    size_t f = 0, t = 0;
-    if (cudaMemGetInfo(&f, &t) != cudaSuccess)
-        return false;
-    if (free_b)
-        *free_b = (uint64_t)f;
-    if (total_b)
-        *total_b = (uint64_t)t;
-    return true;
-#else
-    (void)free_b;
-    (void)total_b;
-    return false;
-#endif
-}
-
-double kv_elem_bytes(enum ggml_type t)
-{
-    switch (t)
-    {
-    case GGML_TYPE_F32:
-        return 4.0;
-    case GGML_TYPE_F16:
-        return 2.0;
-    case GGML_TYPE_BF16:
-        return 2.0;
-    case GGML_TYPE_Q8_0:
-        return 9.0 / 8.0; // ≈1.125
-    case GGML_TYPE_Q4_0:
-    case GGML_TYPE_Q4_1:
-    case GGML_TYPE_IQ4_NL:
-        return 0.55; // rough average, adjust if you want exact
-    case GGML_TYPE_Q5_0:
-    case GGML_TYPE_Q5_1:
-        return 0.65; // rough average
-    default:
-        return 2.0; // safe fallback
-    }
-}
-
-// ---- KV bytes per token from model hyperparams ----
-// head_dim = n_embd / n_head
-// bytes/token = n_layer * n_kv_heads * head_dim * (bytes(K)+bytes(V))
-static inline uint64_t kv_bytes_per_token(const struct llama_model *m, enum ggml_type k_type, enum ggml_type v_type)
-{
-    const int n_layer = llama_model_n_layer(m);
-    const int n_embd = llama_model_n_embd(m);
-    const int n_head = llama_model_n_head(m);
-    const int n_head_kv = llama_model_n_head_kv(m);
-    if (n_layer <= 0 || n_embd <= 0 || n_head <= 0 || n_head_kv <= 0)
-        return 0;
-
-    const int head_dim = n_embd / n_head;
-    double bytes_k = kv_elem_bytes(k_type);
-    double bytes_v = kv_elem_bytes(v_type);
-
-    double per_lyr = (double)n_head_kv * (double)head_dim * (bytes_k + bytes_v);
-    return (uint64_t)((double)n_layer * per_lyr); // bytes/token
-}
-
-// ---- Suggest n_ctx from memory budget ----
-// kv_on_gpu = true -> size against CUDA VRAM (if available)
-// headroom_frac: e.g. 0.15 leaves 15% slack
-// headroom_bytes: absolute extra slack (e.g. 512 MiB)
-// cpu_free_cap_frac: only use a fraction of free system RAM (e.g. 0.50)
-static inline uint32_t suggest_n_ctx_from_mem(const struct llama_model *m, bool kv_on_gpu, enum ggml_type k_type,
-                                              enum ggml_type v_type, double headroom_frac, uint64_t headroom_bytes,
-                                              double cpu_free_cap_frac, uint64_t *dbg_base_bytes, uint64_t *dbg_kv_bpt)
-{
-    const uint64_t kv_bpt = kv_bytes_per_token(m, k_type, v_type);
-    if (dbg_kv_bpt)
-        *dbg_kv_bpt = kv_bpt;
-    if (kv_bpt == 0)
-        return 0;
-
-    uint64_t base = 0;
-    if (kv_on_gpu)
-    {
-        uint64_t free_b = 0, total_b = 0;
-        if (!cuda_free_bytes(&free_b, &total_b))
-            return 0;
-        base = free_b;
-    }
-    else
-    {
-        base = sys_ram_free_bytes();
-        if (cpu_free_cap_frac > 0.0 && cpu_free_cap_frac <= 1.0)
-        {
-            base = (uint64_t)((double)base * cpu_free_cap_frac);
-        }
-    }
-    if (dbg_base_bytes)
-        *dbg_base_bytes = base;
-
-    // apply headroom
-    uint64_t budget = base;
-    if (headroom_frac > 0.0 && headroom_frac < 1.0)
-        budget = (uint64_t)((double)budget * (1.0 - headroom_frac));
-    if (headroom_bytes > 0 && budget > headroom_bytes)
-        budget -= headroom_bytes;
-
-    if (budget < kv_bpt)
-        return 0;
-    uint64_t nctx64 = budget / kv_bpt;
-    if (nctx64 > 0xFFFFFFFFull)
-        nctx64 = 0xFFFFFFFFull;
-    return (uint32_t)nctx64;
-}
-// =================== end n_ctx auto-sizer ===================
-
-static duk_ret_t llamacpp_init_gen(duk_context *ctx)
-{
-    const char *model_path = REQUIRE_STRING(ctx, 0, "initGen: First argument must be a String (path to .gguf)");
-
-    duk_idx_t obj_idx = -1;
-    if (duk_is_object(ctx, 1))
-        obj_idx = 1;
-
-    struct llama_model *lmodel = NULL;
-    struct llama_context *lctx = NULL;
-    int store_last = 1;
-    char *mmproj_path = NULL;
-
-    // ---------------- Model params ----------------
-    struct llama_model_params mp = llama_model_default_params();
-    mp.use_mmap = false;  // <— key change for ZFS/NFS/SMB or spinning disks
-    mp.use_mlock = false; // be explicit
-
-    // (optional) faster failure visibility:
-    mp.progress_callback = NULL; // or set your logger if you have one
-    mp.progress_callback_user_data = NULL;
-
-    if (obj_idx >= 0)
-    {
-        if (duk_get_prop_string(ctx, obj_idx, "vocabOnly"))
-            mp.vocab_only = REQUIRE_BOOL(ctx, -1, "vocabOnly must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "useMmap"))
-            mp.use_mmap = REQUIRE_BOOL(ctx, -1, "useMmap must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "useMlock"))
-            mp.use_mlock = REQUIRE_BOOL(ctx, -1, "useMlock must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "checkTensors"))
-            mp.check_tensors = REQUIRE_BOOL(ctx, -1, "checkTensors must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "storeLastRawPrompt"))
-            store_last = REQUIRE_BOOL(ctx, -1, "storeLastRawPrompt must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "mmproj"))
-        {
-            const char *tmp = REQUIRE_STRING(ctx, -1, "mmproj must be a string (path to mmproj .gguf)");
-            mmproj_path = strdup(tmp);
-        }
-        duk_pop(ctx);
-    }
-
-    lmodel = llama_model_load_from_file(model_path, mp);
-    if (!lmodel)
-        RP_THROW(ctx, "rampart-llama-cpp:initText - Could not load model '%s': %s", model_path, strerror(errno));
-    /*
-        // Optional LoRA
-        const char *lora_path = NULL;
-        float lora_scale = 1.0f;
-        int lora_threads = (int)get_thread_num();
-
-        if (obj_idx >= 0) {
-            if (duk_get_prop_string(ctx, obj_idx, "lora"))
-                lora_path = REQUIRE_STRING(ctx, -1, "lora must be a string (path)");
-            duk_pop(ctx);
-
-            if (duk_get_prop_string(ctx, obj_idx, "loraScale"))
-                lora_scale = (float)REQUIRE_NUMBER(ctx, -1, "loraScale must be a number");
-            duk_pop(ctx);
-
-            if (duk_get_prop_string(ctx, obj_idx, "loraThreads"))
-                lora_threads = (int)REQUIRE_UINT(ctx, -1, "threads must be a positive integer");
-            duk_pop(ctx);
-        }
-    *
-        if (lora_path && lora_path[0]) {
-            if (llama_model_apply_lora_from_file(lmodel, lora_path, NULL, lora_scale, lora_threads) != 0)
-                RP_THROW(ctx, "rampart-llama-cpp:initText - Failed to apply LoRA '%s'", lora_path);
-        }
-    */
-    // ---------------- Context params ----------------
-    struct llama_context_params cp = llama_context_default_params();
-
-    // defaults
-    uint32_t ga_n = 1;
-    uint32_t ga_w = 512;
-    cp.n_threads = 1;
-    cp.n_threads_batch = cp.n_threads;
-    cp.swa_full = 0;
-    cp.n_ctx = 0;
-    cp.flash_attn_type = -1;
-
-    int n_train = llama_model_n_ctx_train(lmodel);
-
-    cp.type_k = GGML_TYPE_F16;
-    cp.type_v = GGML_TYPE_F16;
-
-    char typek_str[16];
-    char typev_str[16];
-
-    strcpy(typek_str, "F16");
-    strcpy(typev_str, "F16");
-
-    if (obj_idx >= 0)
-    {
-        if (duk_get_prop_string(ctx, obj_idx, "nCtx"))
-            cp.n_ctx = (uint32_t)REQUIRE_UINT(ctx, -1, "nCtx must be a positive integer");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "cacheType"))
-        {
-            const char *tp = REQUIRE_STRING(ctx, -1, "cacheType must be a String ('q8' or 'fp16)");
-            if (strcasecmp("F32", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_F32;
-                cp.type_v = GGML_TYPE_F32;
-            }
-            else if (strcasecmp("BF16", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_BF16;
-                cp.type_v = GGML_TYPE_BF16;
-            }
-            else if (strcasecmp("Q8_0", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q8_0;
-                cp.type_v = GGML_TYPE_Q8_0;
-            }
-            else if (strcasecmp("Q5_1", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q5_1;
-                cp.type_v = GGML_TYPE_Q5_1;
-            }
-            else if (strcasecmp("Q5_0", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q5_0;
-                cp.type_v = GGML_TYPE_Q5_0;
-            }
-            else if (strcasecmp("IQ4_NL", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_IQ4_NL;
-                cp.type_v = GGML_TYPE_IQ4_NL;
-            }
-            else if (strcasecmp("Q4_1", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q4_1;
-                cp.type_v = GGML_TYPE_Q4_1;
-            }
-            else if (strcasecmp("Q4_0", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q4_0;
-                cp.type_v = GGML_TYPE_Q4_0;
-            }
-            else if (strcasecmp("F16", tp) != 0)
-                RP_THROW(ctx, "cacheType must be a String ('q8' or 'fp16)");
-            strcpy(typek_str, tp);
-            strcpy(typev_str, tp);
-        }
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "kCacheType"))
-        {
-            const char *tp = REQUIRE_STRING(ctx, -1, "cacheType must be a String ('q8' or 'fp16)");
-            if (strcasecmp("F32", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_F32;
-            }
-            else if (strcasecmp("BF16", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_BF16;
-            }
-            else if (strcasecmp("Q8_0", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q8_0;
-            }
-            else if (strcasecmp("Q5_1", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q5_1;
-            }
-            else if (strcasecmp("Q5_0", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q5_0;
-            }
-            else if (strcasecmp("IQ4_NL", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_IQ4_NL;
-            }
-            else if (strcasecmp("Q4_1", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q4_1;
-            }
-            else if (strcasecmp("Q4_0", tp) == 0)
-            {
-                cp.type_k = GGML_TYPE_Q4_0;
-            }
-            else if (strcasecmp("F16", tp) != 0)
-                RP_THROW(ctx, "kCacheType must be a String ('q8' or 'fp16)");
-            strcpy(typek_str, tp);
-        }
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "vCacheType"))
-        {
-            const char *tp = REQUIRE_STRING(ctx, -1, "cacheType must be a String ('q8' or 'fp16)");
-            if (strcasecmp("F32", tp) == 0)
-            {
-                cp.type_v = GGML_TYPE_F32;
-            }
-            else if (strcasecmp("BF16", tp) == 0)
-            {
-                cp.type_v = GGML_TYPE_BF16;
-            }
-            else if (strcasecmp("Q8_0", tp) == 0)
-            {
-                cp.type_v = GGML_TYPE_Q8_0;
-            }
-            else if (strcasecmp("Q5_1", tp) == 0)
-            {
-                cp.type_v = GGML_TYPE_Q5_1;
-            }
-            else if (strcasecmp("Q5_0", tp) == 0)
-            {
-                cp.type_v = GGML_TYPE_Q5_0;
-            }
-            else if (strcasecmp("IQ4_NL", tp) == 0)
-            {
-                cp.type_v = GGML_TYPE_IQ4_NL;
-            }
-            else if (strcasecmp("Q4_1", tp) == 0)
-            {
-                cp.type_v = GGML_TYPE_Q4_1;
-            }
-            else if (strcasecmp("Q4_0", tp) == 0)
-            {
-                cp.type_v = GGML_TYPE_Q4_0;
-            }
-            else if (strcasecmp("F16", tp) != 0)
-                RP_THROW(ctx, "cacheType must be a String ('q8' or 'fp16)");
-            strcpy(typev_str, tp);
-        }
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "nBatch"))
-            cp.n_batch = (uint32_t)REQUIRE_UINT(ctx, -1, "nBatch must be a positive integer");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "nUBatch"))
-            cp.n_ubatch = (uint32_t)REQUIRE_UINT(ctx, -1, "nUBatch must be a positive integer");
-        duk_pop(ctx);
-
-        /*
-        if (duk_get_prop_string(ctx, obj_idx, "nSeqMax"))
-            cp.n_seq_max = (uint32_t)REQUIRE_UINT(ctx, -1, "nSeqMax must be a positive integer");
-        duk_pop(ctx);
-        */
-
-        if (duk_get_prop_string(ctx, obj_idx, "threads"))
-            cp.n_threads = (int32_t)REQUIRE_UINT(ctx, -1, "threads must be a positive integer");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "threadsBatch"))
-            cp.n_threads_batch = (int32_t)REQUIRE_UINT(ctx, -1, "threadsBatch must be a positive integer");
-        duk_pop(ctx);
-
-        // enums (pass as integers)
-        if (duk_get_prop_string(ctx, obj_idx, "ropeScalingType"))
-            cp.rope_scaling_type =
-                (enum llama_rope_scaling_type)REQUIRE_UINT(ctx, -1, "ropeScalingType must be an integer enum");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "poolingType"))
-            cp.pooling_type = (enum llama_pooling_type)REQUIRE_UINT(ctx, -1, "poolingType must be an integer enum");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "flashAttn"))
-            cp.flash_attn_type = REQUIRE_BOOL(ctx, -1, "flashAttn must be a Boolean");
-        duk_pop(ctx);
-
-        // RoPE / YaRN
-        if (duk_get_prop_string(ctx, obj_idx, "ropeFreqBase"))
-            cp.rope_freq_base = (float)REQUIRE_NUMBER(ctx, -1, "ropeFreqBase must be a number");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "ropeFreqScale"))
-            cp.rope_freq_scale = (float)REQUIRE_NUMBER(ctx, -1, "ropeFreqScale must be a number");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "yarnExtFactor"))
-            cp.yarn_ext_factor = (float)REQUIRE_NUMBER(ctx, -1, "yarnExtFactor must be a number");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "yarnAttnFactor"))
-            cp.yarn_attn_factor = (float)REQUIRE_NUMBER(ctx, -1, "yarnAttnFactor must be a number");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "yarnBetaFast"))
-            cp.yarn_beta_fast = (float)REQUIRE_NUMBER(ctx, -1, "yarnBetaFast must be a number");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "yarnBetaSlow"))
-            cp.yarn_beta_slow = (float)REQUIRE_NUMBER(ctx, -1, "yarnBetaSlow must be a number");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "yarnOrigCtx"))
-            cp.yarn_orig_ctx = (uint32_t)REQUIRE_UINT(ctx, -1, "yarnOrigCtx must be a positive integer");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "defragThold"))
-            cp.defrag_thold = (float)REQUIRE_NUMBER(ctx, -1, "defragThold must be a number");
-        duk_pop(ctx);
-
-        /*
-        // cache types
-        if (duk_get_prop_string(ctx, obj_idx, "typeK"))
-            cp.type_k = (enum ggml_type)REQUIRE_UINT(ctx, -1, "typeK must be an integer enum");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "typeV"))
-            cp.type_v = (enum ggml_type)REQUIRE_UINT(ctx, -1, "typeV must be an integer enum");
-        duk_pop(ctx);
-
-        // booleans
-        if (duk_get_prop_string(ctx, obj_idx, "embeddings"))
-            cp.embeddings = REQUIRE_BOOL(ctx, -1, "embeddings must be boolean");
-        duk_pop(ctx);
-        */
-
-        // accept either "offloadKQV" or "offloadKqv"
-        if (duk_get_prop_string(ctx, obj_idx, "offloadKQV") || duk_get_prop_string(ctx, obj_idx, "offloadKqv"))
-            cp.offload_kqv = REQUIRE_BOOL(ctx, -1, "offloadKQV must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "noPerf"))
-            cp.no_perf = REQUIRE_BOOL(ctx, -1, "noPerf must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "opOffload"))
-            cp.op_offload = REQUIRE_BOOL(ctx, -1, "opOffload must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "swaFull"))
-            cp.swa_full = REQUIRE_BOOL(ctx, -1, "swaFull must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "kvUnified"))
-            cp.kv_unified = REQUIRE_BOOL(ctx, -1, "kvUnified must be boolean");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "grpAttnN"))
-            ga_n = (uint32_t)REQUIRE_UINT(ctx, -1, "grpAttnN must be a positive integer");
-        duk_pop(ctx);
-
-        if (duk_get_prop_string(ctx, obj_idx, "grpAttnW"))
-            ga_w = (uint32_t)REQUIRE_UINT(ctx, -1, "grpAttnW must be a positive integer");
-        duk_pop(ctx);
-
-        if (ga_w % ga_n)
-            RP_THROW(ctx, "Error loading model: bad values: grpAttnW must be a multiple of grpAttnN");
-    }
-
-    // embeddings is elsewhere (below)
-    cp.embeddings = false;
-
-    if (!cp.n_ctx)
-    {
-        uint64_t base_bytes = 0, kv_bpt = 0;
-        uint32_t n_ctx_suggest =
-            suggest_n_ctx_from_mem(lmodel, cp.op_offload, cp.type_k, cp.type_v,
-                                   /*headroom_frac=*/0.75,          // leave 75% slack
-                                   /*headroom_bytes=*/512ull << 20, // +512 MiB slack
-                                   /*cpu_free_cap_frac=*/0.50,      // if KV on CPU, use up to 50% of free RAM
-                                   &base_bytes, &kv_bpt);
-
-        //printf("suggest = %d\n", (int)n_ctx_suggest);
-        // int n_ctx_train = llama_n_ctx_train(model);   // if available in your llama.h
-        if (n_ctx_suggest == 0)
-            n_ctx_suggest = 2048; // fallback
-        if (n_ctx_suggest > (uint32_t)n_train)
-            n_ctx_suggest = (uint32_t)n_train;
-
-        /*
-        fprintf(stderr, "KV bytes/token ~ %llu, base=%llu, suggested n_ctx=%u\n",
-                (unsigned long long)kv_bpt,
-                (unsigned long long)base_bytes,
-                n_ctx_suggest);
-        */
-        cp.n_ctx = n_ctx_suggest;
-
-        // cp.offload_kv   = kv_on_gpu;            // true: keep KV on GPU; false: pin in system RAM
-    }
-
-    // default ubatch to n_ctx so a full window fits in one micro-batch
-    // cp.n_ubatch = cp.n_ctx;
-
-    lctx = llama_init_from_model(lmodel, cp);
-    if (!lctx)
-    {
-        free(mmproj_path);
-        RP_THROW(ctx, "rampart-llama-cpp:initGen - Failed to create llama context");
-    }
-
-    // Optional multimodal projector (for vision models like LLaVA)
-    struct mtmd_context *mtmd_ctx = NULL;
-    if (mmproj_path)
-    {
-        struct mtmd_context_params mparams = mtmd_context_params_default();
-#ifdef LT_ENABLE_GPU
-        mparams.use_gpu = true;
-#else
-        mparams.use_gpu = false;
-#endif
-        mparams.n_threads = cp.n_threads;
-        mparams.print_timings = false;
-        // NOTE: mtmd_context_params.verbosity was removed in llama.cpp b9494;
-        // logging verbosity is now controlled globally via llama_log_set().
-
-        mtmd_ctx = mtmd_init_from_file(mmproj_path, lmodel, mparams);
-        free(mmproj_path);
-        mmproj_path = NULL;
-        if (!mtmd_ctx)
-        {
-            llama_free(lctx);
-            llama_model_free(lmodel);
-            RP_THROW(ctx, "rampart-llama-cpp:initGen - Failed to load mmproj");
-        }
-    }
-
-    // Info
-    const struct llama_vocab *vocab = llama_model_get_vocab(lmodel);
-    if (!vocab)
-        RP_THROW(ctx, "rampart-llama-cpp:initText - Failed to get vocab from model");
-
-    const int32_t n_vocab = (int)llama_vocab_n_tokens(vocab);
-    const uint32_t n_ctx = llama_n_ctx(lctx);
 
     rp_llama_info *info = NULL;
-    CALLOC(info, sizeof(rp_llama_info));
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rp_llama_info")))
+        info = (rp_llama_info *)duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
 
-    info->thr = get_current_thread();
-    info->lctx = lctx;
-    info->lmodel = lmodel;
-    info->vocab = vocab;
-    info->n_ctx = n_ctx;
-    info->n_vocab = n_vocab;
-    info->ga_n = (uint32_t)ga_n;
-    info->ga_w = (uint32_t)ga_w;
-    info->store_last = store_last;
-    info->cur_pos = 0;
-    info->cp = cp;
-    info->mtmd_ctx = mtmd_ctx;
-    info->init_thr = get_thread_num();
-    info->init_pid = (int)getpid();
+    // already have an engine built for THIS thread+process? use it.
+    if (info && owner_thr == cur_thr && owner_pid == cur_pid) {
+        duk_pop(ctx); // this
+        return info;
+    }
 
-    duk_push_object(ctx); // return object
+#ifdef HAVE_CUDA
+    if (owner_pid != -1 && owner_pid != cur_pid && has_gpu_backend())
+        RP_THROW(ctx, "llama.cpp - cannot fork llama.cpp with CUDA initialized");
+#endif
 
-    duk_push_int(ctx, (int)n_ctx);
+    // used on a new thread (or after fork): build a new per-thread engine from
+    // the stored creation params and stash it in THIS copy's own hidden slots.
+    lgen_engine_params p;
+    if (!duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("lg_params")))
+        RP_THROW(ctx, "generation engine not initialized");
+    memcpy(&p, duk_get_buffer_data(ctx, -1, NULL), sizeof p);
+    duk_pop(ctx);
+
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("lg_model_path")); // [this, path]
+    p.model_path  = duk_get_string(ctx, -1);
+    p.mmproj_path = NULL;
+    rp_llama_info *ninfo = lg_new_info(ctx, &p); // copies the path; may throw
+    duk_pop(ctx); // path -> [this]
+
+    duk_push_pointer(ctx, ninfo); duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rp_llama_info"));
+    duk_push_int(ctx, cur_thr);   duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_thr"));
+    duk_push_int(ctx, cur_pid);   duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_pid"));
+    duk_pop(ctx); // this
+    return ninfo;
+}
+
+/* ---- step pump: one recurring 0-delay timeout per engine drives all of this
+ *      thread's slots. The decode runs HERE, on the owning rampart thread (like
+ *      embedding), and on_piece/on_done fire here too — duktape-safe, no
+ *      cross-thread marshaling. Armed lazily on the first predictAsync. ---- */
+
+static void lg_info_free(rp_llama_info *info)
+{
+    if (info->eng) { lgen_engine_free(info->eng); info->eng = NULL; }
+    if (info->last_out) free(info->last_out);
+    free(info);
+}
+
+static int lg_pump(void *arg, int stage)
+{
+    rp_llama_info *info = (rp_llama_info *)arg;
+    if (stage) { // stage 1 ("after"): return value becomes the new repeat flag
+        if (info->eng && lgen_engine_has_active(info->eng)) return 1; // re-arm
+        info->armed = 0;
+        if (info->destroyed) lg_info_free(info); // deferred free (destroyed mid-stream)
+        return 0; // done: one-shot, event is freed
+    }
+    // stage 0: advance every active slot one batched decode (fires callbacks here).
+    // Return 1 (not 0) so the loop proceeds to stage 1, which decides re-arming;
+    // returning 0 here would skip stage 1 and make this a single-shot timeout.
+    if (info->eng) (void)lgen_engine_step(info->eng);
+    return 1;
+}
+
+static void lg_arm_pump(duk_context *ctx, rp_llama_info *info)
+{
+    if (info->armed) return;
+    info->armed = 1;
+    (void)duk_rp_insert_timeout(ctx, 0, "predictAsync", lg_pump, (void *)info,
+                                DUK_INVALID_INDEX, DUK_INVALID_INDEX, 0.0);
+}
+
+/* ---- SYNC predict: drive the engine on THIS thread until the request ends ---- */
+
+typedef struct {
+    int    done;
+    int    status;
+    char  *err;
+    char  *full;
+    size_t full_len;
+} lg_sync_ud;
+
+static void lg_sync_on_done(void *ud, int status, const char *err, int reason,
+                            const char *full, size_t full_len)
+{
+    (void)reason;
+    lg_sync_ud *s = (lg_sync_ud *)ud;
+    s->status = status;
+    if (status != 0 && err) s->err = strdup(err);
+    if (full && full_len) {
+        s->full = malloc(full_len + 1);
+        memcpy(s->full, full, full_len);
+        s->full[full_len] = '\0';
+        s->full_len = full_len;
+    }
+    s->done = 1;
+}
+
+// gen.predict(opts) -> blocks this thread, returns the full string. On a server
+// this blocks the worker thread's event loop; use predictAsync in hot handlers.
+static duk_ret_t lg_predict(duk_context *ctx)
+{
+    rp_llama_info *info = lg_get_info(ctx);
+    REQUIRE_OBJECT(ctx, 0, "first argument must be an options Object");
+
+    duk_idx_t base = duk_get_top(ctx);
+    lgen_request req;
+    const char **stops = NULL; size_t n_stops = 0;
+    lg_build_request(ctx, 0, &req, &stops, &n_stops);
+
+    lg_sync_ud s;
+    memset(&s, 0, sizeof s);
+
+    char err[256];
+    uint64_t rid = lgen_engine_submit(info->eng, &req, NULL, lg_sync_on_done, &s, err, sizeof err);
+    lg_free_stops(stops, n_stops);
+    duk_set_top(ctx, base);
+    if (!rid) RP_THROW(ctx, "predict failed: %s", err);
+
+    // Drive the engine to completion on this thread. on_done sets s.done; the
+    // active guard prevents a hang if the engine goes idle unexpectedly.
+    while (!s.done) {
+        int active = lgen_engine_step(info->eng);
+        if (!active && !s.done) break;
+    }
+
+    if (s.status != 0) {
+        char *e = s.err ? s.err : strdup("generation error");
+        if (s.full) free(s.full);
+        duk_push_error_object(ctx, DUK_ERR_ERROR, "%s", e);
+        free(e);
+        (void)duk_throw(ctx);
+    }
+
+    if (info->last_out) free(info->last_out);
+    info->last_out = s.full; info->last_out_len = s.full_len;
+    duk_push_lstring(ctx, info->last_out ? info->last_out : "", info->last_out_len);
+    return 1;
+}
+
+/* ---- ASYNC predictAsync: submit, then let the per-engine pump stream tokens.
+ *      Callbacks fire on this thread inside lg_pump's step — no cross-thread
+ *      delivery, no refcount. The per-request state lives until on_done. ---- */
+
+typedef struct {
+    duk_context   *ctx;       // owning JS thread's context (callbacks + stash live here)
+    rp_llama_info *info;
+    lgen_engine   *eng;
+    uint64_t       req_id;
+    int            canceled;
+} lg_areq;
+
+static int lg_areq_get_cb(duk_context *ctx, lg_areq *r, const char *prefix)
+{
+    duk_push_global_stash(ctx);
+    duk_push_sprintf(ctx, "%s%p", prefix, (void *)r);
+    if (!duk_get_prop(ctx, -2)) { duk_pop_2(ctx); return 0; }
+    duk_remove(ctx, -2);
+    return 1;
+}
+static void lg_areq_clear_stash(lg_areq *r)
+{
+    duk_context *ctx = r->ctx;
+    duk_push_global_stash(ctx);
+    duk_push_sprintf(ctx, "lgtok_%p", (void *)r); duk_del_prop(ctx, -2);
+    duk_push_sprintf(ctx, "lgfin_%p", (void *)r); duk_del_prop(ctx, -2);
+    duk_pop(ctx);
+}
+
+// on_piece — fired on THIS thread inside lg_pump->lgen_engine_step. Returning a
+// truthy value from the perToken callback cancels the request.
+static void lg_infer_on_piece(void *ud, const char *piece, size_t len)
+{
+    lg_areq *r = (lg_areq *)ud;
+    duk_context *ctx = r->ctx;
+    if (r->canceled) return;
+    if (lg_areq_get_cb(ctx, r, "lgtok_")) {
+        duk_push_object(ctx);
+        duk_push_lstring(ctx, piece ? piece : "", (duk_size_t)len);
+        duk_put_prop_string(ctx, -2, "token");
+        duk_push_false(ctx); duk_put_prop_string(ctx, -2, "done");
+        if (duk_pcall(ctx, 1) == 0) {
+            if (duk_get_boolean_default(ctx, -1, 0) && !r->canceled) {
+                r->canceled = 1;
+                lgen_engine_cancel(r->eng, r->req_id);
+            }
+        }
+        duk_pop(ctx);
+    }
+}
+static void lg_infer_on_done(void *ud, int status, const char *err, int reason,
+                             const char *full, size_t full_len)
+{
+    (void)reason;
+    lg_areq *r = (lg_areq *)ud;
+    duk_context *ctx = r->ctx;
+
+    if (lg_areq_get_cb(ctx, r, "lgtok_")) {
+        duk_push_object(ctx);
+        duk_push_true(ctx); duk_put_prop_string(ctx, -2, "done");
+        if (status != 0 && err) { duk_push_string(ctx, err); duk_put_prop_string(ctx, -2, "error"); }
+        if (duk_pcall(ctx, 1) != 0) { /* swallow */ }
+        duk_pop(ctx);
+    }
+    if (lg_areq_get_cb(ctx, r, "lgfin_")) {
+        duk_push_object(ctx);
+        if (full) { duk_push_lstring(ctx, full, (duk_size_t)full_len); duk_put_prop_string(ctx, -2, "fullText"); }
+        if (status != 0 && err) { duk_push_string(ctx, err); duk_put_prop_string(ctx, -2, "error"); }
+        if (duk_pcall(ctx, 1) != 0) { /* swallow */ }
+        duk_pop(ctx);
+    }
+    if (full && full_len && r->info) {
+        if (r->info->last_out) free(r->info->last_out);
+        r->info->last_out = malloc(full_len + 1);
+        memcpy(r->info->last_out, full, full_len);
+        r->info->last_out[full_len] = '\0';
+        r->info->last_out_len = full_len;
+    }
+
+    lg_areq_clear_stash(r);
+    free(r);
+}
+
+static duk_ret_t lg_predict_async(duk_context *ctx)
+{
+    rp_llama_info *info = lg_get_info(ctx);
+    REQUIRE_OBJECT(ctx, 0, "first argument must be an options Object");
+    int has_tok = duk_is_function(ctx, 1);
+    int has_fin = duk_is_function(ctx, 2);
+    if (!has_tok && !has_fin)
+        RP_THROW(ctx, "predictAsync requires a perToken and/or final callback Function");
+
+    duk_idx_t base = duk_get_top(ctx);
+    lgen_request req;
+    const char **stops = NULL; size_t n_stops = 0;
+    lg_build_request(ctx, 0, &req, &stops, &n_stops); // may throw before we allocate
+
+    lg_areq *r = NULL;
+    CALLOC(r, sizeof *r);
+    r->ctx = ctx; r->info = info; r->eng = info->eng;
+
+    duk_push_global_stash(ctx);
+    if (has_tok) { duk_push_sprintf(ctx, "lgtok_%p", (void *)r); duk_dup(ctx, 1); duk_put_prop(ctx, -3); }
+    if (has_fin) { duk_push_sprintf(ctx, "lgfin_%p", (void *)r); duk_dup(ctx, 2); duk_put_prop(ctx, -3); }
+    duk_pop(ctx);
+
+    char err[256];
+    uint64_t rid = lgen_engine_submit(info->eng, &req, lg_infer_on_piece, lg_infer_on_done, r, err, sizeof err);
+    lg_free_stops(stops, n_stops);
+    duk_set_top(ctx, base);
+
+    if (!rid) {
+        lg_areq_clear_stash(r);
+        free(r);
+        RP_THROW(ctx, "predictAsync submit failed: %s", err);
+    }
+    r->req_id = rid;
+    lg_arm_pump(ctx, info);
+    return 0;
+}
+
+static duk_ret_t lg_get_last(duk_context *ctx)
+{
+    // best-effort: return this thread's own engine's last output (each thread has
+    // its own engine, so getLast is inherently per-thread). Empty if this copy
+    // hasn't generated on this thread yet.
+    duk_push_this(ctx);
+    int owner_thr = -1, owner_pid = -1;
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("lg_thr"))) owner_thr = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("lg_pid"))) owner_pid = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    rp_llama_info *info = NULL;
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rp_llama_info")))
+        info = (rp_llama_info *)duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    if (info && owner_thr == get_thread_num() && owner_pid == (int)getpid())
+        duk_push_lstring(ctx, info->last_out ? info->last_out : "", info->last_out_len);
+    else
+        duk_push_string(ctx, "");
+    return 1;
+}
+
+static duk_ret_t lg_destroy(duk_context *ctx)
+{
+    duk_push_this(ctx);
+    if (!duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rp_llama_info"))) return 0;
+    rp_llama_info *info = (rp_llama_info *)duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    int owner_thr = -1, owner_pid = -1;
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("lg_thr"))) owner_thr = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("lg_pid"))) owner_pid = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+
+    // Only tear down the engine if THIS copy built it on THIS thread+process.
+    // A copy whose info still points at another thread's engine (never used
+    // here) must not free it — that thread's own copy owns and frees it.
+    if (info && owner_thr == get_thread_num() && owner_pid == (int)getpid()) {
+    if (info->armed) {
+        // A step-pump timeout is mid-flight — and we may be INSIDE it right now
+        // (destroy() called from a predictAsync callback runs nested under
+        // lg_pump -> lgen_engine_step). Freeing the engine here would delete it
+        // under the running step (use-after-free). Defer the WHOLE teardown
+        // (engine + info) to the pump's stage 1, which runs after the step and
+        // after the engine drains to idle. See lg_pump / lg_info_free.
+        info->destroyed = 1;
+    } else {
+        // Not armed: no pump running, safe to tear down now. lgen_engine_free
+        // fails any queued requests (firing their on_done) before freeing.
+        lg_info_free(info);
+    }
+    }
+    duk_push_pointer(ctx, NULL);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rp_llama_info"));
+    duk_push_true(ctx);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("destroyed"));
+    return 0;
+}
+
+static duk_ret_t lg_init_gen(duk_context *ctx)
+{
+    const char *model_path = REQUIRE_STRING(ctx, 0, "initGen: first argument must be a String (path to .gguf)");
+    duk_idx_t o = duk_is_object(ctx, 1) ? 1 : -1;
+
+    lgen_engine_params p;
+    memset(&p, 0, sizeof p);
+    p.model_path = model_path;
+    p.n_seq_max = 1;
+    p.n_threads = 1;
+    p.flash_attn_type = -1; // auto
+
+    if (o > -1) {
+        if (duk_get_prop_string(ctx, o, "nCtx")) p.n_ctx = (uint32_t)REQUIRE_UINT(ctx, -1, "nCtx must be a positive integer");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "nSeqMax")) p.n_seq_max = (uint32_t)REQUIRE_UINT(ctx, -1, "nSeqMax must be a positive integer");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "nBatch")) p.n_batch = (uint32_t)REQUIRE_UINT(ctx, -1, "nBatch must be a positive integer");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "nUBatch")) p.n_ubatch = (uint32_t)REQUIRE_UINT(ctx, -1, "nUBatch must be a positive integer");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "threads")) p.n_threads = (int32_t)REQUIRE_UINT(ctx, -1, "threads must be a positive integer");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "threadsBatch")) p.n_threads_batch = (int32_t)REQUIRE_UINT(ctx, -1, "threadsBatch must be a positive integer");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "kvUnified")) p.kv_unified = REQUIRE_BOOL(ctx, -1, "kvUnified must be boolean");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "useMmap")) p.use_mmap = REQUIRE_BOOL(ctx, -1, "useMmap must be boolean");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "useMlock")) p.use_mlock = REQUIRE_BOOL(ctx, -1, "useMlock must be boolean");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "offloadKQV") || duk_get_prop_string(ctx, o, "offloadKqv")) p.offload_kqv = REQUIRE_BOOL(ctx, -1, "offloadKQV must be boolean");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "opOffload")) p.op_offload = REQUIRE_BOOL(ctx, -1, "opOffload must be boolean");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, o, "mmproj")) { duk_pop(ctx); RP_THROW(ctx, "initGen: vision (mmproj) generation is not yet supported in the new engine"); }
+        duk_pop(ctx);
+    }
+
+    rp_llama_info *info = lg_new_info(ctx, &p); // builds engine (shared model) + info
+    lgen_engine *eng = info->eng;
+
+    duk_push_object(ctx);
+    duk_push_int(ctx, (int)lgen_engine_n_ctx(eng));
     duk_rp_put_prop_string_ro(ctx, -2, "nCtx");
-
-    duk_push_int(ctx, (int)n_vocab);
+    duk_push_int(ctx, (int)lgen_engine_n_vocab(eng));
     duk_rp_put_prop_string_ro(ctx, -2, "nVocab");
-
-    duk_push_int(ctx, 0);
-    duk_rp_put_prop_string_ro(ctx, -2, "position");
-
-    char *s = typek_str;
-    while (*s)
-    {
-        *s = toupper(*s);
-        s++;
-    }
-    s = typev_str;
-    while (*s)
-    {
-        *s = toupper(*s);
-        s++;
-    }
-
-    duk_push_string(ctx, typek_str);
-    duk_rp_put_prop_string_ro(ctx, -2, "kCacheType");
-
-    duk_push_string(ctx, typev_str);
-    duk_rp_put_prop_string_ro(ctx, -2, "vCacheType");
 
     duk_push_pointer(ctx, info);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rp_llama_info"));
 
-    /*
-        maybe later
-        duk_push_c_function(ctx, gen_tokenize,   1);
-        duk_put_prop_string(ctx, -2, "tokenize");
+    // Per-copy state so each thread that receives a copy of this handle can build
+    // its OWN engine (sharing the cached model) on first use — see lg_get_info.
+    duk_push_int(ctx, get_thread_num());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_thr"));
+    duk_push_int(ctx, (int)getpid());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_pid"));
+    duk_push_string(ctx, model_path);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_model_path"));
+    void *pbuf = duk_push_fixed_buffer(ctx, sizeof p);
+    memcpy(pbuf, &p, sizeof p);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_params"));
 
-        duk_push_c_function(ctx, gen_detokenize, 1);
-        duk_put_prop_string(ctx, -2, "detokenize");
-    */
-
-    duk_push_c_function(ctx, gen_free, 0);
+    duk_push_c_function(ctx, lg_destroy, 0);
     duk_put_prop_string(ctx, -2, "destroy");
-
-    duk_push_c_function(ctx, gen_free, 1);
+    duk_push_c_function(ctx, lg_destroy, 1);
     duk_set_finalizer(ctx, -2);
-
-    duk_push_c_function(ctx, get_last_gen, 0);
+    duk_push_c_function(ctx, lg_get_last, 0);
     duk_put_prop_string(ctx, -2, "getLast");
-
-    duk_push_c_function(ctx, gen_predict, 2);
+    duk_push_c_function(ctx, lg_predict, 2);
     duk_put_prop_string(ctx, -2, "predict");
-
-    duk_push_c_function(ctx, gen_predict_async, 3);
+    duk_push_c_function(ctx, lg_predict_async, 3);
     duk_put_prop_string(ctx, -2, "predictAsync");
 
     return 1;
 }
 
+/* ------------------------------------------------------------------------------
+ * initGen (transparent cross-thread batching).
+ *
+ * The exposed initGen() runs this embedded JS coordinator: it spawns ONE dedicated
+ * owner rampart.thread holding a single shared slot-engine (built via the module's
+ * __rawInitGen, which rides across to the owner thread as a C-function on the
+ * module object), and returns a wrapper that LOOKS like a normal gen object. Each
+ * predict() triggers the request to the owner (rampart.event) and PARKS on
+ * thread.get for the result — so during the owner's GPU decode every caller is
+ * parked (no concurrent event loop = the Metal/CUDA-safe condition), and N normal
+ * threads' requests transparently batch through the one shared context.
+ *
+ * State that must survive the gen object being deep-copied to other threads is
+ * kept as object PROPERTIES (read via `this`), not closures.
+ * v1: predict() is fully batched; predictAsync() emulates via a blocking predict
+ * then fires the callbacks (true token streaming is a separate, gated step). ---- */
+static const char *BATCHGEN_SCRIPT =
+"(function(mod, model, opts, uid){\n"
+"  var thread = rampart.thread;\n"
+"  var owner = new thread();\n"
+"  owner.exec(function(a){\n"
+"    var raw = a.rawInit(a.model, a.opts);\n"
+"    rampart.event.on('sub_'+a.uid, 'h', function(uv, r){\n"
+"      if (r.stream) {\n"
+"        raw.predictAsync(r.req,\n"
+"          function(t){ if (!t.done && !t.error && t.token) rampart.event.trigger('tok_'+a.uid+'_'+r.id, { tok: t.token }); },\n"
+"          function(res){ rampart.event.trigger('fin_'+a.uid+'_'+r.id, { full: res.fullText || '', err: res.error }); });\n"
+"      } else {\n"
+"        raw.predictAsync(r.req, function(){}, function(res){\n"
+"          rampart.thread.put('res_'+a.uid+'_'+r.id,\n"
+"            res.error ? ('[gen err:'+res.error+']') : (res.fullText || ''));\n"
+"        });\n"
+"      }\n"
+"    });\n"
+"    rampart.thread.put('ready_'+a.uid, { nCtx: raw.nCtx, nVocab: raw.nVocab });\n"
+"  }, { rawInit: mod.__rawInitGen, model: model, opts: opts || {}, uid: uid });\n"
+"  var meta = thread.get('ready_'+uid, 120000) || {};\n"
+"  return {\n"
+"    __uid: uid, nCtx: meta.nCtx, nVocab: meta.nVocab, _last: '', _ctr: 0,\n"
+"    predict: function(o){\n"
+"      var id = rampart.thread.getCurrentId() + '_' + (this._ctr = (this._ctr||0)+1);\n"
+"      rampart.event.trigger('sub_'+this.__uid, { id: id, req: o });\n"
+"      var text = rampart.thread.get('res_'+this.__uid+'_'+id, 120000);\n"
+"      this._last = (text === undefined) ? '' : text;\n"
+"      return this._last;\n"
+"    },\n"
+"    predictAsync: function(o, perTok, fin){\n"
+"      var uid = this.__uid;\n"
+"      var id = rampart.thread.getCurrentId() + '_' + (this._ctr = (this._ctr||0)+1);\n"
+"      var tn = 'tok_'+uid+'_'+id, fn = 'fin_'+uid+'_'+id, full = '';\n"
+"      rampart.event.on(tn, 'h', function(uv, t){ full += t.tok;\n"
+"        if (typeof perTok === 'function') perTok({ token: t.tok, done: false }); });\n"
+"      rampart.event.on(fn, 'h', function(uv, f){\n"
+"        rampart.event.remove(tn); rampart.event.remove(fn);\n"
+"        if (typeof fin === 'function') fin({ fullText: (f.full !== undefined ? f.full : full), error: f.err }); });\n"
+"      rampart.event.trigger('sub_'+uid, { id: id, req: o, stream: true });\n"
+"    },\n"
+"    getLast: function(){ return this._last; },\n"
+"    destroy: function(){ try { owner.terminate(); } catch(e) {} }\n"
+"  };\n"
+"})\n";
+
+static duk_ret_t lg_init_gen_batched(duk_context *ctx)
+{
+    REQUIRE_STRING(ctx, 0, "initGen: first argument must be a String (path to .gguf)");
+    /* opts (optional object) at index 1 */
+
+    static int bg_ctr = 0;
+    int n = __atomic_add_fetch(&bg_ctr, 1, __ATOMIC_SEQ_CST);
+    char uid[64];
+    snprintf(uid, sizeof uid, "bg%d_%d", (int)getpid(), n);
+
+    duk_eval_string(ctx, BATCHGEN_SCRIPT);   /* -> wrapper function on the stack */
+    duk_push_this(ctx);                       /* mod (this module object, has __rawInitGen) */
+    duk_dup(ctx, 0);                          /* model */
+    duk_dup(ctx, 1);                          /* opts (may be undefined) */
+    duk_push_string(ctx, uid);
+    duk_call(ctx, 4);                         /* wrapper(mod, model, opts, uid) -> gen object */
+    return 1;
+}
+
 // LLAMA.CPP EMBEDDING MODELS
 
+// Tear down an embed/rerank handle. A handle may be COPIED across threads (each
+// copy rebuilds its own per-thread llama_ctx from the shared model). So free each
+// resource by its correct owner, or copies will double-free:
+//   - llama_ctx + a model refcount: per CONTEXT — only the copy that built it on
+//     THIS thread (ctx_thread/ctx_pid match) frees its context and releases one
+//     model refcount (the model is freed by the cache when the last is released).
+//   - rerank_toks: per HANDLE (allocated once at init) — only the ORIGIN copy
+//     (emb_origin_thr/pid, never changed by a rebuild) frees it.
 static duk_ret_t emb_free(duk_context *ctx)
 {
     struct llama_model *lmodel = NULL;
     struct llama_context *lctx = NULL;
 
     duk_push_this(ctx);
+
+    // guard against a second teardown of the same copy (explicit destroy + finalizer)
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("destroyed")) && duk_get_boolean_default(ctx, -1, 0)) {
+        duk_pop_2(ctx);
+        return 0;
+    }
+    duk_pop(ctx);
 
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("model"));
     lmodel = duk_get_pointer(ctx, -1);
@@ -1775,20 +749,36 @@ static duk_ret_t emb_free(duk_context *ctx)
     lctx = duk_get_pointer(ctx, -1);
     duk_pop(ctx);
 
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rerank_toks")))
+    int ctx_thr = -1, ctx_pid = -1, org_thr = -1, org_pid = -1;
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_thread")))     ctx_thr = duk_get_int(ctx, -1); duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_pid")))        ctx_pid = duk_get_int(ctx, -1); duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("emb_origin_thr"))) org_thr = duk_get_int(ctx, -1); duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("emb_origin_pid"))) org_pid = duk_get_int(ctx, -1); duk_pop(ctx);
+
+    int cur_thr = get_thread_num();
+    int cur_pid = (int)getpid();
+    int own_context = (lctx && ctx_thr == cur_thr && ctx_pid == cur_pid);
+    int is_origin   = (org_thr == cur_thr && org_pid == cur_pid);
+
+    // per-handle resource: only the origin copy frees it
+    if (is_origin)
     {
-        void *toks = duk_get_pointer(ctx, -1);
-        if(toks)
-            free(toks);
+        if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rerank_toks")))
+        {
+            void *toks = duk_get_pointer(ctx, -1);
+            if (toks) free(toks);
+        }
+        duk_pop(ctx);
     }
-    duk_pop(ctx);
 
-    llama_free(lctx);
-
-    llama_model_free(lmodel);
-
-    duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("model"));
-    duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("llama_ctx"));
+    // per-context resources: only the copy that built this context frees them
+    if (own_context)
+    {
+        llama_free(lctx);
+        lgen_model_release(lmodel); // refcount--, model freed by cache at zero
+        duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("model"));
+        duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("llama_ctx"));
+    }
 
     duk_push_true(ctx);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("destroyed"));
@@ -1976,11 +966,17 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
 
         //lctx = new_embed_context(ctx, lmodel, -1);
 
+        // this copy now holds its own context using the shared model: take a model
+        // refcount for it (released in emb_free when this context is freed).
+        lgen_model_addref(lmodel);
+
         duk_push_pointer(ctx, lctx);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
 
         duk_push_int(ctx, curthr);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
+        duk_push_int(ctx, curpid);
+        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
     }
 
     if (!lctx)
@@ -2631,10 +1627,14 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 
     struct llama_model_params mp = llama_model_default_params();
 
-    lmodel = llama_model_load_from_file(model, mp);
+    // Shared, refcounted load (one llama_model per path even across thread-copies;
+    // one refcount per context, released in emb_free). Fixes the cross-copy
+    // double-free and shares weights across threads.
+    char lerr[256] = {0};
+    lmodel = lgen_model_acquire(model, mp.use_mmap, mp.use_mlock, mp.check_tensors, lerr, sizeof lerr);
 
     if (!lmodel)
-        RP_THROW(ctx, "rampart-llama-cpp:init - Could not load ggml file '%s': %s", model, strerror(errno));
+        RP_THROW(ctx, "rampart-llama-cpp:init - Could not load ggml file '%s': %s", model, lerr[0] ? lerr : strerror(errno));
 
     int vec_dim = llama_model_n_embd(lmodel);
 
@@ -2663,6 +1663,13 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 
     duk_push_int(ctx, (int)getpid());
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
+
+    // origin thread/pid: NEVER updated on rebuild — identifies the one copy that
+    // owns per-handle resources (e.g. rerank_toks). See emb_free.
+    duk_push_int(ctx, (int)get_thread_num());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("emb_origin_thr"));
+    duk_push_int(ctx, (int)getpid());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("emb_origin_pid"));
 
     duk_push_c_function(ctx, embed_text_to_buf32, 1);
     duk_put_prop_string(ctx, -2, "embedTextToFp32Buf");
@@ -2893,11 +1900,16 @@ static duk_ret_t rerank_text(duk_context *ctx)
         duk_pop(ctx);
         lctx = llama_init_from_model(lmodel, *cp_buf);
 
+        // model refcount for this copy's own context (released in emb_free)
+        lgen_model_addref(lmodel);
+
         duk_push_pointer(ctx, lctx);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
 
         duk_push_int(ctx, curthr);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
+        duk_push_int(ctx, curpid);
+        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
     }
 
 
@@ -2977,7 +1989,9 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     // Set up model parameters
     struct llama_model_params mp = llama_model_default_params();
 
-    lmodel = llama_model_load_from_file(model, mp);
+    // shared, refcounted load (one refcount per context; released in emb_free)
+    char lerr[256] = {0};
+    lmodel = lgen_model_acquire(model, mp.use_mmap, mp.use_mlock, mp.check_tensors, lerr, sizeof lerr);
 
     if (!lmodel)
         RP_THROW(ctx, "rampart-llama-cpp:initRerank - Could not load ggml file '%s': %s", model, strerror(errno));
@@ -3081,6 +2095,12 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 
     duk_push_int(ctx, (int)getpid());
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
+
+    // origin (never updated on rebuild): the one copy that frees rerank_toks
+    duk_push_int(ctx, (int)get_thread_num());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("emb_origin_thr"));
+    duk_push_int(ctx, (int)getpid());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("emb_origin_pid"));
 
     void *cp_buf = duk_push_fixed_buffer(ctx, sizeof(struct llama_context_params));
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("cp_buf"));
@@ -3239,8 +2259,11 @@ duk_ret_t duk_open_module(duk_context *ctx)
     duk_push_c_function(ctx, llamacpp_init_embed, 2);
     duk_put_prop_string(ctx, -2, "initEmbed");
 
-    duk_push_c_function(ctx, llamacpp_init_gen, 2);
-    duk_put_prop_string(ctx, -2, "initGen");
+    duk_push_c_function(ctx, lg_init_gen, 2);
+    duk_put_prop_string(ctx, -2, "__rawInitGen");   // raw per-thread slot engine (used by initGen's owner thread)
+
+    duk_push_c_function(ctx, lg_init_gen_batched, 2);
+    duk_put_prop_string(ctx, -2, "initGen");        // transparent cross-thread batching wrapper
 
     duk_push_c_function(ctx, llamacpp_init_rerank, 2);
     duk_put_prop_string(ctx, -2, "initRerank");

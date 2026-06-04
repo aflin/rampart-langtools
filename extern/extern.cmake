@@ -4,6 +4,14 @@ set(EXTERN_DIR ${CMAKE_SOURCE_DIR}/extern)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 
+# Build ggml WITHOUT OpenMP so it uses its own pthread threadpool. We run llama
+# inference on a dedicated worker thread (the generation engine); macOS libomp
+# misbehaves ("thread identifier invalid" / kmp assertion / Metal libdispatch
+# crash) when a non-initial thread runs OpenMP parallel regions while the JS
+# event-loop thread is concurrently active. ggml's native threadpool is what
+# llama-server uses and is safe here. (libomp stays linked for faiss.)
+set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+
 if(NOT APPLE)
   set(GGML_CUDA ${LT_ENABLE_GPU} CACHE BOOL "" FORCE)
 endif()
@@ -44,6 +52,14 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
   endif()
 endif()
 
+# When llama.cpp is built as a subproject, its `common` subdirectory is OFF by
+# default (it defaults to LLAMA_STANDALONE, which is OFF here). But we link
+# `llama-common`/`llama-common-base`, so force it on. TOOLS/SERVER/EXAMPLES/TESTS
+# stay off (subproject defaults) — we don't build them (we used to need tools/mtmd
+# for an old vision experiment; that's gone, image vectors live in rampart-clip).
+# Without this a fresh configure fails: "target llama-common does not exist".
+set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+
 add_subdirectory(${EXTERN_DIR}/llama.cpp ${CMAKE_BINARY_DIR}/extern/llama.cpp EXCLUDE_FROM_ALL)
 
 # SENTENCEPIECE
@@ -60,7 +76,7 @@ if(APPLE)
   set(FAISS_ENABLE_GPU OFF CACHE BOOL "FAISS_ENABLE_GPU" FORCE)
 
   set(CMAKE_EXE_LINKER_FLAGS "-framework Accelerate" CACHE STRING "CMAKE_EXE_LINKER_FLAGS" FORCE)
-  set(CMAKE_SHARED_LINKER_FLAGS "-framework Accelerate" CACHE STRING "CMAKE_SHARED_LINKER_FLAGS" FORCE)
+  set(CMAKE_SHARED_LINKER_FLAGS "-framework Accelerate -framework Foundation" CACHE STRING "CMAKE_SHARED_LINKER_FLAGS" FORCE)
   set(BLA_VENDOR "Apple" CACHE STRING "BLA_VENDOR" FORCE)
   set(BLAS_LIBRARIES "/System/Library/Frameworks/Accelerate.framework" CACHE STRING "BLAS_LIBRARIES" FORCE)
   set(LAPACK_LIBRARIES "/System/Library/Frameworks/Accelerate.framework" CACHE STRING "LAPACK_LIBRARIES" FORCE)
@@ -110,9 +126,16 @@ add_library(spm_c_wrapper_obj OBJECT
 # C++ shim: multi-session slot-based generation engine over llama.cpp + libcommon.
 # Compiled as its own object and linked into rampart-llamacpp.so (mirrors the spm
 # wrapper above). C ABI in llama_gen_shim.h keeps rampart-llamacpp.c pure C.
-add_library(llama_gen_shim_obj OBJECT
+set(LLAMA_GEN_SHIM_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/extern/llamacpp/wrapper/llama_gen_shim.cc
 )
+if(APPLE)
+    # Cocoa multithreaded-mode primer (Objective-C++) so Metal/Foundation are
+    # thread-safe when inference runs on the dedicated thread.
+    list(APPEND LLAMA_GEN_SHIM_SRCS
+        ${CMAKE_CURRENT_SOURCE_DIR}/extern/llamacpp/wrapper/llama_gen_macos.mm)
+endif()
+add_library(llama_gen_shim_obj OBJECT ${LLAMA_GEN_SHIM_SRCS})
 set_target_properties(llama_gen_shim_obj PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
@@ -123,6 +146,5 @@ target_include_directories(llama_gen_shim_obj PRIVATE
     ${EXTERN_DIR}/llama.cpp/common
     ${EXTERN_DIR}/llama.cpp/vendor        # nlohmann/json (pulled in by common/chat.h)
     ${EXTERN_DIR}/llama.cpp/ggml/include
-    ${EXTERN_DIR}/llama.cpp/tools/mtmd
 )
 add_dependencies(llama_gen_shim_obj llama-common llama ggml)

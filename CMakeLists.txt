@@ -75,13 +75,13 @@ include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/include
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/ggml/include/
-  ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/tools/mtmd
+  ${CMAKE_CURRENT_SOURCE_DIR}/extern/llamacpp/wrapper
 )
 
 # Libraries
 set(LIBS
-    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/tools/mtmd/libmtmd.a
-    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/common/libcommon.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/common/libllama-common.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/common/libllama-common-base.a
     ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/src/libllama.a
     ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml.a
     ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml-cpu.a
@@ -96,8 +96,8 @@ set(LIBS
 )
 
 set(LLAMA_LIBS
-    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/tools/mtmd/libmtmd.a
-    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/common/libcommon.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/common/libllama-common.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/common/libllama-common-base.a
     ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/src/libllama.a
     ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml.a
     ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml-cpu.a
@@ -202,11 +202,13 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 add_library(rampart-langtools SHARED
     faiss_detect.cpp
     rampart-langtools.c
+    $<TARGET_OBJECTS:llama_gen_shim_obj>
 )
 
 # llama.cpp
 add_library(rampart-llamacpp SHARED
     rampart-llamacpp.c
+    $<TARGET_OBJECTS:llama_gen_shim_obj>
 )
 
 # faiss
@@ -497,7 +499,6 @@ if("${LT_ENABLE_GPU}" STREQUAL "${LT_ENABLE_GPU_LAST}")
 
   set(LLAMA_LIB   "${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/src/libllama.a")
   set(GGML_LIB    "${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml.a")
-  set(MTMD_LIB    "${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/tools/mtmd/libmtmd.a")
 
   set(SP_LIB      "${CMAKE_CURRENT_BINARY_DIR}/extern/sentencepiece/src/libsentencepiece.a")
 
@@ -512,18 +513,16 @@ if("${LT_ENABLE_GPU}" STREQUAL "${LT_ENABLE_GPU_LAST}")
     )
   endif()
 
-  if(NOT EXISTS "${LLAMA_LIB}" OR NOT EXISTS "${GGML_LIB}" OR NOT EXISTS "${MTMD_LIB}")
+  if(NOT EXISTS "${LLAMA_LIB}" OR NOT EXISTS "${GGML_LIB}")
     add_dependencies(rampart-langtools
       llama
-      common
+      llama-common
       ggml
-      mtmd
     )
     add_dependencies(rampart-llamacpp
       llama
-      common
+      llama-common
       ggml
-      mtmd
     )
   endif()
 
@@ -548,9 +547,8 @@ else()
   endif()
   add_dependencies(rampart-langtools
     llama
-    common
+    llama-common
     ggml
-    mtmd
     sentencepiece
     faiss
     faiss_c
@@ -558,9 +556,8 @@ else()
 
   add_dependencies(rampart-llamacpp
     llama
-    common
+    llama-common
     ggml
-    mtmd
   )
   add_dependencies(rampart-sentencepiece
     sentencepiece
