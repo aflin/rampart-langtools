@@ -10,6 +10,13 @@ cmake -DLT_ENABLE_GPU=1 ..
 # make and copy modules to current rampart install dir
 make install
 ```
+
+### macOS requirement
+
+On Apple Silicon, **macOS 15 (Sequoia) or newer is recommended** and is the only
+version verified to work, due to a Metal regression in older macOS. macOS 14 is
+untested; verified to fail on macOS 11–13.
+
 ## rampart-llamacpp use:
 
 The primary use cases for rampart-llamacpp are **embedding generation**

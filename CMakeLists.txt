@@ -608,3 +608,8 @@ install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llam
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-faiss${LT_NAME_SUFFIX}.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-sentencepiece.so\")")
 
+# test script, runnable from the install tree (e.g. rampart ${RP_PATH}/test/llamacpp-test.js)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/llamacpp-test.js"
+  DESTINATION "${RP_PATH}/test"
+)
+
