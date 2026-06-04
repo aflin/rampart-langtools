@@ -2340,6 +2340,17 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     if (!isloaded)
     {
+#ifdef __APPLE__
+        /* macOS 15+ ggml-metal "residency sets" GGML_ASSERT in their static
+         * destructor at process exit if any Metal buffer outlives exit() — which
+         * happens routinely here because an initGen engine is torn down
+         * asynchronously on its owner thread (and the shared model cache may still
+         * hold weights). Disable the feature by default (it is a marginal perf
+         * optimization); set RAMPART_METAL_RESIDENCY=1 to keep it. This must run
+         * before the first model load creates the Metal device. */
+        if (!getenv("RAMPART_METAL_RESIDENCY"))
+            setenv("GGML_METAL_NO_RESIDENCY", "1", 1);
+#endif
         CALLOC(cap, sizeof(struct llog_cap));
         pthread_mutex_init(&cap->mutex, NULL);
         llama_log_set(llamacpp_logger, cap);
