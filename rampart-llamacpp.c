@@ -750,10 +750,18 @@ static duk_ret_t emb_free(duk_context *ctx)
     duk_pop(ctx);
 
     int ctx_thr = -1, ctx_pid = -1, org_thr = -1, org_pid = -1;
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_thread")))     ctx_thr = duk_get_int(ctx, -1); duk_pop(ctx);
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_pid")))        ctx_pid = duk_get_int(ctx, -1); duk_pop(ctx);
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("emb_origin_thr"))) org_thr = duk_get_int(ctx, -1); duk_pop(ctx);
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("emb_origin_pid"))) org_pid = duk_get_int(ctx, -1); duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_thread")))
+        ctx_thr = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_pid")))
+            ctx_pid = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("emb_origin_thr")))
+        org_thr = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("emb_origin_pid")))
+        org_pid = duk_get_int(ctx, -1);
+    duk_pop(ctx);
 
     int cur_thr = get_thread_num();
     int cur_pid = (int)getpid();
