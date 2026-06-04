@@ -262,9 +262,13 @@ static rp_llama_info *lg_get_info(duk_context *ctx)
 
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("lg_model_path")); // [this, path]
     p.model_path  = duk_get_string(ctx, -1);
-    p.mmproj_path = NULL;
-    rp_llama_info *ninfo = lg_new_info(ctx, &p); // copies the path; may throw
-    duk_pop(ctx); // path -> [this]
+    /* re-point chat_template too (the params buffer's copy is stale on this thread) */
+    if (duk_get_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_chat_template")))   // [this, path, tmpl]
+        p.chat_template = duk_get_string(ctx, -1);
+    else
+        p.chat_template = NULL;
+    rp_llama_info *ninfo = lg_new_info(ctx, &p); // copies path+template; may throw
+    duk_pop_2(ctx); // tmpl, path -> [this]
 
     duk_push_pointer(ctx, ninfo); duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rp_llama_info"));
     duk_push_int(ctx, cur_thr);   duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_thr"));
@@ -559,44 +563,191 @@ static duk_ret_t lg_destroy(duk_context *ctx)
     return 0;
 }
 
+/* ====================================================================
+ * Shared option parsing: maps llama-server's CLI options 1:1 onto the
+ * camelCase keys of init{Gen,Embed,Rerank}({opt:val}). This fills the
+ * COMMON model-loading + context options into the real llama structs;
+ * each init function then layers on its mode-specific options.
+ *   --gpu-layers      -> gpuLayers          --rope-freq-base  -> ropeFreqBase
+ *   --split-mode      -> splitMode          --rope-freq-scale -> ropeFreqScale
+ *   --main-gpu        -> mainGpu            --rope-scaling    -> ropeScaling
+ *   --no-mmap         -> useMmap (bool)     --yarn-*          -> yarn*
+ *   --mlock           -> useMlock           --flash-attn      -> flashAttn
+ *   --check-tensors   -> checkTensors       --cache-type-k/v  -> cacheTypeK/V
+ *   --ctx-size        -> nCtx               --no-kv-offload   -> offloadKqv
+ *   --batch-size      -> nBatch             --op-offload      -> opOffload
+ *   --ubatch-size     -> nUBatch            --kv-unified      -> kvUnified
+ *   --parallel        -> nSeqMax            --threads(-batch) -> threads/threadsBatch
+ * Pointer-valued opts (tensorSplit, overrideKv, devices) and process-global
+ * ones (numa) are intentionally not handled here. Mode opts (pooling/attention/
+ * embdNormalize, jinja/chatTemplate) are handled by the individual init funcs.
+ * ==================================================================== */
+static enum ggml_type lt_kv_type_from_str(duk_context *ctx, const char *s) {
+    if (!strcmp(s, "f32") || !strcmp(s, "fp32")) return GGML_TYPE_F32;
+    if (!strcmp(s, "f16") || !strcmp(s, "fp16")) return GGML_TYPE_F16;
+    if (!strcmp(s, "bf16"))                      return GGML_TYPE_BF16;
+    if (!strcmp(s, "q8_0"))                      return GGML_TYPE_Q8_0;
+    if (!strcmp(s, "q4_0"))                      return GGML_TYPE_Q4_0;
+    if (!strcmp(s, "q4_1"))                      return GGML_TYPE_Q4_1;
+    if (!strcmp(s, "q5_0"))                      return GGML_TYPE_Q5_0;
+    if (!strcmp(s, "q5_1"))                      return GGML_TYPE_Q5_1;
+    if (!strcmp(s, "iq4_nl"))                    return GGML_TYPE_IQ4_NL;
+    RP_THROW(ctx, "cacheTypeK/cacheTypeV: unknown type '%s' "
+                  "(f32,f16,bf16,q8_0,q4_0,q4_1,q5_0,q5_1,iq4_nl)", s);
+    return GGML_TYPE_F16; /* unreachable */
+}
+
+/* read an optional bool prop; supports an alias key. returns 1 if present. */
+static int lt_opt_bool2(duk_context *ctx, duk_idx_t o, const char *k, const char *alias,
+                        const char *errmsg, int *out) {
+    int have = duk_get_prop_string(ctx, o, k);
+    if (!have && alias) { duk_pop(ctx); have = duk_get_prop_string(ctx, o, alias); }
+    if (have) *out = REQUIRE_BOOL(ctx, -1, errmsg);
+    duk_pop(ctx);
+    return have;
+}
+
+static void parse_common_opts(duk_context *ctx, duk_idx_t o,
+                              struct llama_model_params *mp,
+                              struct llama_context_params *cp)
+{
+    if (o < 0) return;
+    int b;
+
+    /* ---- model loading (llama_model_params) ---- */
+    if (duk_get_prop_string(ctx, o, "gpuLayers")) mp->n_gpu_layers = REQUIRE_INT(ctx, -1, "gpuLayers must be an integer (-1 = all)");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "mainGpu"))   mp->main_gpu     = REQUIRE_INT(ctx, -1, "mainGpu must be an integer");
+    duk_pop(ctx);
+    if (lt_opt_bool2(ctx, o, "useMmap",      NULL, "useMmap must be boolean",      &b)) mp->use_mmap      = b;
+    if (lt_opt_bool2(ctx, o, "useMlock",     NULL, "useMlock must be boolean",     &b)) mp->use_mlock     = b;
+    if (lt_opt_bool2(ctx, o, "checkTensors", NULL, "checkTensors must be boolean", &b)) mp->check_tensors = b;
+    if (duk_get_prop_string(ctx, o, "splitMode")) {
+        const char *s = REQUIRE_STRING(ctx, -1, "splitMode must be a string (none|layer|row)");
+        if      (!strcmp(s, "none"))  mp->split_mode = LLAMA_SPLIT_MODE_NONE;
+        else if (!strcmp(s, "layer")) mp->split_mode = LLAMA_SPLIT_MODE_LAYER;
+        else if (!strcmp(s, "row"))   mp->split_mode = LLAMA_SPLIT_MODE_ROW;
+        else RP_THROW(ctx, "splitMode: unknown '%s' (none|layer|row)", s);
+    }
+    duk_pop(ctx);
+
+    /* ---- context (llama_context_params) ---- */
+    if (duk_get_prop_string(ctx, o, "nCtx")) {
+        int n = REQUIRE_INT(ctx, -1, "nCtx must be an integer (0 or -1 = model's max context)");
+        cp->n_ctx = (n <= 0) ? 0 : (uint32_t)n;   /* 0 resolved to n_ctx_train at create */
+    }
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "nBatch"))       cp->n_batch         = (uint32_t)REQUIRE_UINT(ctx, -1, "nBatch must be a positive integer");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "nUBatch"))      cp->n_ubatch        = (uint32_t)REQUIRE_UINT(ctx, -1, "nUBatch must be a positive integer");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "nSeqMax"))      cp->n_seq_max       = (uint32_t)REQUIRE_UINT(ctx, -1, "nSeqMax must be a positive integer");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "threads"))      cp->n_threads       = REQUIRE_INT(ctx, -1, "threads must be an integer");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "threadsBatch")) cp->n_threads_batch = REQUIRE_INT(ctx, -1, "threadsBatch must be an integer");
+    duk_pop(ctx);
+    if (lt_opt_bool2(ctx, o, "kvUnified", NULL, "kvUnified must be boolean", &b)) cp->kv_unified = b;
+    if (lt_opt_bool2(ctx, o, "offloadKqv", "offloadKQV", "offloadKqv must be boolean", &b)) cp->offload_kqv = b;
+    if (lt_opt_bool2(ctx, o, "opOffload", NULL, "opOffload must be boolean", &b)) cp->op_offload = b;
+    if (duk_get_prop_string(ctx, o, "ropeFreqBase"))   cp->rope_freq_base   = (float)REQUIRE_NUMBER(ctx, -1, "ropeFreqBase must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "ropeFreqScale"))  cp->rope_freq_scale  = (float)REQUIRE_NUMBER(ctx, -1, "ropeFreqScale must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "yarnExtFactor"))  cp->yarn_ext_factor  = (float)REQUIRE_NUMBER(ctx, -1, "yarnExtFactor must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "yarnAttnFactor")) cp->yarn_attn_factor = (float)REQUIRE_NUMBER(ctx, -1, "yarnAttnFactor must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "yarnBetaFast"))   cp->yarn_beta_fast   = (float)REQUIRE_NUMBER(ctx, -1, "yarnBetaFast must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "yarnBetaSlow"))   cp->yarn_beta_slow   = (float)REQUIRE_NUMBER(ctx, -1, "yarnBetaSlow must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "yarnOrigCtx"))    cp->yarn_orig_ctx    = (uint32_t)REQUIRE_UINT(ctx, -1, "yarnOrigCtx must be a positive integer");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "ropeScaling")) {
+        const char *s = REQUIRE_STRING(ctx, -1, "ropeScaling must be a string (none|linear|yarn|longrope)");
+        if      (!strcmp(s, "none"))     cp->rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_NONE;
+        else if (!strcmp(s, "linear"))   cp->rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LINEAR;
+        else if (!strcmp(s, "yarn"))     cp->rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+        else if (!strcmp(s, "longrope")) cp->rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LONGROPE;
+        else RP_THROW(ctx, "ropeScaling: unknown '%s' (none|linear|yarn|longrope)", s);
+    }
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "cacheTypeK")) cp->type_k = lt_kv_type_from_str(ctx, REQUIRE_STRING(ctx, -1, "cacheTypeK must be a type string"));
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "cacheTypeV")) cp->type_v = lt_kv_type_from_str(ctx, REQUIRE_STRING(ctx, -1, "cacheTypeV must be a type string"));
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "flashAttn")) {
+        if (duk_is_boolean(ctx, -1))
+            cp->flash_attn_type = duk_get_boolean(ctx, -1) ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        else {
+            const char *s = REQUIRE_STRING(ctx, -1, "flashAttn must be boolean or 'on'|'off'|'auto'");
+            if      (!strcmp(s, "on")  || !strcmp(s, "enabled"))  cp->flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            else if (!strcmp(s, "off") || !strcmp(s, "disabled")) cp->flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            else if (!strcmp(s, "auto"))                          cp->flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+            else RP_THROW(ctx, "flashAttn: unknown '%s' (on|off|auto)", s);
+        }
+    }
+    duk_pop(ctx);
+}
+
+/* read a whole file into a malloc'd NUL-terminated string (for chatTemplateFile) */
+static char *lt_read_file_alloc(duk_context *ctx, const char *fn) {
+    FILE *f = fopen(fn, "rb");
+    if (!f) RP_THROW(ctx, "chatTemplateFile: cannot open '%s'", fn);
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n < 0) { fclose(f); RP_THROW(ctx, "chatTemplateFile: cannot size '%s'", fn); }
+    char *buf = malloc((size_t)n + 1);
+    size_t rd = buf ? fread(buf, 1, (size_t)n, f) : 0;
+    fclose(f);
+    if (!buf) RP_THROW(ctx, "chatTemplateFile: out of memory");
+    buf[rd] = '\0';
+    return buf;
+}
+
 static duk_ret_t lg_init_gen(duk_context *ctx)
 {
     const char *model_path = REQUIRE_STRING(ctx, 0, "initGen: first argument must be a String (path to .gguf)");
     duk_idx_t o = duk_is_object(ctx, 1) ? 1 : -1;
 
-    lgen_engine_params p;
-    memset(&p, 0, sizeof p);
-    p.model_path = model_path;
-    p.n_seq_max = 1;
-    p.n_threads = 1;
-    p.flash_attn_type = -1; // auto
+    /* defaults: one slot, one CPU thread (the GPU does the math), n_ctx 0 => the
+       model's trained max (resolved at context build). flashAttn defaults to auto
+       from llama_context_default_params(). */
+    struct llama_model_params   mp = llama_model_default_params();
+    struct llama_context_params cp = llama_context_default_params();
+    cp.n_seq_max       = 1;
+    cp.n_threads       = 1;
+    cp.n_threads_batch = 1;
+    cp.n_ctx           = 0;
+
+    char *chat_template = NULL;  /* malloc'd; freed after lg_new_info copies it */
+    int   use_jinja     = 1;
 
     if (o > -1) {
-        if (duk_get_prop_string(ctx, o, "nCtx")) p.n_ctx = (uint32_t)REQUIRE_UINT(ctx, -1, "nCtx must be a positive integer");
+        parse_common_opts(ctx, o, &mp, &cp);   /* shared model + context options */
+
+        /* gen-specific options */
+        lt_opt_bool2(ctx, o, "jinja", NULL, "jinja must be boolean", &use_jinja);
+        if (duk_get_prop_string(ctx, o, "chatTemplate"))
+            chat_template = strdup(REQUIRE_STRING(ctx, -1, "chatTemplate must be a string"));
         duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "nSeqMax")) p.n_seq_max = (uint32_t)REQUIRE_UINT(ctx, -1, "nSeqMax must be a positive integer");
+        if (duk_get_prop_string(ctx, o, "chatTemplateFile")) {
+            const char *fn = REQUIRE_STRING(ctx, -1, "chatTemplateFile must be a string");
+            free(chat_template);
+            chat_template = lt_read_file_alloc(ctx, fn);
+        }
         duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "nBatch")) p.n_batch = (uint32_t)REQUIRE_UINT(ctx, -1, "nBatch must be a positive integer");
-        duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "nUBatch")) p.n_ubatch = (uint32_t)REQUIRE_UINT(ctx, -1, "nUBatch must be a positive integer");
-        duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "threads")) p.n_threads = (int32_t)REQUIRE_UINT(ctx, -1, "threads must be a positive integer");
-        duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "threadsBatch")) p.n_threads_batch = (int32_t)REQUIRE_UINT(ctx, -1, "threadsBatch must be a positive integer");
-        duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "kvUnified")) p.kv_unified = REQUIRE_BOOL(ctx, -1, "kvUnified must be boolean");
-        duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "useMmap")) p.use_mmap = REQUIRE_BOOL(ctx, -1, "useMmap must be boolean");
-        duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "useMlock")) p.use_mlock = REQUIRE_BOOL(ctx, -1, "useMlock must be boolean");
-        duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "offloadKQV") || duk_get_prop_string(ctx, o, "offloadKqv")) p.offload_kqv = REQUIRE_BOOL(ctx, -1, "offloadKQV must be boolean");
-        duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "opOffload")) p.op_offload = REQUIRE_BOOL(ctx, -1, "opOffload must be boolean");
-        duk_pop(ctx);
-        if (duk_get_prop_string(ctx, o, "mmproj")) { duk_pop(ctx); RP_THROW(ctx, "initGen: vision (mmproj) generation is not yet supported in the new engine"); }
+        if (duk_get_prop_string(ctx, o, "mmproj")) { duk_pop(ctx); free(chat_template); RP_THROW(ctx, "initGen: vision (mmproj) generation is not supported"); }
         duk_pop(ctx);
     }
+
+    lgen_engine_params p;
+    memset(&p, 0, sizeof p);
+    p.model_path    = model_path;
+    p.chat_template = chat_template;   /* shim copies into the engine */
+    p.use_jinja     = use_jinja;
+    p.mparams       = mp;
+    p.cparams       = cp;
 
     rp_llama_info *info = lg_new_info(ctx, &p); // builds engine (shared model) + info
     lgen_engine *eng = info->eng;
@@ -618,9 +769,17 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_pid"));
     duk_push_string(ctx, model_path);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_model_path"));
+    /* chat_template (a malloc'd string) is owned by the rebuilt engine; the params
+       buffer below keeps a copy of the now-stale pointer, but lg_get_info re-points
+       it from this symbol on each thread before rebuilding (like lg_model_path). */
+    if (chat_template) {
+        duk_push_string(ctx, chat_template);
+        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_chat_template"));
+    }
     void *pbuf = duk_push_fixed_buffer(ctx, sizeof p);
     memcpy(pbuf, &p, sizeof p);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_params"));
+    free(chat_template);   /* the shim engine already owns its own copy */
 
     duk_push_c_function(ctx, lg_destroy, 0);
     duk_put_prop_string(ctx, -2, "destroy");
@@ -658,11 +817,14 @@ static const char *BATCHGEN_SCRIPT =
 "  var owner = new thread();\n"
 "  owner.exec(function(a){\n"
 "    var raw = a.rawInit(a.model, a.opts);\n"
+"    var canc = {};\n"   /* request ids signalled to cancel (set by the cancel event) */
+"    rampart.event.on('can_'+a.uid, 'c', function(uv, c){ canc[c.id] = 1; });\n"
 "    rampart.event.on('sub_'+a.uid, 'h', function(uv, r){\n"
 "      if (r.stream) {\n"
 "        raw.predictAsync(r.req,\n"
-"          function(t){ if (!t.done && !t.error && t.token) rampart.event.trigger('tok_'+a.uid+'_'+r.id, { tok: t.token }); },\n"
-"          function(res){ rampart.event.trigger('fin_'+a.uid+'_'+r.id, { full: res.fullText || '', err: res.error }); });\n"
+"          function(t){ if (canc[r.id]) { delete canc[r.id]; return true; }\n"   /* hard cancel -> frees the slot */
+"                       if (!t.done && !t.error && t.token) rampart.event.trigger('tok_'+a.uid+'_'+r.id, { tok: t.token }); },\n"
+"          function(res){ delete canc[r.id]; rampart.event.trigger('fin_'+a.uid+'_'+r.id, { full: res.fullText || '', err: res.error }); });\n"
 "      } else {\n"
 "        raw.predictAsync(r.req, function(){}, function(res){\n"
 "          rampart.thread.put('res_'+a.uid+'_'+r.id,\n"
@@ -692,6 +854,7 @@ static const char *BATCHGEN_SCRIPT =
 "        rampart.event.remove(tn); rampart.event.remove(fn);\n"
 "        if (typeof fin === 'function') fin({ fullText: (f.full !== undefined ? f.full : full), error: f.err }); });\n"
 "      rampart.event.trigger('sub_'+uid, { id: id, req: o, stream: true });\n"
+"      return { cancel: function(){ rampart.event.trigger('can_'+uid, { id: id }); } };\n"   /* hard cancel handle */
 "    },\n"
 "    getLast: function(){ return this._last; },\n"
 "    destroy: function(){ try { owner.terminate(); } catch(e) {} }\n"
@@ -794,111 +957,69 @@ static duk_ret_t emb_free(duk_context *ctx)
     return 0;
 }
 
-static struct llama_context *new_embed_context(duk_context *ctx, struct llama_model *lmodel, duk_idx_t opts_idx)
+/* Mode-specific options for embed/rerank, parsed into cp AFTER parse_common_opts.
+ * Includes the legacy names (nctx/ubatch/nthreads/nthreads_batch) kept as aliases
+ * so existing initEmbed/initRerank callers keep working, plus pooling/attention. */
+static void parse_embed_opts(duk_context *ctx, duk_idx_t o, struct llama_context_params *cp)
 {
-    struct llama_context_params cp = llama_context_default_params();
-    cp.embeddings = true;
-    cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
-    cp.n_threads = 1;
-    cp.n_ctx = 0;
-    cp.n_ubatch = 0;
-    cp.n_threads_batch = -1;
+    if (o < 0) return;
+    int b;
 
-    if (opts_idx > -1)
-    {
-        // nctx
-        if (duk_get_prop_string(ctx, opts_idx, "nctx"))
-        {
-            if (!duk_is_number(ctx, -1))
-                RP_THROW(ctx, "Option nctx must be a Number");
-            cp.n_ctx = duk_get_int(ctx, -1);
-        }
-        duk_pop(ctx);
+    /* legacy aliases (camelCase equivalents are handled by parse_common_opts) */
+    if (duk_get_prop_string(ctx, o, "nctx"))           cp->n_ctx           = (uint32_t)REQUIRE_INT(ctx, -1, "nctx must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "ubatch"))         cp->n_ubatch        = (uint32_t)REQUIRE_INT(ctx, -1, "ubatch must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "nthreads"))       cp->n_threads       = REQUIRE_INT(ctx, -1, "nthreads must be a number");
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "nthreads_batch")) cp->n_threads_batch = REQUIRE_INT(ctx, -1, "nthreads_batch must be a number");
+    duk_pop(ctx);
 
-        // ubatch
-        if (duk_get_prop_string(ctx, opts_idx, "ubatch"))
-        {
-            if (!duk_is_number(ctx, -1))
-                RP_THROW(ctx, "Option ubatch must be a Number");
-            cp.n_ubatch = duk_get_int(ctx, -1);
+    /* mode options */
+    if (lt_opt_bool2(ctx, o, "embeddings", NULL, "embeddings must be boolean", &b)) cp->embeddings = b;
+    if (duk_get_prop_string(ctx, o, "pooling")) {
+        if (duk_is_number(ctx, -1)) {
+            cp->pooling_type = (enum llama_pooling_type) duk_get_int(ctx, -1);
+        } else {
+            const char *s = REQUIRE_STRING(ctx, -1, "pooling must be 'none'|'mean'|'cls'|'last'|'rank'");
+            if      (!strcmp(s, "none")) cp->pooling_type = LLAMA_POOLING_TYPE_NONE;
+            else if (!strcmp(s, "mean")) cp->pooling_type = LLAMA_POOLING_TYPE_MEAN;
+            else if (!strcmp(s, "cls"))  cp->pooling_type = LLAMA_POOLING_TYPE_CLS;
+            else if (!strcmp(s, "last")) cp->pooling_type = LLAMA_POOLING_TYPE_LAST;
+            else if (!strcmp(s, "rank")) cp->pooling_type = LLAMA_POOLING_TYPE_RANK;
+            else RP_THROW(ctx, "pooling: unknown '%s' (none|mean|cls|last|rank)", s);
         }
-        duk_pop(ctx);
-
-        // nthreads
-        if (duk_get_prop_string(ctx, opts_idx, "nthreads"))
-        {
-            if (!duk_is_number(ctx, -1))
-                RP_THROW(ctx, "Option nthreads must be a Number");
-            cp.n_threads = duk_get_int(ctx, -1);
-        }
-        duk_pop(ctx);
-
-        // nthreads_batch
-        if (duk_get_prop_string(ctx, opts_idx, "nthreads_batch"))
-        {
-            if (!duk_is_number(ctx, -1))
-                RP_THROW(ctx, "Option nthreads_batch must be a Number");
-            cp.n_threads_batch = duk_get_int(ctx, -1);
-        }
-        duk_pop(ctx);
-
-        // embeddings
-        if (duk_get_prop_string(ctx, opts_idx, "embeddings"))
-        {
-            if (!duk_is_boolean(ctx, -1))
-                RP_THROW(ctx, "Option embeddings must be a Boolean");
-            cp.embeddings = duk_get_boolean(ctx, -1);
-        }
-        duk_pop(ctx);
-
-        // pooling: "mean" | "cls" | "last" | number (enum)
-        if (duk_get_prop_string(ctx, opts_idx, "pooling"))
-        {
-            if (duk_is_string(ctx, -1))
-            {
-                const char *s = duk_get_string(ctx, -1);
-                if (strcmp(s, "mean") == 0)
-                    cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
-                else if (strcmp(s, "cls") == 0)
-                    cp.pooling_type = LLAMA_POOLING_TYPE_CLS;
-                else if (strcmp(s, "last") == 0)
-                    cp.pooling_type = LLAMA_POOLING_TYPE_LAST;
-                else
-                    RP_THROW(ctx, "Option pooling must be 'mean', 'cls', or 'last'");
-            }
-            else if (duk_is_number(ctx, -1))
-            {
-                cp.pooling_type = (enum llama_pooling_type)duk_get_int(ctx, -1);
-            }
-            else
-            {
-                RP_THROW(ctx, "Option pooling must be a String or Number");
-            }
-        }
-        duk_pop(ctx);
     }
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "attention")) {
+        const char *s = REQUIRE_STRING(ctx, -1, "attention must be 'causal'|'non-causal'");
+        if      (!strcmp(s, "causal"))                              cp->attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
+        else if (!strcmp(s, "non-causal") || !strcmp(s, "noncausal")) cp->attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+        else RP_THROW(ctx, "attention: unknown '%s' (causal|non-causal)", s);
+    }
+    duk_pop(ctx);
+}
 
-    // If user didn't specify nctx or ubatch, set both to model's max.
+/* Build the embedding context from an ALREADY-PARSED cp (common + embed opts).
+ * Finalizes embed-specific derived values (n_ctx cap, ubatch, batch, unified KV)
+ * and stashes cp_buf for the per-thread rebuild, then creates the context. */
+static struct llama_context *new_embed_context(duk_context *ctx, struct llama_model *lmodel, struct llama_context_params *cpin)
+{
+    struct llama_context_params cp = *cpin;
+
+    // If user didn't specify a context size, default to the model's max (capped
+    // so an auto setting doesn't blow up memory; an explicit nCtx is honored).
     if (cp.n_ctx <= 0)
     {
         int n_train = llama_model_n_ctx_train(lmodel);
-
-        // don't go crazy and run out of memory, unless we explicitly set n_ctx - then it's user error
-        if (n_train > 8192)
-            n_train = 8192;
-
-        if (n_train > 0)
-            cp.n_ctx = n_train;
+        if (n_train > 8192) n_train = 8192;
+        if (n_train > 0) cp.n_ctx = n_train;
     }
 
     if (cp.n_ubatch <= 0)
-    {
-        // default ubatch to n_ctx so a full window fits in one micro-batch
-        cp.n_ubatch = cp.n_ctx > 0 ? cp.n_ctx : 0;
-    }
+        cp.n_ubatch = cp.n_ctx > 0 ? cp.n_ctx : 0;  // full window in one micro-batch
 
-    // batch must be equal or greater, to prevent clamping
-    cp.n_batch = cp.n_ubatch;
+    cp.n_batch = cp.n_ubatch;  // batch >= ubatch, to prevent clamping
 
     // b9494: match llama.cpp's embedding tool (examples/embedding/embedding.cpp).
     // Enabling a unified KV cache makes the context actually allocate a memory;
@@ -911,7 +1032,6 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("cp_buf"));
     memcpy(cp_buf, &cp, sizeof(struct llama_context_params));
 
-    // printf("setting ctx at %d\n", cp.n_ctx);
     return llama_init_from_model(lmodel, cp);
 }
 
@@ -1633,13 +1753,22 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     struct llama_model *lmodel = NULL;
     struct llama_context *lctx = NULL;
 
-    struct llama_model_params mp = llama_model_default_params();
+    /* model + context options (llama-server parity), shared parser + embed mode */
+    struct llama_model_params   mp = llama_model_default_params();
+    struct llama_context_params cp = llama_context_default_params();
+    cp.embeddings      = true;
+    cp.pooling_type    = LLAMA_POOLING_TYPE_MEAN;
+    cp.n_threads       = 1;
+    cp.n_ctx           = 0;
+    cp.n_ubatch        = 0;
+    cp.n_threads_batch = -1;
+    if (obj_idx > -1) { parse_common_opts(ctx, obj_idx, &mp, &cp); parse_embed_opts(ctx, obj_idx, &cp); }
 
     // Shared, refcounted load (one llama_model per path even across thread-copies;
     // one refcount per context, released in emb_free). Fixes the cross-copy
     // double-free and shares weights across threads.
     char lerr[256] = {0};
-    lmodel = lgen_model_acquire(model, mp.use_mmap, mp.use_mlock, mp.check_tensors, lerr, sizeof lerr);
+    lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
 
     if (!lmodel)
         RP_THROW(ctx, "rampart-llama-cpp:init - Could not load ggml file '%s': %s", model, lerr[0] ? lerr : strerror(errno));
@@ -1649,7 +1778,7 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     if (vec_dim <= 0)
         RP_THROW(ctx, "rampart-llama-cpp:init - Internal error getting vector dimensions");
 
-    lctx = new_embed_context(ctx, lmodel, obj_idx);
+    lctx = new_embed_context(ctx, lmodel, &cp);
 
     if (!lctx)
         RP_THROW(ctx, "rampart-llama-cpp:init - Failed to init llama from model");
@@ -1994,67 +2123,24 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     struct llama_model *lmodel = NULL;
     struct llama_context *lctx = NULL;
 
-    // Set up model parameters
-    struct llama_model_params mp = llama_model_default_params();
+    // model + context options (llama-server parity), shared parser + embed mode.
+    // RANK pooling is the rerank default (overridable via the pooling option).
+    struct llama_model_params   mp = llama_model_default_params();
+    struct llama_context_params cp = llama_context_default_params();
+    cp.embeddings      = true;
+    cp.pooling_type    = LLAMA_POOLING_TYPE_RANK;
+    cp.n_threads       = -1;
+    cp.n_ctx           = 0;
+    cp.n_ubatch        = 0;
+    cp.n_threads_batch = -1;
+    if (obj_idx >= 0) { parse_common_opts(ctx, obj_idx, &mp, &cp); parse_embed_opts(ctx, obj_idx, &cp); }
 
     // shared, refcounted load (one refcount per context; released in emb_free)
     char lerr[256] = {0};
-    lmodel = lgen_model_acquire(model, mp.use_mmap, mp.use_mlock, mp.check_tensors, lerr, sizeof lerr);
+    lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
 
     if (!lmodel)
         RP_THROW(ctx, "rampart-llama-cpp:initRerank - Could not load ggml file '%s': %s", model, strerror(errno));
-
-    // Set up context parameters for reranking
-    struct llama_context_params cp = llama_context_default_params();
-
-    // Enable embeddings mode and set pooling to RANK
-    cp.embeddings = true;
-    cp.pooling_type = LLAMA_POOLING_TYPE_RANK;
-    cp.n_threads = -1;
-    cp.n_ctx = 0;        // will be set later if not specified
-    cp.n_ubatch = 0;     // will be set later if not specified
-    cp.n_threads_batch = -1;
-
-    // Get options from JavaScript object (matching user's existing option names)
-    if (obj_idx >= 0)
-    {
-        // nctx (context size)
-        if (duk_get_prop_string(ctx, obj_idx, "nctx"))
-        {
-            if (!duk_is_number(ctx, -1))
-                RP_THROW(ctx, "option nctx must be a Number");
-            cp.n_ctx = duk_get_int(ctx, -1);
-        }
-        duk_pop(ctx);
-
-        // ubatch (micro-batch size)
-        if (duk_get_prop_string(ctx, obj_idx, "ubatch"))
-        {
-            if (!duk_is_number(ctx, -1))
-                RP_THROW(ctx, "option ubatch must be a Number");
-            cp.n_ubatch = duk_get_int(ctx, -1);
-        }
-        duk_pop(ctx);
-
-        // nthreads - not really relevant here?
-        if (duk_get_prop_string(ctx, obj_idx, "nthreads"))
-        {
-            if (!duk_is_number(ctx, -1))
-                RP_THROW(ctx, "option nthreads must be a Number");
-            cp.n_threads = duk_get_int(ctx, -1);
-        }
-        duk_pop(ctx);
-
-        // nthreads_batch
-        if (duk_get_prop_string(ctx, obj_idx, "nthreads_batch"))
-        {
-            if (!duk_is_number(ctx, -1))
-                RP_THROW(ctx, "option nthreads_batch must be a Number");
-            cp.n_threads_batch = duk_get_int(ctx, -1);
-        }
-        duk_pop(ctx);
-
-    }
 
     // If user didn't specify nctx or ubatch, set both to model's max
     if (cp.n_ctx <= 0)

@@ -3,8 +3,9 @@
  *
  * Exercises the critical functions of the embedding path (initEmbed) and the
  * text-generation path (initGen). Each needs a model file; this script offers
- * to download each from HuggingFace into /tmp (so nothing is left in the
- * project tree). Decline a download and that section prints "- skipped".
+ * to download each from HuggingFace into the standard, reusable location
+ * ~/.rampart/models/<gen|embed|rerank>/ (so other tools/demos can find them).
+ * Decline a download and that section prints "- skipped".
  *
  *   rampart llamacpp-test.js
  */
@@ -34,23 +35,27 @@ function loadModule() {
 }
 var llamacpp = loadModule();
 
-/* ---- models: downloaded to /tmp, source URL on HuggingFace ---------------- */
+/* ---- models: downloaded under ~/.rampart/models/<category>/, src on HuggingFace
+   (standard, reusable location so demos and other tools can find them) -------- */
+var MODELROOT = (process.env.HOME || '/tmp') + '/.rampart/models';
 var MODELS = {
     embed: {
         name: 'all-minilm-l6-v2_f16.gguf',
-        file: '/tmp/all-minilm-l6-v2_f16.gguf',
+        dir:  MODELROOT + '/embed',
         url:  'https://huggingface.co/leliuga/all-MiniLM-L6-v2-GGUF/resolve/main/all-MiniLM-L6-v2.F16.gguf',
         size: '~45 MB',
         what: 'embedding test'
     },
     gen: {
         name: 'qwen2.5-0.5b-instruct-q4_k_m.gguf',
-        file: '/tmp/qwen2.5-0.5b-instruct-q4_k_m.gguf',
+        dir:  MODELROOT + '/gen',
         url:  'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf',
         size: '~470 MB',
         what: 'generation / inference test'
     }
 };
+/* full destination path for each model */
+for (var _k in MODELS) MODELS[_k].file = MODELS[_k].dir + '/' + MODELS[_k].name;
 
 /* ================================================================
    test harness (modeled on rampart-iroh/iroh-test.js)
@@ -98,6 +103,7 @@ function obtain(m) {
     if (r !== 'y' && r !== 'yes') return null;
 
     printf("Downloading %s\n  -> %s\n", m.url, m.file);
+    try { mkdir(m.dir); } catch(e) {}   // ensure ~/.rampart/models/<cat>/ exists (mkdir creates parents)
     var f = fopen(m.file, 'w+');
     var nchunks = 0, status = -1;
     try {

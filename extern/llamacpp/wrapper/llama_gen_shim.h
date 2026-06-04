@@ -17,6 +17,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "llama.h"   /* lgen_engine_params carries llama_model_params/llama_context_params
+                        directly, so the one shared option parser (rampart-llamacpp.c)
+                        fills the real structs. Both TUs already include llama.h. */
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,9 +30,8 @@ extern "C" {
  * Invariant: ONE refcount per live llama_context that uses the model — call
  * acquire (or addref, if you already hold the pointer) when you create a context,
  * and release when you free that context. */
-struct llama_model;
-struct llama_model *lgen_model_acquire(const char *path, int use_mmap, int use_mlock,
-                                       int check_tensors, char *errbuf, size_t errlen);
+struct llama_model *lgen_model_acquire(const char *path, const struct llama_model_params *mp,
+                                       char *errbuf, size_t errlen);
 void                lgen_model_addref(struct llama_model *m);
 void                lgen_model_release(struct llama_model *m);
 
@@ -54,30 +56,21 @@ typedef void (*lgen_on_piece)(void *ud, const char *piece, size_t len);
 typedef void (*lgen_on_done)(void *ud, int status, const char *err,
                              int finish_reason, const char *full_text, size_t full_len);
 
-/* ---- engine creation params (mirrors the subset of llama params we expose) ---- */
+/* ---- engine creation params ----
+ * The model/context options are the real llama structs, filled by the single
+ * shared option parser in rampart-llamacpp.c (parse_common_opts). Only scalar/enum
+ * fields are set there; pointer fields (tensor_split, kv_overrides, devices) are
+ * left at their defaults so the struct is safe to memcpy/copy across rampart
+ * threads (the per-thread engine rebuild path). model_path and chat_template are
+ * const char* owned by the caller; lgen_engine_create copies them into the engine.
+ * cparams.n_seq_max is the slot count; cparams.n_ctx == 0 => model's n_ctx_train. */
 typedef struct {
     const char *model_path;
-    const char *mmproj_path;     /* NULL = text-only (P1); vision deferred to P2 */
+    const char *chat_template;   /* gen: custom Jinja template; NULL = model default */
+    int         use_jinja;       /* gen: 1 = apply chat template via Jinja (default)  */
 
-    uint32_t n_ctx;              /* total context across all slots (0 = auto)    */
-    uint32_t n_seq_max;          /* number of slots                              */
-    uint32_t n_batch;
-    uint32_t n_ubatch;
-    int32_t  n_threads;
-    int32_t  n_threads_batch;
-    int      kv_unified;         /* bool                                          */
-    int      flash_attn_type;    /* -1 = auto                                     */
-    int      offload_kqv;        /* bool                                          */
-    int      op_offload;         /* bool                                          */
-
-    int      type_k;             /* enum ggml_type as int                         */
-    int      type_v;
-
-    /* model params */
-    int      use_mmap;
-    int      use_mlock;
-    int      check_tensors;
-    int      vocab_only;
+    struct llama_model_params   mparams;
+    struct llama_context_params cparams;
 } lgen_engine_params;
 
 /* ---- per-request params ---- */

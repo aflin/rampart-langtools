@@ -97,11 +97,13 @@ rampart.utils.printf("%s\n", text);
 // ASYNC/STREAMING: predictAsync(opts, onToken, onDone) is non-blocking and
 // streams tokens as they are produced.  Multiple in-flight calls (across
 // threads or from one event loop) batch together through the shared engine.
-gen.predictAsync(
+// It returns a handle whose .cancel() hard-stops that generation (frees the slot).
+var h = gen.predictAsync(
     { prompt: "Explain how a combustion engine works.", maxTokens: 256, temp: 0.7 },
     function(res) { if (!res.done && !res.error) rampart.utils.printf("%s", res.token); },
     function(res) { rampart.utils.printf("\n[done]\n"); }   // res.fullText, res.error
 );
+// h.cancel();   // stop this generation early
 
 // retrieve the full text of the last sync predict()
 var fullText = gen.getLast();
@@ -111,22 +113,30 @@ gen.destroy();
 ```
 
 ### initGen Options:
+
+Most options map 1:1 to the matching `llama-server` command-line flag (camelCase
+of the flag — e.g. `gpuLayers` = `--gpu-layers`, `flashAttn` = `--flash-attn`,
+`cacheTypeK` = `--cache-type-k`). See the
+[llama.cpp / llama-server docs](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)
+for what each does.
+
 ```
 var gen = llamacpp.initGen('/path/to/model.gguf', {
-    // Model params
-    useMmap:    false,      // use memory-mapped IO (default: false)
-    useMlock:   false,      // lock model in RAM (default: false)
+    // model loading
+    gpuLayers, mainGpu, splitMode, useMmap, useMlock, checkTensors,
 
-    // Context / batching params
-    nCtx:        0,         // context size (0 = auto from available memory)
-    nSeqMax:     1,         // max requests batched together in the one context
-    kvUnified:   false,     // share one KV cache across slots (default: false)
-    threads:     1,         // number of threads
-    threadsBatch: 1,        // threads for batch processing
-    nBatch:      0,         // batch size
-    nUBatch:     0,         // micro-batch size
-    offloadKQV:  false,     // offload KQV to GPU
-    opOffload:   false,     // offload operations to GPU
+    // context (nCtx: 0 or -1 = the model's trained max, like llama-server)
+    nCtx, nSeqMax, nBatch, nUBatch, threads, threadsBatch,
+    ropeScaling, ropeFreqBase, ropeFreqScale,
+    yarnExtFactor, yarnAttnFactor, yarnBetaFast, yarnBetaSlow, yarnOrigCtx,
+    flashAttn,                 // true | false | "auto"
+    cacheTypeK, cacheTypeV,    // KV cache type, e.g. "q8_0"
+    offloadKqv, opOffload, kvUnified,
+
+    // chat
+    jinja,             // apply the chat template via Jinja (default: true)
+    chatTemplate,      // custom Jinja template (string)
+    chatTemplateFile,  // ... or read the template from a file
 });
 ```
 
@@ -153,16 +163,23 @@ gen.predict({
 // streaming use predictAsync(opts, onToken, onDone) instead.
 ```
 
-### Other Options:
-```
-// options like nctx, n_threads_batch, batch, ubatch can also be set:
-// load module
-var llamacpp=require('rampart-llamacpp');
+### initEmbed / initRerank Options:
 
-// load model
-var rrmodel = process.scriptPath + '/data/models/bge-reranker-v2-m3-Q8_0.gguf';
-var rr = llamacpp.initRerank(rrmodel, {ubatch:256});
+`initEmbed` and `initRerank` accept the same model-loading and context options as
+`initGen` above (`gpuLayers`, `nCtx`, `threads`, `flashAttn`, `cacheTypeK/V`, the
+`rope*`/`yarn*` family, etc. — see the
+[llama.cpp docs](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)),
+plus:
+
 ```
+var emb = llamacpp.initEmbed('model.gguf', {
+    pooling,    // "none" | "mean" | "cls" | "last" | "rank"   (--pooling)
+    attention,  // "causal" | "non-causal"                     (--attention)
+});
+```
+
+The legacy names `nctx`, `ubatch`, `nthreads`, `nthreads_batch` are still accepted
+as aliases for `nCtx`, `nUBatch`, `threads`, `threadsBatch`.
 
 ### Logging:
 llama.cpp produces log output during model loading and initialization.

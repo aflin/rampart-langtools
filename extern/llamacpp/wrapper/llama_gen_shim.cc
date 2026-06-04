@@ -106,6 +106,8 @@ struct lgen_engine {
     /* config + model (set at create) */
     lgen_engine_params params{};
     std::string  model_path;
+    std::string  chat_template;     /* owned copy of params.chat_template ("" = default) */
+    bool         use_jinja = true;  /* apply the chat template via Jinja                  */
     llama_model *model = nullptr;
     const llama_vocab *vocab = nullptr;
     uint32_t  n_ctx_cfg = 0;     /* configured/derived, reported to JS */
@@ -236,7 +238,7 @@ static common_params_sampling sampling_from_req(const gen_request *req) {
 
 static std::string build_prompt(lgen_engine *e, const gen_request *req) {
     common_chat_templates_inputs in;
-    in.use_jinja = true;
+    in.use_jinja = e->use_jinja;
     in.add_generation_prompt = req->add_assistant ? true : false;
     if (req->has_messages) {
         json arr = json::parse(req->messages_json, nullptr, false);
@@ -413,25 +415,25 @@ int                            g_model_cache_pid = -1; /* detect fork */
 /* acquire by (path + load flags): load once, or bump refcount + return the
  * cached model. The invariant maintained by all callers is ONE refcount per
  * live llama_context that uses the model. */
-llama_model *model_acquire_path(const char *path, int use_mmap, int use_mlock,
-                                int check_tensors, char *err, size_t errlen) {
+llama_model *model_acquire_path(const char *path, const llama_model_params *mp,
+                                char *err, size_t errlen) {
     std::lock_guard<std::mutex> lk(g_model_cache_mtx);
     /* after a fork the inherited GPU/model handles are invalid in the child;
      * drop the cache so this process reloads its own (don't free parent's COW). */
     int pid = (int) getpid();
     if (g_model_cache_pid != pid) { g_model_cache.clear(); g_model_cache_pid = pid; }
 
-    char flags[32];
-    snprintf(flags, sizeof flags, "|%d%d%d", use_mmap ? 1 : 0, use_mlock ? 1 : 0, check_tensors ? 1 : 0);
+    /* key on path + every load param that changes the resulting model, so two
+     * engines differing in GPU offload / split don't wrongly share one model. */
+    char flags[96];
+    snprintf(flags, sizeof flags, "|%d%d%d|ngl%d|sm%d|mg%d",
+             mp->use_mmap ? 1 : 0, mp->use_mlock ? 1 : 0, mp->check_tensors ? 1 : 0,
+             mp->n_gpu_layers, (int) mp->split_mode, mp->main_gpu);
     std::string key = std::string(path) + flags;
     for (auto &e : g_model_cache)
         if (e.key == key) { e.refcount++; return e.model; }
 
-    llama_model_params mp = llama_model_default_params();
-    mp.use_mmap      = use_mmap ? true : false;
-    mp.use_mlock     = use_mlock ? true : false;
-    mp.check_tensors = check_tensors ? true : false;
-    llama_model *m = llama_model_load_from_file(path, mp);
+    llama_model *m = llama_model_load_from_file(path, *mp);
     if (!m) { set_err(err, errlen, "could not load model"); return nullptr; }
     g_model_cache.push_back({ key, m, 1 });
     return m;
@@ -467,7 +469,7 @@ void model_release(llama_model *m) {
 static bool load_model(lgen_engine *e, char *err, size_t errlen) {
     if (e->model) return true;
     const lgen_engine_params *p = &e->params;
-    e->model = model_acquire_path(p->model_path, p->use_mmap, p->use_mlock, p->check_tensors, err, errlen);
+    e->model = model_acquire_path(p->model_path, &p->mparams, err, errlen);
     if (!e->model) return false;
     e->vocab   = llama_model_get_vocab(e->model);
     e->n_vocab = llama_vocab_n_tokens(e->vocab);
@@ -500,20 +502,12 @@ static bool build_context(lgen_engine *e, char *err, size_t errlen) {
     static std::mutex g_build_mtx;
     std::lock_guard<std::mutex> build_lk(g_build_mtx);
 
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx           = p->n_ctx ? p->n_ctx : 4096;
-    cp.n_seq_max       = e->n_seq_max;
-    cp.n_batch         = p->n_batch  ? p->n_batch  : 2048;
-    cp.n_ubatch        = p->n_ubatch ? p->n_ubatch : cp.n_batch;
-    cp.n_threads       = p->n_threads ? p->n_threads : 1;
-    cp.n_threads_batch = p->n_threads_batch ? p->n_threads_batch : cp.n_threads;
-    cp.kv_unified      = p->kv_unified ? true : false;
-    if (p->flash_attn_type != 0) cp.flash_attn_type = (enum llama_flash_attn_type) p->flash_attn_type;
-    cp.offload_kqv     = p->offload_kqv ? true : false;
-    cp.op_offload      = p->op_offload ? true : false;
-    if (p->type_k) cp.type_k = (enum ggml_type) p->type_k;
-    if (p->type_v) cp.type_v = (enum ggml_type) p->type_v;
-    cp.embeddings      = false;
+    /* the context options were all parsed by the shared parser into cparams */
+    llama_context_params cp = p->cparams;
+    /* 0 (unspecified, or nCtx:0/-1) => the model's trained max, same as llama-server */
+    if (cp.n_ctx == 0) cp.n_ctx = (uint32_t) llama_model_n_ctx_train(e->model);
+    cp.n_seq_max  = e->n_seq_max;   /* slot count */
+    cp.embeddings = false;          /* gen never embeds */
 
     e->ctx = llama_init_from_model(e->model, cp);
     if (!e->ctx) { set_err(err, errlen, "failed to create llama context"); return false; }
@@ -521,7 +515,8 @@ static bool build_context(lgen_engine *e, char *err, size_t errlen) {
     e->n_ctx   = llama_n_ctx(e->ctx);
     e->n_batch = llama_n_batch(e->ctx);
     e->add_bos = llama_vocab_get_add_bos(e->vocab);
-    e->templates = common_chat_templates_init(e->model, "");
+    e->templates = common_chat_templates_init(e->model,
+                       e->chat_template.empty() ? "" : e->chat_template);
     e->batch = llama_batch_init(e->n_batch + e->n_seq_max, 0, 1);
 
     e->slots.assign(e->n_seq_max, gen_slot());
@@ -552,10 +547,11 @@ extern "C" {
  * so a model is loaded once and freed once even when a handle is copied across
  * threads. Invariant: one refcount per live llama_context that uses the model —
  * acquire (or addref) when you create a context, release when you free it. */
-struct llama_model *lgen_model_acquire(const char *path, int use_mmap, int use_mlock,
-                                       int check_tensors, char *errbuf, size_t errlen) {
+struct llama_model *lgen_model_acquire(const char *path, const struct llama_model_params *mp,
+                                       char *errbuf, size_t errlen) {
     if (!path) { set_err(errbuf, errlen, "missing model_path"); return nullptr; }
-    return model_acquire_path(path, use_mmap, use_mlock, check_tensors, errbuf, errlen);
+    if (!mp)   { set_err(errbuf, errlen, "missing model params"); return nullptr; }
+    return model_acquire_path(path, mp, errbuf, errlen);
 }
 void lgen_model_addref(struct llama_model *m)  { model_addref(m); }
 void lgen_model_release(struct llama_model *m) { model_release(m); }
@@ -567,7 +563,11 @@ lgen_engine *lgen_engine_create(const lgen_engine_params *p, char *errbuf, size_
     e->params = *p;
     e->model_path = p->model_path;
     e->params.model_path = e->model_path.c_str();
-    e->n_seq_max = p->n_seq_max ? p->n_seq_max : 1;
+    /* own the chat template string (the caller's pointer won't outlive this call) */
+    e->chat_template = p->chat_template ? p->chat_template : "";
+    e->params.chat_template = e->chat_template.empty() ? nullptr : e->chat_template.c_str();
+    e->use_jinja = p->use_jinja ? true : false;
+    e->n_seq_max = p->cparams.n_seq_max ? p->cparams.n_seq_max : 1;
 
     /* Load the full model + build the context NOW, on the calling (rampart)
      * thread. This mirrors how embedding (initEmbed) loads on its worker thread
