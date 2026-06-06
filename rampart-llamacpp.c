@@ -1453,8 +1453,26 @@ static void rp_embed_cache_put(rp_embed_handle_t *h)
     pthread_mutex_unlock(&rp_embed_cache_lock);
 }
 
+/* CUDA graphs (ggml) are cached per shape in a per-context map that only evicts
+ * after 10s of non-use. Batched embedding/reranking (and continuous-batch
+ * generation) feed it a stream of varying shapes, so the map fills faster than
+ * it drains and VRAM climbs until OOM. Graphs only speed up single-stream
+ * autoregressive generation -- which embedding and reranking never do -- so we
+ * disable them for those paths. ggml reads this env once, lazily, on the first
+ * graph evaluation, so it MUST be set before the first llama_decode; the embed/
+ * rerank init and the sql-driven rp_embed_load all run before any decode. A pure
+ * generation app calls none of these, so its CUDA graphs stay enabled. Opt out
+ * (keep graphs for embed/rerank too, accepting the leak) by setting
+ * RAMPART_LLAMA_CUDA_GRAPHS. Harmless on CPU/Metal builds (the var is ignored). */
+static void lt_disable_cuda_graphs_for_batched(void)
+{
+    if (!getenv("RAMPART_LLAMA_CUDA_GRAPHS"))
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+}
+
 void *rp_embed_load(const char *path, char *err, size_t errlen)
 {
+    lt_disable_cuda_graphs_for_batched();   /* sql-loaded embed path */
     if (!path) {
         if (err && errlen) snprintf(err, errlen, "rp_embed_load: null path");
         return NULL;
@@ -1742,6 +1760,7 @@ void rp_embed_release(void *handle)
 
 static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 {
+    lt_disable_cuda_graphs_for_batched();
     const char *model = REQUIRE_STRING(ctx, 0, "init: argument 1 must be a string");
     duk_idx_t obj_idx = -1;
 
@@ -2112,6 +2131,7 @@ static duk_ret_t rerank_text(duk_context *ctx)
 // Initialize a reranking model
 static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 {
+    lt_disable_cuda_graphs_for_batched();
     const char *model = REQUIRE_STRING(ctx, 0, "init: argument 1 must be a string");
     duk_idx_t obj_idx = -1;
 
