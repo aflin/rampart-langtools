@@ -181,6 +181,47 @@ var emb = llamacpp.initEmbed('model.gguf', {
 The legacy names `nctx`, `ubatch`, `nthreads`, `nthreads_batch` are still accepted
 as aliases for `nCtx`, `nUBatch`, `threads`, `threadsBatch`.
 
+### modelInfo (read model metadata without loading weights):
+
+`llamacpp.modelInfo(path)` returns a model's key parameters by reading only its
+GGUF metadata and vocabulary — it does **not** load the weight tensors, so there
+is no GPU upload and the call is fast (tens to a few hundred ms, mostly vocab
+parsing) even for multi-gigabyte models.
+
+```
+var info = llamacpp.modelInfo('bge-m3-FP16.gguf');
+// {
+//   embedDim:   1024,   // size of the vector embed()/embedText* produces
+//   hiddenDim:  1024,   // model hidden size
+//   nCtxTrain:  8192,   // trained context length
+//   nLayer:     24,
+//   arch:       "bert", // GGUF general.architecture
+//   pooling:    "cls",  // declared pooling: none|mean|cls|last|rank|unspecified
+//   nParams:    566703104
+// }
+```
+
+`embedDim` is the output embedding size (it prefers the GGUF
+`embedding_length_out` of a projection head, falling back to `embedding_length`).
+This lets a pipeline size its vector storage/index from the model itself rather
+than hard-coding a dimension — e.g. `var vecDim = llamacpp.modelInfo(f).embedDim;`.
+
+### Environment variables:
+
+`RAMPART_LLAMA_CUDA_GRAPHS` — On CUDA builds, ggml caches a captured CUDA graph
+per compute-graph shape and only evicts entries after they have been idle for 10
+seconds. Batched embedding and reranking decode a stream of varying shapes, which
+fills that cache faster than it drains and makes GPU memory climb until it runs
+out. CUDA graphs only speed up single-stream text generation, so `initEmbed`,
+`initRerank`, and the `rampart-sql` embedding path disable them automatically (by
+setting `GGML_CUDA_DISABLE_GRAPHS=1` before the first decode). A process that only
+calls `initGen` never disables them, so generation performance is unaffected.
+
+Set `RAMPART_LLAMA_CUDA_GRAPHS` (to any value) to opt out and keep CUDA graphs on
+even for embedding/reranking — accepting the memory growth above. The setting is
+process-global and read once at startup, so it cannot be toggled per call. It has
+no effect on CPU or Metal (Apple) builds.
+
 ### Logging:
 llama.cpp produces log output during model loading and initialization.
 This output is captured in an internal buffer rather than printed to

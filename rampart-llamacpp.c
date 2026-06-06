@@ -1758,6 +1758,83 @@ void rp_embed_release(void *handle)
 
 /* ============================================================ */
 
+/* Read an integer GGUF metadata value "<arch>.<suffix>" from a (vocab_only)
+ * model. Returns dflt if the key is absent. */
+static long lt_meta_long(struct llama_model *m, const char *arch,
+                         const char *suffix, long dflt)
+{
+    char key[192], val[64] = {0};
+    if (!arch || !arch[0]) return dflt;
+    snprintf(key, sizeof key, "%s.%s", arch, suffix);
+    if (llama_model_meta_val_str(m, key, val, sizeof val) >= 0)
+        return atol(val);
+    return dflt;
+}
+
+/* modelInfo(path) -- read a model's metadata WITHOUT loading its weights.
+ * Uses a vocab_only load (vocab + metadata only: no tensor data, no GPU upload)
+ * and reads the dimensions from the GGUF metadata keys (under vocab_only the
+ * hparams accessors like llama_model_n_embd() aren't populated, but the metadata
+ * KV are -- and they are exactly what llama.cpp itself reads to fill those
+ * hparams). Returns:
+ *   { embedDim, hiddenDim, nCtxTrain, nLayer, arch, pooling, nParams }
+ * embedDim prefers "<arch>.embedding_length_out" (a projection head's output
+ * size) and falls back to "<arch>.embedding_length" -- it is the size of the
+ * vector embed()/embedText* produces. pooling is the model's declared pooling
+ * type, or "unspecified" if the GGUF doesn't set one. */
+static duk_ret_t llamacpp_model_info(duk_context *ctx)
+{
+    const char *path = REQUIRE_STRING(ctx, 0,
+        "modelInfo: argument 1 must be a String (path to .gguf)");
+
+    struct llama_model_params mp = llama_model_default_params();
+    mp.vocab_only   = true;   /* metadata + vocab only -- no weights, no GPU upload */
+    mp.n_gpu_layers = 0;      /* belt-and-suspenders: never touch the GPU here */
+
+    struct llama_model *m = llama_model_load_from_file(path, mp);
+    if (!m)
+        RP_THROW(ctx, "modelInfo: could not load '%s'", path);
+
+    char arch[128] = {0};
+    if (llama_model_meta_val_str(m, "general.architecture", arch, sizeof arch) < 0)
+        arch[0] = '\0';
+
+    /* pooling type is stored under "<arch>.pooling_type" as a uint enum. */
+    const char *pooling = "unspecified";
+    if (arch[0]) {
+        char pkey[160], pval[32] = {0};
+        snprintf(pkey, sizeof pkey, "%s.pooling_type", arch);
+        if (llama_model_meta_val_str(m, pkey, pval, sizeof pval) >= 0) {
+            switch (atoi(pval)) {
+                case 0:  pooling = "none"; break;
+                case 1:  pooling = "mean"; break;
+                case 2:  pooling = "cls";  break;
+                case 3:  pooling = "last"; break;
+                case 4:  pooling = "rank"; break;
+                default: pooling = pval;   break;
+            }
+        }
+    }
+
+    long     hidden_dim = lt_meta_long(m, arch, "embedding_length", 0);
+    long     embed_dim  = lt_meta_long(m, arch, "embedding_length_out", hidden_dim);
+    long     n_ctx_tr   = lt_meta_long(m, arch, "context_length", 0);
+    long     n_layer    = lt_meta_long(m, arch, "block_count", 0);
+    uint64_t nparm      = llama_model_n_params(m);
+
+    llama_model_free(m);
+
+    duk_push_object(ctx);
+    duk_push_int(ctx, embed_dim);        duk_put_prop_string(ctx, -2, "embedDim");
+    duk_push_int(ctx, hidden_dim);       duk_put_prop_string(ctx, -2, "hiddenDim");
+    duk_push_int(ctx, n_ctx_tr);         duk_put_prop_string(ctx, -2, "nCtxTrain");
+    duk_push_int(ctx, n_layer);          duk_put_prop_string(ctx, -2, "nLayer");
+    duk_push_string(ctx, arch);          duk_put_prop_string(ctx, -2, "arch");
+    duk_push_string(ctx, pooling);       duk_put_prop_string(ctx, -2, "pooling");
+    duk_push_number(ctx, (double)nparm); duk_put_prop_string(ctx, -2, "nParams");
+    return 1;
+}
+
 static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 {
     lt_disable_cuda_graphs_for_batched();
@@ -2383,6 +2460,9 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     duk_push_c_function(ctx, llamacpp_init_embed, 2);
     duk_put_prop_string(ctx, -2, "initEmbed");
+
+    duk_push_c_function(ctx, llamacpp_model_info, 1);
+    duk_put_prop_string(ctx, -2, "modelInfo");     // read dim/ctx/arch w/o loading weights
 
     duk_push_c_function(ctx, lg_init_gen, 2);
     duk_put_prop_string(ctx, -2, "__rawInitGen");   // raw per-thread slot engine (used by initGen's owner thread)
