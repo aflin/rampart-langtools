@@ -17,25 +17,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#ifdef __APPLE__
-#include <sys/utsname.h>
-/* macOS major version (e.g. 12, 14, 15) from uname's Darwin release.
-   Darwin K = macOS K-9: Darwin 21 = macOS 12, 23 = 14, 24 = 15.  Returns
-   0 if it can't be determined; callers should treat 0 as "unknown,
-   don't block". */
-static int rp_macos_major(void)
-{
-    struct utsname u;
-    int darwin;
-    if (uname(&u) != 0) return 0;
-    darwin = atoi(u.release);
-    /* install.sh's min-supported macOS is 11.0 (Darwin 20); anything
-       below that is either not macOS or not a supported install
-       target -- treat as "unknown, don't block". */
-    if (darwin < 20) return 0;
-    return darwin - 9;
-}
-#endif
 #include <stdbool.h>
 #include <pthread.h>
 #include "llama.h"
@@ -880,6 +861,25 @@ static const char *BATCHGEN_SCRIPT =
 "    destroy: function(){ try { owner.terminate(); } catch(e) {} }\n"
 "  };\n"
 "})\n";
+
+#ifdef __APPLE__
+#include <sys/utsname.h>
+/* macOS major version (e.g. 12, 14, 15) from uname's Darwin release.
+   Darwin K = macOS K-9: Darwin 21 = macOS 12, 23 = 14, 24 = 15.  Returns
+   0 if it can't be determined; callers should treat 0 as "unknown,
+   don't block".  install.sh's min-supported macOS is 11.0 (Darwin 20);
+   anything below that is either not macOS or not a supported install
+   target -- treat as unknown. */
+static int rp_macos_major(void)
+{
+    struct utsname u;
+    int darwin;
+    if (uname(&u) != 0) return 0;
+    darwin = atoi(u.release);
+    if (darwin < 20) return 0;
+    return darwin - 9;
+}
+#endif
 
 static duk_ret_t lg_init_gen_batched(duk_context *ctx)
 {
