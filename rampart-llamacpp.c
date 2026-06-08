@@ -16,6 +16,26 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#ifdef __APPLE__
+#include <sys/utsname.h>
+/* macOS major version (e.g. 12, 14, 15) from uname's Darwin release.
+   Darwin K = macOS K-9: Darwin 21 = macOS 12, 23 = 14, 24 = 15.  Returns
+   0 if it can't be determined; callers should treat 0 as "unknown,
+   don't block". */
+static int rp_macos_major(void)
+{
+    struct utsname u;
+    int darwin;
+    if (uname(&u) != 0) return 0;
+    darwin = atoi(u.release);
+    /* install.sh's min-supported macOS is 11.0 (Darwin 20); anything
+       below that is either not macOS or not a supported install
+       target -- treat as "unknown, don't block". */
+    if (darwin < 20) return 0;
+    return darwin - 9;
+}
+#endif
 #include <stdbool.h>
 #include <pthread.h>
 #include "llama.h"
@@ -865,6 +885,23 @@ static duk_ret_t lg_init_gen_batched(duk_context *ctx)
 {
     REQUIRE_STRING(ctx, 0, "initGen: first argument must be a String (path to .gguf)");
     /* opts (optional object) at index 1 */
+
+#ifdef __APPLE__
+    /* initGen on macOS uses Metal features that segfault on macOS < 15
+       (observed on macOS 12 Monterey with libllama built on macOS 15).
+       embed() and rerank() are unaffected by the affected code paths,
+       so we only gate this entry point.  rp_macos_major returns 0 if
+       it can't read uname -- in that case don't block. */
+    {
+        int macos_ver = rp_macos_major();
+        if (macos_ver > 0 && macos_ver < 15)
+            RP_THROW(ctx,
+                "initGen: requires macOS 15 (Sequoia) or later -- "
+                "detected macOS %d.  embed() and rerank() work on this "
+                "version; only the generation pipeline is gated.",
+                macos_ver);
+    }
+#endif
 
     static int bg_ctr = 0;
     int n = __atomic_add_fetch(&bg_ctr, 1, __ATOMIC_SEQ_CST);

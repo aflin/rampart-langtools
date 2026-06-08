@@ -202,9 +202,21 @@ function runGenTest(done) {
     var path = obtain(MODELS.gen);
     if (!path) { printf("- skipped\n"); return done(); }
 
-    var gen = null;
+    /* Probe initGen before turning the rest of the block into test
+       cases.  rampart-llamacpp.c throws "initGen: requires macOS N or
+       later" on macOS releases too old for the underlying Metal
+       features.  Treat that as a graceful skip, not a failure. */
+    var gen = null, probeError = null;
+    try { gen = llamacpp.initGen(path, { nCtx: 2048, nSeqMax: 2 }); }
+    catch (e) { probeError = e; }
+
+    if (probeError && /requires macOS \d+/.test(String(probeError))) {
+        printf("- unsupported: %s\n", String(probeError.message || probeError));
+        return done();
+    }
+
     testFeature("initGen loads model", function() {
-        gen = llamacpp.initGen(path, { nCtx: 2048, nSeqMax: 2 });
+        if (probeError) throw probeError;
         return typeof gen === 'object' && gen !== null;
     });
     if (!gen) return done();
