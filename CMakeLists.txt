@@ -456,11 +456,20 @@ else()
 endif()
 ##end linux
 
+# RPATH "$ORIGIN/../lib" so the langtools .so's find the rampart
+# install bundle's libopenblas / libgfortran / libgomp / libquadmath
+# under <prefix>/lib/.  Same pattern as rampart-sql.so and
+# rampart-graphicsmagick.so in the main build.  $ORIGIN is honoured
+# by both glibc's rtld and FreeBSD's rtld.
+set(LT_RPATH "\$ORIGIN/../lib")
+
 set_target_properties(
     rampart-langtools
     PROPERTIES SUFFIX ".so"
     PREFIX ""
     OUTPUT_NAME "rampart-langtools${LT_NAME_SUFFIX}"
+    INSTALL_RPATH "${LT_RPATH}"
+    BUILD_RPATH   "${LT_RPATH}"
 )
 
 set_target_properties(
@@ -468,6 +477,8 @@ set_target_properties(
     PROPERTIES SUFFIX ".so"
     PREFIX ""
     OUTPUT_NAME "rampart-llamacpp${LT_NAME_SUFFIX}"
+    INSTALL_RPATH "${LT_RPATH}"
+    BUILD_RPATH   "${LT_RPATH}"
 )
 
 set_target_properties(
@@ -475,12 +486,16 @@ set_target_properties(
     PROPERTIES SUFFIX ".so"
     PREFIX ""
     OUTPUT_NAME "rampart-faiss${LT_NAME_SUFFIX}"
+    INSTALL_RPATH "${LT_RPATH}"
+    BUILD_RPATH   "${LT_RPATH}"
 )
 
 set_target_properties(
     rampart-sentencepiece
     PROPERTIES SUFFIX ".so"
     PREFIX ""
+    INSTALL_RPATH "${LT_RPATH}"
+    BUILD_RPATH   "${LT_RPATH}"
 )
 
 if(NOT DEFINED LT_ENABLE_GPU_LAST)
