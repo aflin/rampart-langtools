@@ -116,7 +116,10 @@ static const char **lg_build_stops(duk_context *ctx, duk_idx_t obj_idx, size_t *
     size_t k = 0;
     for (duk_size_t i = 0; i < len; i++) {
         duk_get_prop_index(ctx, -1, (duk_uarridx_t)i);
-        if (duk_is_string(ctx, -1)) stops[k++] = strdup(duk_get_string(ctx, -1));
+        if (duk_is_string(ctx, -1)) {
+            char *d = strdup(duk_get_string(ctx, -1));
+            if (d) stops[k++] = d;
+        }
         duk_pop(ctx);
     }
     duk_pop(ctx);
@@ -141,7 +144,9 @@ static void lg_build_request(duk_context *ctx, duk_idx_t obj_idx, lgen_request *
     req->temp = -1; req->top_p = -1; req->min_p = -1; req->typ_p = -1; req->top_k = 0;
     req->penalty_repeat = -1; req->penalty_last_n = -1;
     req->dry_multiplier = -1; req->dry_base = -1; req->dry_allowed_length = -1;
-    req->seed = (uint32_t)time(NULL);
+    /* mix in a counter so same-second requests don't share a default seed */
+    static uint32_t seed_ctr = 0;
+    req->seed = (uint32_t)time(NULL) + __atomic_add_fetch(&seed_ctr, 1, __ATOMIC_RELAXED);
     req->add_assistant = 1;
 
     if (duk_get_prop_string(ctx, obj_idx, "prompt")) {
@@ -332,7 +337,8 @@ static void lg_sync_on_done(void *ud, int status, const char *err, int reason,
     s->status = status;
     if (status != 0 && err) s->err = strdup(err);
     if (full && full_len) {
-        s->full = malloc(full_len + 1);
+        s->full = NULL;
+        REMALLOC(s->full, full_len + 1);
         memcpy(s->full, full, full_len);
         s->full[full_len] = '\0';
         s->full_len = full_len;
@@ -455,7 +461,8 @@ static void lg_infer_on_done(void *ud, int status, const char *err, int reason,
     }
     if (full && full_len && r->info) {
         if (r->info->last_out) free(r->info->last_out);
-        r->info->last_out = malloc(full_len + 1);
+        r->info->last_out = NULL;
+        REMALLOC(r->info->last_out, full_len + 1);
         memcpy(r->info->last_out, full, full_len);
         r->info->last_out[full_len] = '\0';
         r->info->last_out_len = full_len;
@@ -526,9 +533,11 @@ static duk_ret_t lg_get_last(duk_context *ctx)
     return 1;
 }
 
-static duk_ret_t lg_destroy(duk_context *ctx)
+/* inner teardown: expects the gen object at the TOP of the stack.  The
+   destroy() method wrapper pushes `this`; as a finalizer duktape passes the
+   object as the argument (duk_push_this would yield undefined there). */
+static duk_ret_t lg_destroy_(duk_context *ctx)
 {
-    duk_push_this(ctx);
     if (!duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rp_llama_info"))) return 0;
     rp_llama_info *info = (rp_llama_info *)duk_get_pointer(ctx, -1);
     duk_pop(ctx);
@@ -562,6 +571,12 @@ static duk_ret_t lg_destroy(duk_context *ctx)
     duk_push_true(ctx);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("destroyed"));
     return 0;
+}
+
+static duk_ret_t lg_destroy(duk_context *ctx)
+{
+    duk_push_this(ctx);
+    return lg_destroy_(ctx);
 }
 
 /* ====================================================================
@@ -733,8 +748,13 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
             chat_template = strdup(REQUIRE_STRING(ctx, -1, "chatTemplate must be a string"));
         duk_pop(ctx);
         if (duk_get_prop_string(ctx, o, "chatTemplateFile")) {
-            const char *fn = REQUIRE_STRING(ctx, -1, "chatTemplateFile must be a string");
+            if (!duk_is_string(ctx, -1)) {
+                free(chat_template);
+                RP_THROW(ctx, "chatTemplateFile must be a string");
+            }
+            const char *fn = duk_get_string(ctx, -1);
             free(chat_template);
+            chat_template = NULL;
             chat_template = lt_read_file_alloc(ctx, fn);
         }
         duk_pop(ctx);
@@ -784,7 +804,7 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
 
     duk_push_c_function(ctx, lg_destroy, 0);
     duk_put_prop_string(ctx, -2, "destroy");
-    duk_push_c_function(ctx, lg_destroy, 1);
+    duk_push_c_function(ctx, lg_destroy_, 1); /* finalizer: object arrives as the argument */
     duk_set_finalizer(ctx, -2);
     duk_push_c_function(ctx, lg_get_last, 0);
     duk_put_prop_string(ctx, -2, "getLast");
@@ -927,12 +947,13 @@ static duk_ret_t lg_init_gen_batched(duk_context *ctx)
 //     model refcount (the model is freed by the cache when the last is released).
 //   - rerank_toks: per HANDLE (allocated once at init) — only the ORIGIN copy
 //     (emb_origin_thr/pid, never changed by a rebuild) frees it.
-static duk_ret_t emb_free(duk_context *ctx)
+/* inner teardown: expects the handle object at the TOP of the stack.  The
+   destroy() method wrapper pushes `this`; as a finalizer duktape passes the
+   object as the argument (duk_push_this would yield undefined there). */
+static duk_ret_t emb_free_(duk_context *ctx)
 {
     struct llama_model *lmodel = NULL;
     struct llama_context *lctx = NULL;
-
-    duk_push_this(ctx);
 
     // guard against a second teardown of the same copy (explicit destroy + finalizer)
     if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("destroyed")) && duk_get_boolean_default(ctx, -1, 0)) {
@@ -992,6 +1013,12 @@ static duk_ret_t emb_free(duk_context *ctx)
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("destroyed"));
 
     return 0;
+}
+
+static duk_ret_t emb_free(duk_context *ctx)
+{
+    duk_push_this(ctx);
+    return emb_free_(ctx);
 }
 
 /* Mode-specific options for embed/rerank, parsed into cp AFTER parse_common_opts.
@@ -1129,7 +1156,8 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
         duk_pop(ctx);
         lctx = llama_init_from_model(lmodel, *cp_buf);
 
-        //lctx = new_embed_context(ctx, lmodel, -1);
+        if (!lctx)
+            RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - failed to create llama context on this thread");
 
         // this copy now holds its own context using the shared model: take a model
         // refcount for it (released in emb_free when this context is freed).
@@ -1161,8 +1189,10 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
 
     if (need <= 0)
     {
-        // return empty array for empty/whitespace-only input
+        // empty/whitespace-only input: same {vecs:[...]} shape as the normal path
+        duk_push_object(ctx);
         duk_push_array(ctx);
+        duk_put_prop_string(ctx, -2, "vecs");
         return 1;
     }
 
@@ -1204,6 +1234,12 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     float *avgvec = NULL;
     CALLOC(avgvec, sizeof(float) * vec_dim);
 
+    // f32 staging buffer for the fp16 pack path (heap, not a VLA: vec_dim is
+    // model-controlled and could overflow the stack)
+    float *f32tmp = NULL;
+    if (pack == PACK16)
+        CALLOC(f32tmp, sizeof(float) * vec_dim);
+
     // the return object
     duk_push_object(ctx);
 
@@ -1227,6 +1263,8 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
         if (n > n_ubatch)
         {
             free(toks);
+            free(avgvec);
+            free(f32tmp);
             RP_THROW(ctx, "chunk too large for micro-batch (n=%d > n_ubatch=%d). Increase ubatch and/or batch.", n, n_ubatch);
             return 0;
         }
@@ -1237,6 +1275,8 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
         {
             llama_batch_free(batch);
             free(toks);
+            free(avgvec);
+            free(f32tmp);
             RP_THROW(ctx, "llama_batch_init failed");
             return 0;
         }
@@ -1257,6 +1297,8 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
         {
             llama_batch_free(batch);
             free(toks);
+            free(avgvec);
+            free(f32tmp);
             RP_THROW(ctx, "llama_decode failed on chunk %d (tokens %d..%d)", k, start, start + n - 1);
             return 0;
         }
@@ -1270,6 +1312,8 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
         if (!emb)
         {
             free(toks);
+            free(avgvec);
+            free(f32tmp);
             RP_THROW(ctx, "no embedding returned (chunk %d)", k);
             return 0;
         }
@@ -1284,13 +1328,12 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
         if (pack == PACK16)
         {
             uint16_t *out = (uint16_t *)duk_push_fixed_buffer(ctx, (duk_size_t)(2 * vec_dim));
-            float v[vec_dim];
             for (int i = 0; i < vec_dim; ++i)
             {
-                v[i] = emb[i] * inv;
-                avgvec[i] += v[i];
+                f32tmp[i] = emb[i] * inv;
+                avgvec[i] += f32tmp[i];
             }
-            rpvec_f32_to_f16(v, out, vec_dim);
+            rpvec_f32_to_f16(f32tmp, out, vec_dim);
         }
         else if (pack == PACK32)
         {
@@ -1321,6 +1364,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     {
         free(toks);
         free(avgvec); // not needed - same as existing sole vec
+        free(f32tmp);
         // [ ..., object, array ]
         duk_dup(ctx, -1);
         // [ ..., object, array, arraydup ]
@@ -1382,6 +1426,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
 
     free(toks);
     free(avgvec);
+    free(f32tmp);
 
     return 1; // -> [ ArrayBuffer(fp16), ArrayBuffer(fp16), ... ]
 }
@@ -1909,12 +1954,18 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     int vec_dim = llama_model_n_embd(lmodel);
 
     if (vec_dim <= 0)
+    {
+        lgen_model_release(lmodel);
         RP_THROW(ctx, "rampart-llama-cpp:init - Internal error getting vector dimensions");
+    }
 
     lctx = new_embed_context(ctx, lmodel, &cp);
 
     if (!lctx)
+    {
+        lgen_model_release(lmodel);
         RP_THROW(ctx, "rampart-llama-cpp:init - Failed to init llama from model");
+    }
 
     duk_push_pointer(ctx, lmodel);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("model"));
@@ -1953,7 +2004,7 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     duk_push_c_function(ctx, emb_free, 0);
     duk_put_prop_string(ctx, -2, "destroy");
 
-    duk_push_c_function(ctx, emb_free, 1);
+    duk_push_c_function(ctx, emb_free_, 1); /* finalizer: object arrives as the argument */
     duk_set_finalizer(ctx, -2);
 
     return 1;
@@ -2046,6 +2097,9 @@ float rerank_one(duk_context *ctx, struct llama_context *lctx, struct llama_mode
     // Build input string
     char *input = build_rerank_input(toks, query, text);
 
+    if (!input)
+        RP_THROW(ctx, "rerank - out of memory building input");
+
     // Tokenize the input
     int n_tokens = 0;
     int n_ubatch = llama_n_ubatch(lctx);
@@ -2062,6 +2116,7 @@ float rerank_one(duk_context *ctx, struct llama_context *lctx, struct llama_mode
     // sanity: must be a rerank model
     if (llama_pooling_type(lctx) != LLAMA_POOLING_TYPE_RANK) {
         // not a reranker; this would return a full embedding vector
+        free(tokens);
         return 0.0f;
     }
 
@@ -2170,6 +2225,9 @@ static duk_ret_t rerank_text(duk_context *ctx)
         duk_pop(ctx);
         lctx = llama_init_from_model(lmodel, *cp_buf);
 
+        if (!lctx)
+            RP_THROW(ctx, "rerank - failed to create llama context on this thread");
+
         // model refcount for this copy's own context (released in emb_free)
         lgen_model_addref(lmodel);
 
@@ -2274,7 +2332,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
 
     if (!lmodel)
-        RP_THROW(ctx, "rampart-llama-cpp:initRerank - Could not load ggml file '%s': %s", model, strerror(errno));
+        RP_THROW(ctx, "rampart-llama-cpp:initRerank - Could not load ggml file '%s': %s", model, lerr[0] ? lerr : strerror(errno));
 
     // If user didn't specify nctx or ubatch, set both to model's max
     if (cp.n_ctx <= 0)
@@ -2307,7 +2365,9 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 
     if (!lctx)
     {
-        llama_model_free(lmodel);
+        // the model came from the refcounted cache: release our ref, never
+        // llama_model_free it directly (the cache still holds the pointer)
+        lgen_model_release(lmodel);
         RP_THROW(ctx, "rampart-llama-cpp:initRerank - Failed to init llama context from model");
     }
 
@@ -2350,7 +2410,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     duk_push_c_function(ctx, emb_free, 0);
     duk_put_prop_string(ctx, -2, "destroy");
 
-    duk_push_c_function(ctx, emb_free, 1);
+    duk_push_c_function(ctx, emb_free_, 1); /* finalizer: object arrives as the argument */
     duk_set_finalizer(ctx, -2);
 
     return 1;
@@ -2378,8 +2438,9 @@ static void llamacpp_logger(enum ggml_log_level level, const char *text, void *u
 
     size_t text_len = strlen(text);
 
-    // Check if adding new text would exceed maximum
-    if (cap->len + text_len > MAX_LOG_BUFFER)
+    // Check if adding new text would exceed maximum (cap->len > 0 implies
+    // cap->buf is allocated; skip the trim on a fresh/reset buffer)
+    if (cap->len && cap->len + text_len > MAX_LOG_BUFFER)
     {
         // Cut buffer in half, keep second half, prepend overflow warning
         static const char *warn = "WARN: log overflow\n";
@@ -2444,6 +2505,9 @@ static duk_ret_t resetlog(duk_context *ctx)
     duk_push_this(ctx);
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("caplog"));
     struct llog_cap *caplog = duk_get_pointer(ctx, -1);
+
+    if (!caplog)
+        RP_THROW(ctx, "Error getting log");
 
     pthread_mutex_lock(&caplog->mutex);
     free(caplog->buf);

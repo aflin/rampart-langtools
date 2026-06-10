@@ -38,8 +38,12 @@ static duk_ret_t detok_from_pieces(duk_context *ctx, duk_idx_t arridx)
 
     for (; i < n; i++)
     {
+        duk_size_t plen = 0;
         duk_get_prop_index(ctx, arridx, (duk_uarridx_t)i);
-        mlen += (size_t)duk_get_length(ctx, -1);
+        /* byte length, not duk_get_length's character length: multibyte UTF-8
+           pieces are longer in bytes and would overflow the output buffer */
+        REQUIRE_LSTRING(ctx, -1, &plen, "sentencepiece.decode - array[%lu] is not a string", i);
+        mlen += (size_t)plen;
         duk_pop(ctx);
     }
 
@@ -91,6 +95,7 @@ duk_ret_t detok_from_piecestring(duk_context *ctx, duk_idx_t stridx)
     const char *end;
     char *out = NULL;
     REMALLOC(out, mlen + 1);
+    out[0] = '\0'; /* strcat/strncat below append to this */
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
@@ -172,6 +177,10 @@ static duk_ret_t sp_encode(duk_context *ctx)
             duk_put_prop_index(ctx, -2, (duk_uarridx_t)i);
         }
     }
+    else if (!n_pieces)
+    {
+        duk_push_string(ctx, "");
+    }
     else
     {
         char *s, *str = NULL;
@@ -190,8 +199,39 @@ static duk_ret_t sp_encode(duk_context *ctx)
         }
         *(-1 + s + pos) = '\0';
         duk_push_string(ctx, str);
+        free(str);
     }
+    spm_free_pieces(pieces, n_pieces);
     return 1;
+}
+
+/* free the processor.  As a finalizer the object is the argument at the top of
+   the stack.  Copies of the object on other threads share the pointer, so only
+   the copy on the thread+process that created it frees (same ownership
+   convention as the llamacpp handles). */
+static duk_ret_t sp_free_(duk_context *ctx)
+{
+    int othr = -1, opid = -1;
+
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("spOriginThr")))
+        othr = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("spOriginPid")))
+        opid = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+
+    if (othr != get_thread_num() || opid != (int)getpid())
+        return 0;
+
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("spmProcessor"));
+    spm_processor_t *sp = duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    if (sp)
+        spm_free(sp);
+    duk_push_pointer(ctx, NULL);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("spmProcessor"));
+    return 0;
 }
 
 static duk_ret_t sp_init(duk_context *ctx)
@@ -214,8 +254,14 @@ static duk_ret_t sp_init(duk_context *ctx)
 
     duk_push_pointer(ctx, sp);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("spmProcessor"));
+    duk_push_int(ctx, get_thread_num());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("spOriginThr"));
+    duk_push_int(ctx, (int)getpid());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("spOriginPid"));
     duk_push_c_function(ctx, sp_encode, 2);
     duk_put_prop_string(ctx, -2, "encode");
+    duk_push_c_function(ctx, sp_free_, 1);
+    duk_set_finalizer(ctx, -2);
     return 1;
 }
 

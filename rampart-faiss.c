@@ -78,7 +78,8 @@ static idx_t _add_one(FaissIndex *idx, idx_t id, float *v, size_t sz, const char
     if(id < 0 )
     {
         rc = faiss_Index_add(idx, 1, v);
-        id = faiss_Index_ntotal(idx);
+        /* sequential ids are 0-based: the vector just added is ntotal-1 */
+        id = faiss_Index_ntotal(idx) - 1;
     }
     else
         rc = faiss_Index_add_with_ids(idx, 1, v, &id);
@@ -89,7 +90,7 @@ static idx_t _add_one(FaissIndex *idx, idx_t id, float *v, size_t sz, const char
         {
             *err = faiss_get_last_error();
             if (!*err)
-                *err = "faiss_Index_add_with_ids failed";
+                *err = "faiss_Index_add failed";
         }
         return -1;
     }
@@ -118,10 +119,10 @@ static duk_ret_t add_fp32(duk_context *ctx)
         unsigned long long val = strtoull(str, &endptr, 10);
 
         if (errno == ERANGE) {
-            RP_THROW(ctx, "addFp16 - First argument is out of range for a 64 bit number");
+            RP_THROW(ctx, "addFp32 - First argument is out of range for a 64 bit number");
         }
-        if (*endptr != '\0') {
-            RP_THROW(ctx, "addFp16 - First argument (id) must be a Number or String representation of a 64 bit value");
+        if (endptr == str || *endptr != '\0') {
+            RP_THROW(ctx, "addFp32 - First argument (id) must be a Number or String representation of a 64 bit value");
         }
 
         id = (idx_t) val;
@@ -130,7 +131,7 @@ static duk_ret_t add_fp32(duk_context *ctx)
     else
     {
         // idx_t is int64_t, but let's do it right:
-        double d = REQUIRE_NUMBER(ctx, 0, "addFp16 requires an integer (id|-1) as its first argument");
+        double d = REQUIRE_NUMBER(ctx, 0, "addFp32 requires an integer (id|-1) as its first argument");
         id = (idx_t) d;
     }
 
@@ -187,7 +188,7 @@ static duk_ret_t add_fp16(duk_context *ctx)
         if (errno == ERANGE) {
             RP_THROW(ctx, "addFp16 - First argument is out of range for a 64 bit number");
         }
-        if (*endptr != '\0') {
+        if (endptr == str || *endptr != '\0') {
             RP_THROW(ctx, "addFp16 - First argument (id) must be a Number or String representation of a 64 bit value");
         }
 
@@ -284,12 +285,8 @@ static idx_t *faiss_search_topk_ids_params(FaissIndex *idx, const float *q, /* q
         }
         else
         {
-            if (err)
-                *err = "Failed to set nprobe";
-            return NULL;
-        }
-        if(!sp) //unnecessary?
-        {
+            free(D);
+            free(I);
             if (err)
                 *err = "Failed to set nprobe";
             return NULL;
@@ -419,9 +416,9 @@ static duk_ret_t do_search_fp32(duk_context *ctx)
     duk_pop_2(ctx);
 
     if (sz / 4 != dim)
-        RP_THROW(ctx, "searchFp32 - buffer is %lu long, should be %lu (2 * %lu dimensions)", sz, dim * 2, dim);
+        RP_THROW(ctx, "searchFp32 - buffer is %lu long, should be %lu (4 * %lu dimensions)", sz, dim * 4, dim);
 
-    do_search_(ctx, v, dim, 1);
+    do_search_(ctx, v, dim, 0);
 
     return 1;
 }
@@ -451,6 +448,8 @@ static duk_ret_t save_index(duk_context *ctx)
             rc = faiss_write_index_fname(idx, fname);
             faiss_Index_free(idx);
         }
+        else if (rc == 0) // no error reported but no cpu index produced
+            rc = 1;
     }
     else
 #endif
@@ -591,7 +590,8 @@ int close_and_unlink(FILE *fh, const char *path, const char **err)
 static duk_ret_t dotrain(duk_context *ctx)
 {
     duk_size_t dim;
-    int nrows, fd;
+    idx_t nrows;
+    int fd;
     FILE *fh;
 
     //const char *filename;
@@ -640,7 +640,7 @@ static duk_ret_t dotrain(duk_context *ctx)
     {
         RP_THROW(ctx, "faiss.train - Training file is not expected size ( size(%lu) % (dim * 4) != 0)", st.st_size);
     }
-    nrows = (int)(st.st_size / ((off_t)dim * sizeof(float)));
+    nrows = (idx_t)(st.st_size / ((off_t)dim * sizeof(float)));
 
     if (!nrows)
     {
@@ -675,7 +675,34 @@ static duk_ret_t dotrain(duk_context *ctx)
     return 0;
 }
 
-// TODO: close filehandle in a finalizer
+/* close the trainer's filehandle.  As a finalizer the trainer object is the
+   argument at the top of the stack.  Copies on other threads share the FILE*,
+   so only the copy on the thread+process that created it closes.  The training
+   file itself is intentionally NOT unlinked (it may be reused/reloaded). */
+static duk_ret_t trainer_free_(duk_context *ctx)
+{
+    int othr = -1, opid = -1;
+
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("trainerOriginThr")))
+        othr = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("trainerOriginPid")))
+        opid = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+
+    if (othr != get_thread_num() || opid != (int)getpid())
+        return 0;
+
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("fh"));
+    FILE *fh = duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    if (fh)
+        fclose(fh);
+    duk_push_pointer(ctx, NULL);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("fh"));
+    return 0;
+}
 
 static duk_ret_t new_trainer(duk_context *ctx)
 {
@@ -695,8 +722,12 @@ static duk_ret_t new_trainer(duk_context *ctx)
         if(!fh)
             RP_THROW(ctx, "faiss.trainer - can't open path '%s': %s", trainpath, strerror(errno));
         if(stat(trainpath, &st) != 0)
+        {
+            fclose(fh);
             RP_THROW(ctx, "faiss.trainer - error: stat path '%s': %s", trainpath, strerror(errno));
+        }
         strncpy(trainfile, trainpath, PATH_MAX-1);
+        trainfile[PATH_MAX-1] = '\0';
     }
     else
     {
@@ -709,7 +740,8 @@ static duk_ret_t new_trainer(duk_context *ctx)
 
             /* build filename: <trainpath>/faisstrainingdata.<counter>.<pid> */
             pid_t pid = getpid();
-            int n = snprintf(trainfile, PATH_MAX, "%.*s/faisstrainingdata.%d.%ld", (int)tlen, trainpath, counter++, (long)pid);
+            int ctr = __atomic_fetch_add(&counter, 1, __ATOMIC_SEQ_CST);
+            int n = snprintf(trainfile, PATH_MAX, "%.*s/faisstrainingdata.%d.%ld", (int)tlen, trainpath, ctr, (long)pid);
 
             if (n < 0 || n >= PATH_MAX)
                 RP_THROW(ctx, "faiss.trainer - training file path too long");
@@ -717,6 +749,7 @@ static duk_ret_t new_trainer(duk_context *ctx)
         else if (S_ISREG(st.st_mode))
         {
             strncpy(trainfile, trainpath, PATH_MAX-1);
+            trainfile[PATH_MAX-1] = '\0';
         }
         else
             RP_THROW(ctx, "faiss.trainer - path '%s' is something not a file or directory", trainpath);
@@ -733,6 +766,11 @@ static duk_ret_t new_trainer(duk_context *ctx)
 
     duk_get_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissIdx"));
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissIdx"));
+
+    /* hold a reference to the index object so it (and the FaissIndex its
+       finalizer frees) cannot be collected while this trainer is alive */
+    duk_dup(ctx, -2);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("idxref"));
 
     duk_get_prop_string(ctx, -2, "settings");
     if(S_ISREG(st.st_mode))
@@ -756,6 +794,14 @@ static duk_ret_t new_trainer(duk_context *ctx)
 
     duk_push_pointer(ctx, fh);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("fh"));
+
+    duk_push_int(ctx, get_thread_num());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("trainerOriginThr"));
+    duk_push_int(ctx, (int)getpid());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("trainerOriginPid"));
+
+    duk_push_c_function(ctx, trainer_free_, 1);
+    duk_set_finalizer(ctx, -2);
 
     duk_push_c_function(ctx, add_trainvec_fp16, 1);
     duk_put_prop_string(ctx, -2, "addTrainingfp16");
@@ -781,6 +827,7 @@ static void load_index(const char *fname, FaissIndex **out, const char **err, in
     {
         *out = NULL;
         *err = "Could not access file";
+        return;
     }
     if (faiss_read_index_fname(fname, flags, out) != 0)
     {
@@ -883,6 +930,34 @@ static duk_ret_t enable_gpu(duk_context *ctx)
 
 FaissIndexType faiss_detect_type(FaissIndex* idx, int* pqM, int* pqBits, int *mapped);
 
+/* free the index.  As a finalizer the index object is the argument at the top
+   of the stack.  Copies of the object on other threads share the raw pointer,
+   so only the copy on the thread+process that created the index frees it. */
+static duk_ret_t faiss_idx_free_(duk_context *ctx)
+{
+    int othr = -1, opid = -1;
+
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("thread_num")))
+        othr = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("pid_num")))
+        opid = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+
+    if (othr != get_thread_num() || opid != (int)getpid())
+        return 0;
+
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("faissIdx"));
+    FaissIndex *idx = duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+
+    if (idx)
+        faiss_Index_free(idx);
+    duk_push_pointer(ctx, NULL);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("faissIdx"));
+    return 0;
+}
+
 static void push_faiss_obj(duk_context *ctx, FaissIndex *idx, FaissMetricType mtype, int dim, double rows)
 {
     const char *mtype_str = "innerProduct", *type_str="Unknown";
@@ -976,6 +1051,12 @@ static void push_faiss_obj(duk_context *ctx, FaissIndex *idx, FaissMetricType mt
 
     duk_push_int(ctx, get_thread_num());
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("thread_num"));
+
+    duk_push_int(ctx, (int)getpid());
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("pid_num"));
+
+    duk_push_c_function(ctx, faiss_idx_free_, 1);
+    duk_set_finalizer(ctx, -2);
 
     //duk_push_int(ctx, (int)type);
     //duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("type"));
