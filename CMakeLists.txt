@@ -226,6 +226,16 @@ if(LT_ENABLE_GPU)
     target_compile_definitions(rampart-langtools PRIVATE LT_ENABLE_GPU=1)
     target_compile_definitions(rampart-llamacpp PRIVATE LT_ENABLE_GPU=1)
     target_compile_definitions(rampart-faiss PRIVATE LT_ENABLE_GPU=1)
+
+    # A manual CUDA toolkit install (e.g. /usr/local/cuda on Debian 11, drivers
+    # from NVIDIA rather than apt) doesn't put cublas_v2.h and friends on the
+    # default include path the way apt's CUDA does on Debian 12. Add it when
+    # present; harmless where the toolkit headers are already on the search path.
+    if(EXISTS "/usr/local/cuda/include")
+        target_include_directories(rampart-langtools PRIVATE /usr/local/cuda/include)
+        target_include_directories(rampart-llamacpp PRIVATE /usr/local/cuda/include)
+        target_include_directories(rampart-faiss PRIVATE /usr/local/cuda/include)
+    endif()
 endif()
 
 
@@ -357,6 +367,7 @@ else()
     /usr/lib/i386-linux-gnu
     /usr/lib/aarch64-linux-gnu
     /usr/lib/arm-linux-gnueabihf
+    /usr/local/cuda/lib64
   )
 
   if(LT_ENABLE_GPU)

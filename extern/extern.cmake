@@ -60,6 +60,26 @@ endif()
 # Without this a fresh configure fails: "target llama-common does not exist".
 set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
 
+# Pin CUDA architectures BEFORE adding llama.cpp (and faiss below). ggml and faiss
+# each fall back to their own default arch list when CMAKE_CUDA_ARCHITECTURES is
+# unset, and ggml's default leaves common GPUs (V100/T4/A100) as PTX-only. Setting
+# it here forces native SASS for the GPUs we deploy to, with a PTX fallback for
+# newer parts. Must precede the add_subdirectory calls so both subprojects honor it.
+#
+# Built with the CUDA 11.8 toolkit (/usr/local/cuda-11.8) on purpose: a CUDA 11.x
+# binary runs on any driver R450+ (incl. Debian 11's stock apt 470 driver) via
+# minor-version compatibility, and needs only the .so.11 runtime libs that stock apt
+# already ships (Debian 12 nvidia-cuda-toolkit = 11.8). That keeps deployment to a
+# plain `apt` -- which is what rampart-sql's embed() needs -- with NVIDIA's CUDA
+# download as the fallback. Do NOT add sm_90: CUDA 11.8 cannot compile the Hopper
+# PDL device intrinsics (see ggml-cuda/common.cuh), which breaks the build.
+#   70-89      : native SASS -> V100, T4, A100, RTX30/A10/A40, RTX40/L4/L40 (incl. 3070 Ti)
+#   89-virtual : PTX JIT     -> Hopper / Blackwell / future GPUs (still run, on newer drivers)
+# Floor is Volta (7.0); add 60;61 for Pascal (GTX 10-series) reach, or drop 70;75 to shrink.
+if(LT_ENABLE_GPU AND NOT APPLE)
+  set(CMAKE_CUDA_ARCHITECTURES "70-real;75-real;80-real;86-real;89-real;89-virtual" CACHE STRING "")
+endif()
+
 add_subdirectory(${EXTERN_DIR}/llama.cpp ${CMAKE_BINARY_DIR}/extern/llama.cpp EXCLUDE_FROM_ALL)
 
 # SENTENCEPIECE
@@ -94,10 +114,8 @@ else()
   set(FAISS_ENABLE_GPU ${LT_ENABLE_GPU} CACHE BOOL "FAISS_ENABLE_GPU" FORCE)
   set(env{FAISS_ENABLE_GPU} ${LT_ENABLE_GPU})
 
-  if(LT_ENABLE_GPU)
-    set(CMAKE_CUDA_ARCHITECTURES "80;86;89" CACHE STRING "")
-    set(env{CMAKE_CUDA_ARCHITECTURES} "80;86;89")
-  endif()
+  # CMAKE_CUDA_ARCHITECTURES is pinned once, earlier (before the llama.cpp/faiss
+  # subdirectories), so faiss inherits the same arch list. Don't set it again here.
 
 endif()
 
