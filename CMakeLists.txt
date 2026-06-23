@@ -370,9 +370,19 @@ else()
     /usr/local/cuda/lib64
   )
 
+  # OpenMP runtime by compiler: gcc emits GOMP_* -> GNU libgomp (already in the
+  # bundle's lib/, shared with rampart-sql's FAISS); clang emits __kmpc_* ->
+  # LLVM libomp (libomp5.so -- system on FreeBSD).  macOS uses static libomp.a
+  # in its own branch above; this only affects the Linux/FreeBSD path.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(LT_OMP_LIB libgomp.so.1)
+  else()
+    set(LT_OMP_LIB libomp5.so)
+  endif()
+
   if(LT_ENABLE_GPU)
     set(LIB_FILES
-      libomp5.so
+      ${LT_OMP_LIB}
       libopenblas.a
       libgfortran.so.5
       libcudart.so
@@ -381,7 +391,7 @@ else()
     )
   else()
     set(LIB_FILES
-      libomp5.so
+      ${LT_OMP_LIB}
       libopenblas.a
       libgfortran.so.5
     )

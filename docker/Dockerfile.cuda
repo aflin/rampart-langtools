@@ -1,0 +1,26 @@
+# rampart-langtools CUDA layer -- a base oven PLUS one CUDA toolkit version.
+# Parameterized so build.sh can build the cu11 / cu12 / cu13 images from this one
+# file:
+#   cu11 -> BASE=rampart-langtools-oven (manylinux2014/glibc 2.17), CUDA 11.8, rhel7 repo
+#   cu12 -> BASE=rampart-langtools-oven-2_28 (glibc 2.28),          CUDA 12.8, rhel8 repo
+#   cu13 -> BASE=rampart-langtools-oven-2_28 (glibc 2.28),          CUDA 13.0, rhel8 repo
+#
+# CUDA_ARCHDIR is x86_64 or sbsa (ARM server) -- build.sh derives it from the
+# host arch.  The toolkit installs to /usr/local/cuda-<ver> with a /usr/local/cuda
+# symlink; the link-time libcuda stub (lib64/stubs/libcuda.so) is symlinked into
+# lib64 so the langtools CMake finds it (at runtime libcuda.so.1 comes from the
+# target's NVIDIA driver, never bundled).
+ARG BASE_IMAGE=rampart-langtools-oven
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+ARG CUDA_DISTRO=rhel7
+ARG CUDA_ARCHDIR=x86_64
+ARG CUDA_PKGS="cuda-toolkit-11-8 cuda-driver-devel-11-8"
+
+RUN curl -fsSL -o /etc/yum.repos.d/cuda.repo \
+      "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_DISTRO}/${CUDA_ARCHDIR}/cuda-${CUDA_DISTRO}.repo" && \
+    yum install -y --nogpgcheck ${CUDA_PKGS} && \
+    yum clean all && \
+    ( ln -sf stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so 2>/dev/null || true )

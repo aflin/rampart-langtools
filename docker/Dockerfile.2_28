@@ -1,0 +1,42 @@
+# rampart-langtools CUDA base oven (glibc 2.28) -- the base for the cu12/cu13
+# variants.  CUDA 12+ requires glibc >= 2.28, so it CANNOT live on the
+# manylinux2014 (glibc 2.17) base that cpu/cu11 use; this is manylinux_2_28
+# (AlmaLinux 8, glibc 2.28).  Every CUDA-12/13 machine is modern, so a 2.28
+# floor on those modules is a non-issue.
+#
+# gcc-toolset is PRE-INSTALLED in manylinux_2_28 (recent gcc, C++17 + AVX-512),
+# so unlike the 2014 base there's no devtoolset to add -- just OpenBLAS from
+# source.  enable_toolchain (build-in-oven.sh) sources the gcc-toolset here, the
+# devtoolset on the 2014 base.
+#
+# This is only the BASE; the CUDA toolkit is layered on top by Dockerfile.cuda.
+# Target arch: x86_64 (default) or aarch64.  build.sh passes --build-arg ARCH.
+ARG ARCH=x86_64
+FROM quay.io/pypa/manylinux_2_28_${ARCH}
+
+SHELL ["/bin/bash", "-c"]
+
+# The image's default gcc-toolset is 14 -- too new for old OpenBLAS (gcc 14
+# turns implicit-function-declaration into an ERROR) and for CUDA 12.8 (wants
+# gcc <= 13).  Install pinned toolsets: gcc-toolset-11 for cu11 (CUDA 11.8,
+# gcc<=11) and gcc-toolset-13 for cu12/cu13 + the OpenBLAS build below.
+# build-in-oven.sh selects the right one per variant.
+RUN yum install -y \
+        gcc-toolset-11-gcc gcc-toolset-11-gcc-c++ gcc-toolset-11-gcc-gfortran \
+        gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ gcc-toolset-13-gcc-gfortran \
+    && yum clean all
+
+# OpenBLAS from source (static + shared) -- full FAISS links the static
+# libopenblas.a; DYNAMIC_ARCH=1 gives runtime CPU dispatch (x86 and aarch64).
+ARG OPENBLAS_VERSION=0.3.21
+RUN source /opt/rh/gcc-toolset-13/enable && \
+    curl -fsSL -o /tmp/openblas.tar.gz \
+      "https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/OpenBLAS-${OPENBLAS_VERSION}.tar.gz" && \
+    tar -xzf /tmp/openblas.tar.gz -C /tmp && \
+    make -C "/tmp/OpenBLAS-${OPENBLAS_VERSION}" -j"$(nproc)" \
+        DYNAMIC_ARCH=1 NUM_THREADS=64 USE_OPENMP=1 && \
+    make -C "/tmp/OpenBLAS-${OPENBLAS_VERSION}" PREFIX=/usr/local install && \
+    rm -rf /tmp/OpenBLAS-* /tmp/openblas.tar.gz && \
+    echo /usr/local/lib > /etc/ld.so.conf.d/openblas.conf && ldconfig
+
+# No ENTRYPOINT: docker/build.sh invokes docker/build-in-oven.sh explicitly.
