@@ -15,23 +15,24 @@ set -euo pipefail
 
 STAGE="${1:-build}"
 VARIANT="${2:-}"
-# cpu_2_28 = the cpu flavor on the 2_28 base: distinct build dir + tier, but the
-# SAME _cpu module name (tier is implied by the install prefix, like cu12/cu13).
-case "$VARIANT" in cpu_2_28) SUFFIX=cpu ;; *) SUFFIX=$VARIANT ;; esac
+# cpu_2_28 / cu11_2_28 = the cpu / cu11 flavor on the 2_28 base: distinct build dir +
+# tier, but the SAME _cpu / _cu11 module name (tier is implied by the install prefix,
+# like cu12/cu13).
+case "$VARIANT" in cpu_2_28) SUFFIX=cpu ;; cu11_2_28) SUFFIX=cu11 ;; *) SUFFIX=$VARIANT ;; esac
 LT=/lt
 BUILD="$LT/build/oven${VARIANT:+-$VARIANT}"
 PREFIX="${RAMPART_PREFIX:-/usr/local/rampart-ml}"
 
 export PATH="$PREFIX/bin:$PATH"   # so the CMake's `rampart -c process.installPath` resolves
 
-is_cuda() { case "$VARIANT" in cu11|cu12|cu13) return 0 ;; *) return 1 ;; esac; }
+is_cuda() { case "$VARIANT" in cu11|cu11_2_28|cu12|cu13) return 0 ;; *) return 1 ;; esac; }
 
 # CMAKE_CUDA_ARCHITECTURES per variant + host arch (real SASS + a top -virtual PTX
 # for forward-compat).  Edit freely -- these are sensible defaults, not gospel.
 cuda_arches() {
     m=$(uname -m)
     case "$VARIANT" in
-      cu11) [ "$m" = aarch64 ] && echo "72-real;87-real;87-virtual" \
+      cu11|cu11_2_28) [ "$m" = aarch64 ] && echo "72-real;87-real;87-virtual" \
                                 || echo "70-real;75-real;80-real;86-real;89-real;89-virtual" ;;
       cu12) [ "$m" = aarch64 ] && echo "87-real;90-real;100-real;120-real;120-virtual" \
                                 || echo "80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ;;
@@ -58,7 +59,7 @@ case "$STAGE" in
     # Pin host gcc: cu11->11 (CUDA 11.8 ceiling); cu12/cu13/cpu_2_28->13 (proven on
     # the 2_28 oven; its default gcc-14 is unneeded here); else newest available.
     case "$VARIANT" in
-      cu11)               enable_toolchain 11 ;;
+      cu11|cu11_2_28)     enable_toolchain 11 ;;
       cu12|cu13|cpu_2_28) enable_toolchain 13 ;;
       *)                  enable_toolchain ;;
     esac
@@ -122,7 +123,9 @@ case "$STAGE" in
         # the module .so (stripped) + llamacpp-test.js.
         echo "==> grafting ${VARIANT:-default} build (configured for '${cfg:-?}') into $PREFIX"
         mkdir -p "$PREFIX/modules"
-        sos=$(ls "$BUILD"/rampart-*"${SUFFIX:+_$SUFFIX}".so "$BUILD"/rampart-sentencepiece.so 2>/dev/null | sort -u) || true
+        # exclude rampart-langtools*.so -- it's built but intentionally not shipped
+        # (covered by llamacpp/faiss/sentencepiece), matching the CMake install rules.
+        sos=$(ls "$BUILD"/rampart-*"${SUFFIX:+_$SUFFIX}".so "$BUILD"/rampart-sentencepiece.so 2>/dev/null | grep -v '/rampart-langtools' | sort -u) || true
         for so in $sos; do
             install -m 755 "$so" "$PREFIX/modules/"
             strip -S "$PREFIX/modules/$(basename "$so")" 2>/dev/null || true

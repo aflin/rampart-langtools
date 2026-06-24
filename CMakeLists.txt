@@ -626,9 +626,9 @@ target_link_libraries(rampart-sentencepiece PRIVATE
     ${SP_LIBS}
 )
 
-install(TARGETS rampart-langtools
-  DESTINATION "${RP_PATH}/modules"
-)
+# rampart-langtools.so is the legacy combined module; its functionality is now
+# covered by the separate rampart-llamacpp / rampart-faiss / rampart-sentencepiece
+# modules, so it is built but intentionally NOT installed (skip its TARGETS + strip).
 install(TARGETS rampart-llamacpp
   DESTINATION "${RP_PATH}/modules"
 )
@@ -639,7 +639,6 @@ install(TARGETS rampart-sentencepiece
   DESTINATION "${RP_PATH}/modules"
 )
 
-install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-langtools${LT_NAME_SUFFIX}.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llamacpp${LT_NAME_SUFFIX}.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-faiss${LT_NAME_SUFFIX}.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-sentencepiece.so\")")

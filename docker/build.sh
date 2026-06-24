@@ -11,6 +11,7 @@
 #   variant:   (none)/cpu  CPU only    glibc 2.17  -> rampart-2_17
 #              cpu_2_28     CPU only    glibc 2.28  -> rampart-2_28  (newer SIMD)
 #              cu11         CUDA 11.8   glibc 2.17 (x86) / 2.28 (ARM)
+#              cu11_2_28    CUDA 11.8   glibc 2.28  -> rampart-2_28  (cu11 for the 2_28 tree)
 #              cu12         CUDA 12.8   glibc 2.28  -> rampart-2_28
 #              cu13         CUDA 13.0   glibc 2.28  -> rampart-2_28
 #   CUDA 12+ needs glibc >= 2.28, so cu11 is the only CUDA build for the 2.17 tier.
@@ -51,6 +52,12 @@ cuda_cfg() {
               else
                   CU_BASE=$BASE2_28; CU_BASEDF=Dockerfile.2_28; CU_DISTRO=rhel8   # arm: no rhel7/sbsa repo -> rhel8
               fi
+              CU_PKGS="cuda-toolkit-11-8 cuda-driver-devel-11-8" ;;
+        cu11_2_28)  # CUDA 11.8 on the 2_28 base -- the cu11 module for the rampart-2_28
+                    # tree.  The 2014-oven cu11 expects the gcc-11 lib chain and bad_allocs
+                    # against rampart-2_28's gcc-13 libgfortran/libgomp; this one links the
+                    # 2_28 oven's OpenBLAS and matches.  (On ARM plain cu11 is already 2_28.)
+              CU_BASE=$BASE2_28; CU_BASEDF=Dockerfile.2_28; CU_DISTRO=rhel8
               CU_PKGS="cuda-toolkit-11-8 cuda-driver-devel-11-8" ;;
         cu12) CU_BASE=$BASE2_28; CU_BASEDF=Dockerfile.2_28; CU_DISTRO=rhel8
               CU_PKGS="cuda-toolkit-12-8 cuda-driver-devel-12-8" ;;
@@ -180,6 +187,6 @@ case "$STAGE" in
     ""|-h|--help)
         sed -n '2,/^set -e/{/^set -e/!p}' "$0" | sed 's/^# \{0,1\}//' ;;
     *)
-        echo "unknown stage: $STAGE  (build | install | save-image | shell) [cpu|cpu_2_28|cu11|cu12|cu13]" >&2
+        echo "unknown stage: $STAGE  (build | install | save-image | shell) [cpu|cpu_2_28|cu11|cu11_2_28|cu12|cu13]" >&2
         exit 1 ;;
 esac
