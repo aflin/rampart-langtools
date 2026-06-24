@@ -16,39 +16,51 @@ if(NOT APPLE)
   set(GGML_CUDA ${LT_ENABLE_GPU} CACHE BOOL "" FORCE)
 endif()
 
-# Work around a clang/ggml interaction that breaks the build under
-# virtualization (e.g. macOS guests in UTM).  ggml's -mcpu=native build probes
-# CPU features by *running* a test binary; when the host advertises i8mm but the
-# guest cannot execute it (sysctl hw.optional.arm.FEAT_I8MM == 0), ggml appends
-# +noi8mm to -mcpu=native.  clang still defines __ARM_FEATURE_MATMUL_INT8 for
-# that flag combination, so the i8mm code path compiles in while codegen has the
-# feature disabled, failing with "always_inline 'vmmlaq_s32' requires target
-# feature 'i8mm'".  On bare metal (i8mm present) -mcpu=native is fine, so only
-# disable GGML_NATIVE and pin an explicit -march when i8mm is actually missing.
-if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
-  execute_process(
-    COMMAND sysctl -n hw.optional.arm.FEAT_I8MM
-    OUTPUT_VARIABLE LT_FEAT_I8MM
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-  )
-  if(NOT LT_FEAT_I8MM STREQUAL "1")
-    # Build an arch string from the features this CPU really exposes.
-    set(LT_ARM_ARCH "armv8.2-a")
-    execute_process(COMMAND sysctl -n hw.optional.arm.FEAT_DotProd
-      OUTPUT_VARIABLE LT_FEAT_DOTPROD OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    execute_process(COMMAND sysctl -n hw.optional.arm.FEAT_FP16
-      OUTPUT_VARIABLE LT_FEAT_FP16 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    if(LT_FEAT_DOTPROD STREQUAL "1")
-      string(APPEND LT_ARM_ARCH "+dotprod")
-    endif()
-    if(LT_FEAT_FP16 STREQUAL "1")
-      string(APPEND LT_ARM_ARCH "+fp16")
+# Portable ARM build.  ggml defaults to GGML_NATIVE=ON -> -mcpu=native, which bakes
+# the BUILD host's CPU features into the .so.  Run that on a different/older ARM
+# (e.g. a Raspberry Pi) and it SIGILLs ("Illegal instruction") the instant a kernel
+# uses a missing feature.  So on ARM, pin an explicit -march instead of native.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  if(NOT APPLE)
+    # Linux ARM (the manylinux ovens): ALWAYS turn off native and pin a portable -march.
+    # docker/build.sh sets LT_ARM_ARCH=armv8-a (baseline) for BOTH glibc tiers -- the
+    # tier (2_17/2_28) is a glibc floor, NOT an ISA floor, so ggml must run on any armv8
+    # (Pi 3/4 .. Orin) like the rest of the build.  Default to armv8-a if unset.  (Modern
+    # ARM SIMD = ggml runtime dispatch, a separate axis -- not a raised -march here.)
+    if(DEFINED ENV{LT_ARM_ARCH} AND NOT "$ENV{LT_ARM_ARCH}" STREQUAL "")
+      set(LT_ARM_ARCH "$ENV{LT_ARM_ARCH}")
+    else()
+      set(LT_ARM_ARCH "armv8-a")
     endif()
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
     set(GGML_CPU_ARM_ARCH "${LT_ARM_ARCH}" CACHE STRING "" FORCE)
-    message(STATUS "rampart-langtools: i8mm not available (virtualized CPU?); "
-      "disabling GGML_NATIVE, using -march=${LT_ARM_ARCH}")
+    message(STATUS "rampart-langtools: portable ARM build -- GGML_NATIVE off, -march=${LT_ARM_ARCH}")
+  else()
+    # macOS: bare-metal -mcpu=native is optimal (gets i8mm), but a virtualized guest
+    # (e.g. macOS in UTM) advertises i8mm it can't execute; ggml then emits +noi8mm
+    # while clang still defines __ARM_FEATURE_MATMUL_INT8 -> "vmmlaq_s32 requires
+    # target feature 'i8mm'".  So only override (off + explicit -march) when i8mm is
+    # actually missing; otherwise leave GGML_NATIVE on.
+    execute_process(
+      COMMAND sysctl -n hw.optional.arm.FEAT_I8MM
+      OUTPUT_VARIABLE LT_FEAT_I8MM OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(NOT LT_FEAT_I8MM STREQUAL "1")
+      set(LT_ARM_ARCH "armv8.2-a")
+      execute_process(COMMAND sysctl -n hw.optional.arm.FEAT_DotProd
+        OUTPUT_VARIABLE LT_FEAT_DOTPROD OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+      execute_process(COMMAND sysctl -n hw.optional.arm.FEAT_FP16
+        OUTPUT_VARIABLE LT_FEAT_FP16 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+      if(LT_FEAT_DOTPROD STREQUAL "1")
+        string(APPEND LT_ARM_ARCH "+dotprod")
+      endif()
+      if(LT_FEAT_FP16 STREQUAL "1")
+        string(APPEND LT_ARM_ARCH "+fp16")
+      endif()
+      set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+      set(GGML_CPU_ARM_ARCH "${LT_ARM_ARCH}" CACHE STRING "" FORCE)
+      message(STATUS "rampart-langtools: i8mm not available (virtualized CPU?); "
+        "disabling GGML_NATIVE, using -march=${LT_ARM_ARCH}")
+    endif()
   endif()
 endif()
 

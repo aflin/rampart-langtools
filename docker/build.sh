@@ -138,10 +138,18 @@ do_build() {
     variant="$1"
     ensure_image "$variant"
     require_rampart
-    echo "==> [langtools build:${variant:-default}] compiling into build/oven${variant:+-$variant}/…"
+    # ggml defaults to -mcpu=native, baking the build host's CPU into the .so -> SIGILL
+    # on a different/older ARM.  Pin the PORTABLE baseline armv8-a for BOTH tiers: the
+    # glibc tier (2_17/2_28) is a glibc floor, NOT an ISA floor -- the rest of the build
+    # is armv8-a and runs on any armv8 (incl. a Pi 4 / Cortex-A72, armv8.0), so ggml must
+    # match.  (Modern-ARM SIMD = ggml runtime dispatch, a separate axis; raising -march
+    # here SIGILLs on older chips.)  x86 left empty (ggml handles x86 separately).
+    arm_arch=""
+    [ "$ARCH" = aarch64 ] && arm_arch="armv8-a"
+    echo "==> [langtools build:${variant:-default}] compiling into build/oven${variant:+-$variant}/${arm_arch:+ (-march=$arm_arch)}…"
     docker run --rm \
         --user "$(id -u):$(id -g)" \
-        -e HOME=/tmp -e RAMPART_PREFIX="$PREFIX_DIR" \
+        -e HOME=/tmp -e RAMPART_PREFIX="$PREFIX_DIR" -e LT_ARM_ARCH="$arm_arch" \
         -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
         -v "$REPO:/lt" -w /lt \
         -v "$PREFIX_DIR":"$PREFIX_DIR":ro \
