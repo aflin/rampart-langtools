@@ -238,6 +238,25 @@ if(LT_ENABLE_GPU)
     endif()
 endif()
 
+# rampart-llamacpp GPU-arch guard: bake the native-SASS sm list (the -real archs from
+# CMAKE_CUDA_ARCHITECTURES, e.g. "87 90 100 120") into LT_CUDA_SM_LIST.  At init,
+# rampart-llamacpp.c compares the device's compute capability against it and throws a
+# clean error on a mismatch instead of letting ggml abort mid-graph (e.g. a cu12 module
+# on a Blackwell GB10 / sm_121).  -virtual (PTX) archs are excluded on purpose: ggml's
+# family-specific 'a' kernels don't JIT across SM versions.  No CUDA language / kernel
+# needed -- it's a host-side cudaGetDeviceProperties check.
+if(LT_ENABLE_GPU AND NOT APPLE)
+    set(_lt_sm "")
+    foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if(_a MATCHES "^([0-9]+)(-real)?$")          # numeric / -real archs; skip -virtual
+            string(APPEND _lt_sm "${CMAKE_MATCH_1} ")
+        endif()
+    endforeach()
+    string(STRIP "${_lt_sm}" _lt_sm)
+    message(STATUS "rampart-langtools: GPU-arch guard sm list = ${_lt_sm}")
+    target_compile_definitions(rampart-llamacpp PRIVATE "LT_CUDA_SM_LIST=\"${_lt_sm}\"")
+endif()
+
 
 if(APPLE)
 
@@ -421,16 +440,35 @@ else()
     ${FOUND_LIBS}
   )
 
+  # -Bsymbolic-functions: bind each module's *own* function references to its
+  # own definitions at link time, so they are not interposed at load time.
+  # rampart dlopen's modules with RTLD_GLOBAL (see duktape/core/module.c), which
+  # publishes every module's symbols into the global namespace.  These modules
+  # statically link a lot of C++ (faiss/llama.cpp/ggml) and therefore carry their
+  # own inline/template copies of libstdc++ internals (std::string, std::regex,
+  # locale facets, ...).  Without -Bsymbolic-functions those calls resolve to
+  # whatever copy was loaded first -- the rampart executable's, built against an
+  # OLDER libstdc++ (max GLIBCXX_3.4.18) than a native gcc build of these modules
+  # (GLIBCXX_3.4.30).  The ABI-incompatible mix corrupts std::string state and
+  # faiss::index_factory()'s std::regex segfaults at the first openFactory()
+  # (with ASLR on; it hides under gdb).  Binding locally keeps each module on one
+  # consistent libstdc++.  Linux-only: macOS uses a two-level namespace, so its
+  # symbols already bind to the library they were linked against.  (The shipped
+  # "oven"/manylinux builds happen to match rampart's old toolchain and so dodge
+  # this, but a plain native `cmake .. && make` must not.)
   target_link_options(rampart-langtools PRIVATE
     "-Wl,-soname,@rpath/rampart-langtools${LT_NAME_SUFFIX}.so"
+    "-Wl,-Bsymbolic-functions"
   )
 
   target_link_options(rampart-llamacpp PRIVATE
     "-Wl,-soname,@rpath/rampart-llamacpp${LT_NAME_SUFFIX}.so"
+    "-Wl,-Bsymbolic-functions"
   )
 
   target_link_options(rampart-faiss PRIVATE
     "-Wl,-soname,@rpath/rampart-faiss${LT_NAME_SUFFIX}.so"
+    "-Wl,-Bsymbolic-functions"
   )
 
   ## OLD LINUX
@@ -643,8 +681,10 @@ install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llam
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-faiss${LT_NAME_SUFFIX}.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-sentencepiece.so\")")
 
-# test script, runnable from the install tree (e.g. rampart ${RP_PATH}/test/llamacpp-test.js)
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/llamacpp-test.js"
+# test scripts, runnable from the install tree (e.g. rampart ${RP_PATH}/test/llamacpp-test.js)
+install(FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/llamacpp-test.js"
+  "${CMAKE_CURRENT_SOURCE_DIR}/faiss-test.js"
   DESTINATION "${RP_PATH}/test"
 )
 

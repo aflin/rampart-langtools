@@ -51,6 +51,65 @@
         return 0;
     }
 
+    /* sm numbers this build has NATIVE SASS for, baked from CMAKE_CUDA_ARCHITECTURES
+     * at configure (e.g. "87 90 100 120").  ggml rewrites Blackwell/Hopper archs to
+     * family-specific 'a' kernels that do NOT JIT across SM versions, so a native-SASS
+     * match for the device's EXACT compute capability is the reliable test.  PTX
+     * (-virtual) archs are intentionally excluded: ggml's 'a' PTX won't JIT onto a
+     * newer SM (a cu12 module on a GB10/sm_121 proved it). */
+#ifndef LT_CUDA_SM_LIST
+#define LT_CUDA_SM_LIST ""
+#endif
+    /* 1 if this build can run on `device` (native SASS for its cc), or if there's no
+     * CUDA GPU / the list wasn't baked (don't block).  Else fills `eb` and returns 0
+     * so init fails cleanly instead of ggml's CUDA_CHECK aborting mid-graph. */
+    static int lt_gpu_kernel_supported(int device, char *eb, size_t n)
+    {
+        int dbg = getenv("RAMPART_LT_GPU_DEBUG") != NULL;
+        if (LT_CUDA_SM_LIST[0] == '\0') {            /* arch list not baked -> don't block */
+            if (dbg) fprintf(stderr, "[lt-gpu] sm list empty -> allow\n");
+            return 1;
+        }
+        /* Query CUDA DIRECTLY, not has_gpu_backend(): ggml registers its GPU backend
+         * lazily (at model load / first compute), so at init time has_gpu_backend() is
+         * still 0 even on a working GPU -- which is exactly why this check never fired.
+         * cudaGetDeviceCount initializes and queries the runtime right now. */
+        int ndev = 0;
+        cudaError_t ce = cudaGetDeviceCount(&ndev);
+        if (dbg) fprintf(stderr, "[lt-gpu] cudaGetDeviceCount=%d (err=%d) sm='%s'\n",
+                         ndev, (int)ce, LT_CUDA_SM_LIST);
+        if (ce != cudaSuccess || ndev <= 0) return 1;  /* no CUDA GPU -> CPU build runs, allow */
+        if (device < 0 || device >= ndev) device = 0;
+        struct cudaDeviceProp p;
+        cudaError_t ge = cudaGetDeviceProperties(&p, device);
+        if (ge != cudaSuccess) {                     /* can't tell -> allow */
+            if (dbg) fprintf(stderr, "[lt-gpu] cudaGetDeviceProperties(%d) err=%d -> allow\n", device, (int)ge);
+            return 1;
+        }
+        int cc = p.major * 10 + p.minor;             /* 12.1 -> 121, 8.7 -> 87 */
+        if (dbg) fprintf(stderr, "[lt-gpu] device %d '%s' cc %d.%d (%d) vs sm '%s'\n",
+                         device, p.name, p.major, p.minor, cc, LT_CUDA_SM_LIST);
+        for (const char *s = LT_CUDA_SM_LIST; *s; ) {
+            char *end;
+            long v = strtol(s, &end, 10);
+            if (end == s) { s++; continue; }         /* skip spaces/separators */
+            if ((int)v == cc) {                      /* native SASS for this device */
+                if (dbg) fprintf(stderr, "[lt-gpu] cc %d supported -> allow\n", cc);
+                return 1;
+            }
+            s = end;
+        }
+        if (dbg) fprintf(stderr, "[lt-gpu] cc %d NOT in sm list -> REFUSE\n", cc);
+        if (eb && n)
+            snprintf(eb, n,
+                "GPU '%s' (compute %d.%d / sm_%d) has no compatible kernels in this "
+                "rampart-llamacpp build (CUDA %d; built for sm: %s). Use the cuNN module "
+                "matching your GPU (e.g. cu13 for Blackwell GB10 / sm_121), or rebuild "
+                "adding sm_%d.",
+                p.name, p.major, p.minor, cc, CUDART_VERSION / 1000, LT_CUDA_SM_LIST, cc);
+        return 0;
+    }
+
 #else
 
     #undef HAVE_CUDA
@@ -761,6 +820,17 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
         if (duk_get_prop_string(ctx, o, "mmproj")) { duk_pop(ctx); free(chat_template); RP_THROW(ctx, "initGen: vision (mmproj) generation is not supported"); }
         duk_pop(ctx);
     }
+
+#if HAVE_CUDA
+    {  /* GPU build: always check; lt_gpu_kernel_supported self-gates on has_gpu_backend */
+        char eb[512];
+        int dev = mp.main_gpu >= 0 ? mp.main_gpu : 0;
+        if (!lt_gpu_kernel_supported(dev, eb, sizeof eb)) {
+            free(chat_template);
+            RP_THROW(ctx, "initGen: %s", eb);
+        }
+    }
+#endif
 
     lgen_engine_params p;
     memset(&p, 0, sizeof p);
@@ -1572,6 +1642,17 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
     pthread_mutex_init(&h->mtx, NULL);
 
     struct llama_model_params mp = llama_model_default_params();
+#if HAVE_CUDA
+    {  /* GPU build: always check; lt_gpu_kernel_supported self-gates on has_gpu_backend */
+        int dev = mp.main_gpu >= 0 ? mp.main_gpu : 0;
+        if (!lt_gpu_kernel_supported(dev, err, errlen)) {
+            free(h->path);
+            pthread_mutex_destroy(&h->mtx);
+            free(h);
+            return NULL;
+        }
+    }
+#endif
     h->lmodel = llama_model_load_from_file(path, mp);
     if (!h->lmodel) {
         if (err && errlen)
@@ -1941,6 +2022,15 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     cp.n_ubatch        = 0;
     cp.n_threads_batch = -1;
     if (obj_idx > -1) { parse_common_opts(ctx, obj_idx, &mp, &cp); parse_embed_opts(ctx, obj_idx, &cp); }
+
+#if HAVE_CUDA
+    {  /* GPU build: always check; lt_gpu_kernel_supported self-gates on has_gpu_backend */
+        char eb[512];
+        int dev = mp.main_gpu >= 0 ? mp.main_gpu : 0;
+        if (!lt_gpu_kernel_supported(dev, eb, sizeof eb))
+            RP_THROW(ctx, "initEmbed: %s", eb);
+    }
+#endif
 
     // Shared, refcounted load (one llama_model per path even across thread-copies;
     // one refcount per context, released in emb_free). Fixes the cross-copy
@@ -2326,6 +2416,15 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     cp.n_ubatch        = 0;
     cp.n_threads_batch = -1;
     if (obj_idx >= 0) { parse_common_opts(ctx, obj_idx, &mp, &cp); parse_embed_opts(ctx, obj_idx, &cp); }
+
+#if HAVE_CUDA
+    {  /* GPU build: always check; lt_gpu_kernel_supported self-gates on has_gpu_backend */
+        char eb[512];
+        int dev = mp.main_gpu >= 0 ? mp.main_gpu : 0;
+        if (!lt_gpu_kernel_supported(dev, eb, sizeof eb))
+            RP_THROW(ctx, "initRerank: %s", eb);
+    }
+#endif
 
     // shared, refcounted load (one refcount per context; released in emb_free)
     char lerr[256] = {0};

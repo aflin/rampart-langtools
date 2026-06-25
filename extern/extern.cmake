@@ -126,6 +126,37 @@ else()
   set(FAISS_ENABLE_GPU ${LT_ENABLE_GPU} CACHE BOOL "FAISS_ENABLE_GPU" FORCE)
   set(env{FAISS_ENABLE_GPU} ${LT_ENABLE_GPU})
 
+  # Pin faiss's OpenMP runtime to the one the compiler actually emits calls for.
+  # faiss is the only subproject that uses OpenMP (ggml has GGML_OPENMP OFF), and
+  # it runs its own find_package(OpenMP REQUIRED), exporting OpenMP::OpenMP_CXX as
+  # an INTERFACE dependency we inherit when libfaiss.a is linked into
+  # rampart-faiss.so.  gcc emits GOMP_* calls that MUST resolve against GNU
+  # libgomp; if FindOpenMP instead latches onto a system LLVM libomp (its dev
+  # symlink can sort ahead of libgomp in the default search), the module ends up
+  # with BOTH runtimes -- and the mismatched libomp corrupts libstdc++ locale/TLS
+  # state so std::regex inside faiss::index_factory() segfaults at the very first
+  # openFactory() (only with ASLR on, which is why it hides under gdb).
+  #
+  # Force the GNU runtime under gcc by pre-seeding the variables FindOpenMP keys
+  # off (already set => it skips its own probing); leave clang alone, since its
+  # __kmpc_* calls correctly want libomp.  Mirrors LT_OMP_LIB in the top-level
+  # CMakeLists, and the OpenMP pin the APPLE branch above does for libomp.a.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    find_library(LT_LIBGOMP NAMES gomp libgomp.so.1)
+    if(LT_LIBGOMP)
+      set(OpenMP_C_FLAGS       "-fopenmp"      CACHE STRING "" FORCE)
+      set(OpenMP_CXX_FLAGS     "-fopenmp"      CACHE STRING "" FORCE)
+      set(OpenMP_C_LIB_NAMES   "gomp;pthread"  CACHE STRING "" FORCE)
+      set(OpenMP_CXX_LIB_NAMES "gomp;pthread"  CACHE STRING "" FORCE)
+      set(OpenMP_gomp_LIBRARY  "${LT_LIBGOMP}" CACHE STRING "" FORCE)
+      find_library(LT_LIBPTHREAD NAMES pthread)
+      if(LT_LIBPTHREAD)
+        set(OpenMP_pthread_LIBRARY "${LT_LIBPTHREAD}" CACHE STRING "" FORCE)
+      endif()
+      message(STATUS "rampart-langtools: pinned faiss OpenMP to GNU libgomp (${LT_LIBGOMP})")
+    endif()
+  endif()
+
   # CMAKE_CUDA_ARCHITECTURES is pinned once, earlier (before the llama.cpp/faiss
   # subdirectories), so faiss inherits the same arch list. Don't set it again here.
 

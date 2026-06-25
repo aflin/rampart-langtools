@@ -36,7 +36,10 @@ cuda_arches() {
                                 || echo "70-real;75-real;80-real;86-real;89-real;89-virtual" ;;
       cu12) [ "$m" = aarch64 ] && echo "87-real;90-real;100-real;120-real;120-virtual" \
                                 || echo "80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ;;
-      cu13) [ "$m" = aarch64 ] && echo "87-real;90-real;100-real;110-real;120-real;120-virtual" \
+      # NB: cu12 stops at sm_120 -- GB10/sm_121 needs the family-specific sm_121a
+      # kernel ggml forces, and CUDA 12.8's nvcc has compute_121 but NOT compute_121a
+      # (only CUDA 13 does).  So GB10/Spark uses the cu13 module, not cu12.
+      cu13) [ "$m" = aarch64 ] && echo "87-real;90-real;100-real;110-real;120-real;121-real;121-virtual" \
                                 || echo "75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ;;
     esac
 }
