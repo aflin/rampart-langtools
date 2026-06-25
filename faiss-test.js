@@ -47,7 +47,7 @@ function testFeature(name, test) {
         try { test = test(); }
         catch(e) { error = e; test = false; }
     }
-    printf("testing faiss - %3d - %-52s - ", testnum, name);
+    printf("testing faiss - %3d - %-69s - ", testnum, name);
     fflush(stdout);
     if (test) {
         printf("passed\n");
@@ -99,8 +99,9 @@ var TMP      = (process.env.TMPDIR || '/tmp');
 var PID      = process.getpid();
 var TRAINF   = TMP + '/faiss-test-train.' + PID;
 var SAVEF    = TMP + '/faiss-test-index.' + PID + '.faiss';
+var SAVEIVF  = TMP + '/faiss-test-ivf.'   + PID + '.faiss';
 function cleanup() {
-    [TRAINF, SAVEF].forEach(function(f) { try { rmFile(f); } catch(e) {} });
+    [TRAINF, SAVEF, SAVEIVF].forEach(function(f) { try { rmFile(f); } catch(e) {} });
 }
 
 /* ================================================================
@@ -208,29 +209,57 @@ function runIVFTest() {
         var res = idx.searchFp32(f32(DATA[PROBE]), 5, nlist);   // nprobe=nlist => exact
         return res.length && res[0].id === PROBE;
     });
+    return idx;
 }
 
 /* ================================================================
    save / openIndexFromFile round-trip
    ================================================================ */
-function runPersistTest(flatIdx) {
+function runPersistTest(flatIdx, ivfIdx) {
     printf("\n--- save / openIndexFromFile round-trip ---\n");
-    if (!flatIdx) { printf("- skipped (no Flat index)\n"); return; }
+    if (flatIdx) {
+        testFeature("Flat: save() writes the index to disk", function() {
+            flatIdx.save(SAVEF);
+            var st = stat(SAVEF);
+            return st && st.size > 0;
+        });
+        testFeature("Flat: openIndexFromFile() reloads it (count preserved)", function() {
+            var re = faiss.openIndexFromFile(SAVEF);
+            return re && re.settings.count === N && re.settings.dimension === DIM;
+        });
+        testFeature("Flat: reloaded index returns the same top id", function() {
+            var re = faiss.openIndexFromFile(SAVEF);
+            var res = re.searchFp32(f32(DATA[PROBE]), 1);
+            return res.length && res[0].id === PROBE;
+        });
+    } else {
+        printf("- Flat round-trip skipped (no Flat index)\n");
+    }
 
-    testFeature("save() writes the index to disk", function() {
-        flatIdx.save(SAVEF);
-        var st = stat(SAVEF);
-        return st && st.size > 0;
-    });
-    testFeature("openIndexFromFile() reloads it (count preserved)", function() {
-        var re = faiss.openIndexFromFile(SAVEF);
-        return re && re.settings.count === N && re.settings.dimension === DIM;
-    });
-    testFeature("reloaded index returns the same top id", function() {
-        var re = faiss.openIndexFromFile(SAVEF);
-        var res = re.searchFp32(f32(DATA[PROBE]), 1);
-        return res.length && res[0].id === PROBE;
-    });
+    /* IVF round-trip — openIndexFromFile() opens with IO_FLAG_MMAP, which
+     * routes IVF invlists through OnDiskInvertedListsIOHook.  That hook
+     * is the one that hits the GCC 8 libstdc++ std::string SSO destructor
+     * miscompile on armhf (FAISS issues #1071, #2281, #2955, #3292).
+     * Without this case the bug would sit latent in rampart-faiss.so on
+     * a Buster Pi — the Flat round-trip above doesn't exercise it. */
+    if (ivfIdx) {
+        testFeature("IVF: save() writes the index to disk", function() {
+            ivfIdx.save(SAVEIVF);
+            var st = stat(SAVEIVF);
+            return st && st.size > 0;
+        });
+        testFeature("IVF: openIndexFromFile() reloads it (count preserved)", function() {
+            var re = faiss.openIndexFromFile(SAVEIVF);
+            return re && re.settings.count === N && re.settings.dimension === DIM;
+        });
+        testFeature("IVF: reloaded index returns the same top id", function() {
+            var re = faiss.openIndexFromFile(SAVEIVF);
+            var res = re.searchFp32(f32(DATA[PROBE]), 1);
+            return res.length && res[0].id === PROBE;
+        });
+    } else {
+        printf("- IVF round-trip skipped (no IVF index)\n");
+    }
 }
 
 /* ================================================================
@@ -281,9 +310,10 @@ function runGpuTest() {
    run
    ================================================================ */
 var flatIdx = runFlatTest();
+var ivfIdx  = null;
 runIDMapTest();
-runIVFTest();
-runPersistTest(flatIdx);
+ivfIdx = runIVFTest();
+runPersistTest(flatIdx, ivfIdx);
 runGpuTest();
 
 cleanup();
