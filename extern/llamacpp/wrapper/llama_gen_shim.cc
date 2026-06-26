@@ -16,6 +16,7 @@
  */
 
 #include "llama.h"
+#include "ggml-backend.h"     /* ggml_backend_dev_by_type: CPU-only context fallback */
 #include "common.h"
 #include "sampling.h"
 #include "chat.h"
@@ -510,6 +511,33 @@ static bool build_context(lgen_engine *e, char *err, size_t errlen) {
     cp.embeddings = false;          /* gen never embeds */
 
     e->ctx = llama_init_from_model(e->model, cp);
+
+    /* GPU context init can fail on a host with no usable device (e.g. Metal in a
+     * VM / headless macOS, or a GPU OOM).  Fall back to a CPU-pinned context,
+     * matching initEmbed/initRerank: drop the GPU model ref, reload pinned to the
+     * CPU device (n_gpu_layers=0 -> distinct model-cache key), and retry.  Pinning
+     * the device is required -- n_gpu_layers=0 alone still selects Metal/GPU for
+     * compute.  A host with a working GPU succeeds on the first try and skips this. */
+    if (!e->ctx) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            model_release(e->model);
+            e->model = nullptr;
+            llama_model_params cmp = p->mparams;
+            ggml_backend_dev_t devs[2] = { cpu_dev, nullptr };
+            cmp.n_gpu_layers = 0;
+            cmp.devices      = devs;
+            fprintf(stderr, "rampart-llamacpp: GPU context init failed for '%s'; retrying gen on CPU\n",
+                    p->model_path);
+            e->model = model_acquire_path(p->model_path, &cmp, err, errlen);
+            if (e->model) {
+                e->vocab   = llama_model_get_vocab(e->model);
+                e->n_vocab = llama_vocab_n_tokens(e->vocab);
+                e->ctx     = llama_init_from_model(e->model, cp);
+            }
+        }
+    }
+
     if (!e->ctx) { set_err(err, errlen, "failed to create llama context"); return false; }
 
     e->n_ctx   = llama_n_ctx(e->ctx);

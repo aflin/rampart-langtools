@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include "llama.h"
+#include "ggml-backend.h"     /* ggml_backend_dev_by_type: CPU-only context fallback */
 #include "llama_gen_shim.h"   /* C ABI for the multi-session generation engine */
 #include "rampart.h"
 
@@ -78,7 +79,19 @@
         cudaError_t ce = cudaGetDeviceCount(&ndev);
         if (dbg) fprintf(stderr, "[lt-gpu] cudaGetDeviceCount=%d (err=%d) sm='%s'\n",
                          ndev, (int)ce, LT_CUDA_SM_LIST);
-        if (ce != cudaSuccess || ndev <= 0) return 1;  /* no CUDA GPU -> CPU build runs, allow */
+        if (ce != cudaSuccess || ndev <= 0) {
+            /* No CUDA GPU: ggml registers no CUDA backend and the context is built
+             * on CPU -- it works, but silently.  Warn once (this is a GPU build, so
+             * the user expected the GPU) so the drop to CPU is visible, mirroring
+             * the Metal fallback notice. */
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "rampart-llamacpp: no usable CUDA GPU (%s) -- running on CPU\n",
+                        ce != cudaSuccess ? cudaGetErrorString(ce) : "0 devices");
+            }
+            return 1;  /* no CUDA GPU -> CPU build runs, allow */
+        }
         if (device < 0 || device >= ndev) device = 0;
         struct cudaDeviceProp p;
         cudaError_t ge = cudaGetDeviceProperties(&p, device);
@@ -952,8 +965,9 @@ static const char *BATCHGEN_SCRIPT =
 "  };\n"
 "})\n";
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
 #include <sys/utsname.h>
+#include <sys/sysctl.h>
 /* macOS major version (e.g. 12, 14, 15) from uname's Darwin release.
    Darwin K = macOS K-9: Darwin 21 = macOS 12, 23 = 14, 24 = 15.  Returns
    0 if it can't be determined; callers should treat 0 as "unknown,
@@ -969,6 +983,16 @@ static int rp_macos_major(void)
     if (darwin < 20) return 0;
     return darwin - 9;
 }
+/* true if running under a hypervisor (a VM).  kern.hv_vmm_present is 1 in a
+   guest, 0 on bare metal.  Unknown -> 0 (assume real hardware, don't gate). */
+static int rp_in_vm(void)
+{
+    int v = 0;
+    size_t sz = sizeof(v);
+    if (sysctlbyname("kern.hv_vmm_present", &v, &sz, NULL, 0) != 0)
+        return 0;
+    return v != 0;
+}
 #endif
 
 static duk_ret_t lg_init_gen_batched(duk_context *ctx)
@@ -976,19 +1000,25 @@ static duk_ret_t lg_init_gen_batched(duk_context *ctx)
     REQUIRE_STRING(ctx, 0, "initGen: first argument must be a String (path to .gguf)");
     /* opts (optional object) at index 1 */
 
-#ifdef __APPLE__
-    /* initGen on macOS uses Metal features that segfault on macOS < 15
-       (observed on macOS 12 Monterey with libllama built on macOS 15).
-       embed() and rerank() are unaffected by the affected code paths,
-       so we only gate this entry point.  rp_macos_major returns 0 if
-       it can't read uname -- in that case don't block. */
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    /* On Apple Silicon, initGen's Metal generation kernels fail to build on
+       macOS < 15 ONLY in a VM: the paravirtual Metal stack can't specialize them,
+       yielding a nil pipeline that crashes during decode.  On real Apple Silicon
+       hardware gen works fine on macOS 11+ (verified), and macOS 15+ works even in
+       a VM.  embed()/rerank() are unaffected (different Metal path).  So gate only
+       the proven-bad combination: macOS < 15 AND running under a hypervisor.
+       (x86_64 is not gated -- a no-Metal VM there falls back to CPU in
+       build_context.)  RAMPART_FORCE_GEN=1 overrides the gate entirely. */
+    if (!getenv("RAMPART_FORCE_GEN"))
     {
         int macos_ver = rp_macos_major();
-        if (macos_ver > 0 && macos_ver < 15)
+        if (macos_ver > 0 && macos_ver < 15 && rp_in_vm())
             RP_THROW(ctx,
-                "initGen: requires macOS 15 (Sequoia) or later -- "
-                "detected macOS %d.  embed() and rerank() work on this "
-                "version; only the generation pipeline is gated.",
+                "initGen: Apple Silicon macOS < 15 in a VM is unsupported -- the "
+                "paravirtual Metal stack can't build the generation kernels "
+                "(detected macOS %d in a VM).  It works on real hardware at any "
+                "version, or in a VM on macOS 15+.  embed() and rerank() are "
+                "unaffected.  Set RAMPART_FORCE_GEN=1 to override.",
                 macos_ver);
     }
 #endif
@@ -2051,9 +2081,35 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 
     lctx = new_embed_context(ctx, lmodel, &cp);
 
+    /* A GPU build (Metal on macOS, CUDA on Linux) grabs a device when a context
+     * is created.  In a VM / headless / no-GPU host that fails -- e.g. macOS Metal
+     * in a VM: "picking default device: (null) ... failed to create command queue"
+     * -- so context creation returns NULL though the model loaded.  Note that
+     * n_gpu_layers=0 is NOT enough: the context still selects the Metal device for
+     * compute.  Transparently fall back to CPU by pinning the model's device list
+     * to the CPU device, then reload + retry.  A real Intel Mac / Apple Silicon
+     * with a working Metal device succeeds on the first try and never gets here. */
     if (!lctx)
     {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         lgen_model_release(lmodel);
+        lmodel = NULL;
+        if (cpu_dev)
+        {
+            ggml_backend_dev_t devs[2] = { cpu_dev, NULL };
+            mp.n_gpu_layers = 0;       /* distinct model-cache key from the GPU load */
+            mp.devices      = devs;    /* force CPU-only: no Metal/GPU backend */
+            fprintf(stderr, "rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
+            lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
+            if (lmodel)
+                lctx = new_embed_context(ctx, lmodel, &cp);
+        }
+    }
+
+    if (!lctx)
+    {
+        if (lmodel)
+            lgen_model_release(lmodel);
         RP_THROW(ctx, "rampart-llama-cpp:init - Failed to init llama from model");
     }
 
@@ -2462,11 +2518,33 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 
     lctx = llama_init_from_model(lmodel, cp);
 
+    /* GPU context init can fail on a host with no usable device (e.g. Metal in a
+     * VM / headless macOS); fall back to a CPU-pinned context.  Pinning the model
+     * to the CPU device is required -- n_gpu_layers=0 alone still selects Metal for
+     * compute.  See the fuller note in llamacpp_init_embed. */
+    if (!lctx)
+    {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        lgen_model_release(lmodel);
+        lmodel = NULL;
+        if (cpu_dev)
+        {
+            ggml_backend_dev_t devs[2] = { cpu_dev, NULL };
+            mp.n_gpu_layers = 0;
+            mp.devices      = devs;
+            fprintf(stderr, "rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
+            lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
+            if (lmodel)
+                lctx = llama_init_from_model(lmodel, cp);
+        }
+    }
+
     if (!lctx)
     {
         // the model came from the refcounted cache: release our ref, never
         // llama_model_free it directly (the cache still holds the pointer)
-        lgen_model_release(lmodel);
+        if (lmodel)
+            lgen_model_release(lmodel);
         RP_THROW(ctx, "rampart-llama-cpp:initRerank - Failed to init llama context from model");
     }
 
