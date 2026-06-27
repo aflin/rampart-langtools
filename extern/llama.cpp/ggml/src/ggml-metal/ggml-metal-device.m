@@ -1706,6 +1706,18 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
 
+        if (buf_src == nil) {
+            // rampart-langtools: macOS 11 returns nil from newBufferWithBytesNoCopy
+            // for non-page-aligned host memory (macOS 12+ tolerates it).  This is the
+            // non-unified-memory upload path (Intel Macs; Apple Silicon short-circuits
+            // via is_shared above), so embed()/rerank() crash here on an Intel macOS 11
+            // Mac.  Fall back to the copying variant (no alignment requirement) -- the
+            // same API ggml_metal_set_tensor_async already uses.
+            buf_src = [buf->dev->mtl_device newBufferWithBytes:data_ptr
+                                                        length:size
+                                                       options:MTLResourceStorageModeShared];
+        }
+
         GGML_ASSERT(buf_src);
 
         // dst
@@ -1762,6 +1774,34 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
                                                                length:size
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
+
+        if (buf_dst == nil) {
+            // rampart-langtools: macOS 11 returns nil from newBufferWithBytesNoCopy
+            // for non-page-aligned host memory (macOS 12+ tolerates it).  Non-unified
+            // memory read-back path (Intel Macs; Apple Silicon short-circuits via
+            // is_shared above).  Fall back to a Metal-owned staging buffer: blit into
+            // it, wait, then memcpy back to `data`.  Lets embed()/rerank() read their
+            // result on an Intel macOS 11 Mac.
+            id<MTLBuffer> buf_tmp = [buf->dev->mtl_device newBufferWithLength:size
+                                                                     options:MTLResourceStorageModeShared];
+            GGML_ASSERT(buf_tmp);
+
+            id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+            [encoder copyFromBuffer:bid_src.metal
+                       sourceOffset:bid_src.offs
+                           toBuffer:buf_tmp
+                  destinationOffset:0
+                               size:size];
+
+            [encoder endEncoding];
+            [cmd_buf commit];
+            [cmd_buf waitUntilCompleted];
+
+            memcpy(data, [buf_tmp contents], size);
+            return;
+        }
 
         GGML_ASSERT(buf_dst);
 
