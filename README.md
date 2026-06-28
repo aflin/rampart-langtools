@@ -11,11 +11,10 @@ cmake -DLT_ENABLE_GPU=1 ..
 make install
 ```
 
-### macOS requirement
+### macOS support
 
-On Apple Silicon, **macOS 15 (Sequoia) or newer is recommended** and is the only
-version verified to work, due to a Metal regression in older macOS. macOS 14 is
-untested; verified to fail on macOS 11–13.
+Supported on **macOS 11 (Big Sur) and newer**, on both Apple Silicon and Intel.
+embed, rerank, and text generation are all verified on macOS 11+.
 
 ## rampart-llamacpp use:
 
