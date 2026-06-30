@@ -1709,7 +1709,10 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
      * (without duktape opts — we don't expose tuning here). */
     h->cp = llama_context_default_params();
     h->cp.embeddings     = true;
-    h->cp.pooling_type   = LLAMA_POOLING_TYPE_MEAN;
+    /* Honor the model's OWN declared pooling (mean/cls/last/rank from GGUF
+       metadata); UNSPECIFIED lets llama.cpp resolve it. Falls back to MEAN below
+       if the model declares none. Mirrors llamacpp_init_embed's default. */
+    h->cp.pooling_type   = LLAMA_POOLING_TYPE_UNSPECIFIED;
     h->cp.n_threads      = 1;
     h->cp.n_threads_batch = -1;
     int n_train = llama_model_n_ctx_train(h->lmodel);
@@ -1729,6 +1732,17 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
         pthread_mutex_destroy(&h->mtx);
         free(h);
         return NULL;
+    }
+
+    /* Model declares no pooling (resolves to NONE) -> fall back to MEAN so
+       embeddings stay pooled (historical default). h->cp keeps the final pooling
+       so per-thread context rebuilds match. */
+    if (h->cp.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED &&
+        llama_pooling_type(h->lctx) == LLAMA_POOLING_TYPE_NONE)
+    {
+        h->cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        struct llama_context *l2 = llama_init_from_model(h->lmodel, h->cp);
+        if (l2) { llama_free(h->lctx); h->lctx = l2; }
     }
 
     h->refcount = 1;
