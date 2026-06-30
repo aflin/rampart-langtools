@@ -2046,7 +2046,11 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     struct llama_model_params   mp = llama_model_default_params();
     struct llama_context_params cp = llama_context_default_params();
     cp.embeddings      = true;
-    cp.pooling_type    = LLAMA_POOLING_TYPE_MEAN;
+    /* Default: honor the model's OWN declared pooling (mean/cls/last/rank baked
+       into the GGUF metadata). UNSPECIFIED tells llama.cpp to use the model's
+       pooling_type; if the model declares none we fall back to MEAN after the
+       context is built (below). An explicit { pooling } option overrides this. */
+    cp.pooling_type    = LLAMA_POOLING_TYPE_UNSPECIFIED;
     cp.n_threads       = 1;
     cp.n_ctx           = 0;
     cp.n_ubatch        = 0;
@@ -2111,6 +2115,19 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
         if (lmodel)
             lgen_model_release(lmodel);
         RP_THROW(ctx, "rampart-llama-cpp:init - Failed to init llama from model");
+    }
+
+    /* Caller passed no { pooling } (cp stayed UNSPECIFIED) and the model declares
+       no pooling (resolves to NONE) -> fall back to MEAN so embeddings stay pooled
+       (the historical default). Rebuild re-stashes cp_buf with the final pooling so
+       per-thread context rebuilds match. Models that DO declare a pooling keep
+       UNSPECIFIED here, which each thread resolves to the model's type consistently. */
+    if (cp.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED &&
+        llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_NONE)
+    {
+        cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        struct llama_context *l2 = new_embed_context(ctx, lmodel, &cp);
+        if (l2) { llama_free(lctx); lctx = l2; }
     }
 
     duk_push_pointer(ctx, lmodel);
