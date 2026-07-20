@@ -1,0 +1,976 @@
+# Pipeline trigger settings
+trigger:
+  branches:
+    include:
+    - main
+    - rel-*
+  paths:
+    exclude:
+    - docs/**
+    - README.md
+    - tutorials/**
+pr:
+  branches:
+    include:
+    - main
+    - rel-*
+  paths:
+    exclude:
+    - docs/**
+    - README.md
+    - tutorials/**
+
+stages:
+
+- stage: LinuxBuilds
+  dependsOn: []
+  variables:
+    torch.packages: 'torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1'
+  jobs:
+
+  #######
+  # Linux
+  #######
+  - job: Linux
+    pool:
+      name: 'onnxruntime-extensions-Linux-CPU'
+
+    strategy:
+      matrix:
+        py312-1192:
+          python.version: '3.12'
+          ort.version: '1.19.2'
+        py311-1181:
+          python.version: '3.11'
+          ort.version: '1.18.1'
+
+    steps:
+    - template: templates/download-file.yml
+      parameters:
+        url: "https://github.com/microsoft/onnxruntime/releases/download/v$(ort.version)/onnxruntime-linux-x64-$(ort.version).tgz"
+        outputFilePath: "$(Build.SourcesDirectory)/onnxruntime-linux-x64-$(ort.version).tgz"
+
+    - task: ExtractFiles@1
+      inputs:
+        archiveFilePatterns: '**/*.tgz'
+        destinationFolder: '$(Build.SourcesDirectory)'
+        cleanDestinationFolder: false
+        overwriteExistingFiles: true
+      displayName: Unpack ONNXRuntime package.
+
+    - script: |
+        CPU_NUMBER=8 sh ./build.sh -DOCOS_ENABLE_CTEST=ON -DOCOS_ONNXRUNTIME_VERSION="$(ort.version)" -DONNXRUNTIME_PKG_DIR=$(Build.SourcesDirectory)/onnxruntime-linux-x64-$(ort.version)
+      displayName: build the customop library with onnxruntime
+
+    - script: |
+        cd out/Linux/RelWithDebInfo
+        ctest -C RelWithDebInfo --output-on-failure
+      displayName: Run C++ native tests
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(python.version)'
+        addToPath: true
+
+    - script: |
+        python -m pip install --upgrade pip
+        python -m pip install --upgrade setuptools
+        python -m pip install onnxruntime==$(ort.version)
+      displayName: Install requirements
+
+    - script: |
+        CPU_NUMBER=8 python -m pip install .
+      displayName: Build the library and tests
+
+    - script: python -m pip install $(torch.packages)
+      displayName: Install pytorch
+
+    - script: |
+        python -m pip install -r requirements-dev.txt
+      displayName: Install requirements-dev.txt
+
+    - script: |
+        cd test && python -m pytest . --verbose
+      displayName: Run python test
+      condition: and(succeeded(), eq(variables['python.version'], '3.11'))
+
+    - script: |
+        cd test && python test_performance.py --iterations 10 --warmup 3 || true
+      displayName: Run performance benchmark (best-effort)
+      condition: and(succeededOrFailed(), eq(variables['python.version'], '3.11'))
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: 'test/benchmark_results.json'
+        ArtifactName: 'benchmark_results_$(Agent.OS)'
+        publishLocation: 'Container'
+      displayName: Publish benchmark results
+      continueOnError: true
+      condition: and(succeededOrFailed(), eq(variables['python.version'], '3.11'))
+  - job: LinuxPyDbg
+    pool:
+      name: 'onnxruntime-extensions-Linux-CPU'
+
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+        addToPath: true
+        architecture: 'x64'
+
+    - script: |
+        python -m pip install --upgrade setuptools pip
+        python -m pip install 'numpy < 2.0.0'
+        export OCOS_NO_OPENCV=1
+        export OCOS_SCB_DEBUG=1
+        CPU_NUMBER=8 python -m pip install -e .
+      displayName: Build the python library in editable mode
+
+    - script: |
+        python -m pip install $(torch.packages) --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install -r requirements-dev.txt
+      displayName: Install requirements-dev.txt
+
+    - script: |
+        cd test
+        python -m pytest --ignore=test_cv2.py --ignore=test_tools_add_pre_post_processing_to_model.py . --verbose
+      displayName: Run python test
+      env:
+        OCOS_SCB_DEBUG: '1'
+
+  #####################################
+  # Linux prevent exception propagation
+  #####################################
+  - job: Linux_Prevent_Exception_Propagation
+    pool:
+      name: 'onnxruntime-extensions-Linux-CPU'
+
+    steps:
+    # Simulate an embedded build as part of ORT with exceptions disabled by manually setting CMAKE_CXX_FLAGS and
+    # using _OCOS_PREVENT_EXCEPTION_PROPAGATION_OVERRIDE. The build should re-enable exceptions within ort-ext
+    # but prevent them from propagating. Unit tests are run to validate this.
+    - script: '
+        ./build_lib.sh --enable_cxx_tests --onnxruntime_version 1.14.0 --config RelWithDebInfo
+        --cmake_extra_defines
+          _OCOS_PREVENT_EXCEPTION_PROPAGATION_OVERRIDE=ON OCOS_ENABLE_CPP_EXCEPTIONS=OFF
+          CMAKE_CXX_FLAGS="-fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables"
+        '
+
+      displayName: Build ort-ext with exception propagation disabled
+
+    # As an extra validation check CMakeCache.txt as well
+    - script: |
+        grep "^_OCOS_PREVENT_EXCEPTION_PROPAGATION.*ON$" build/Linux/RelWithDebInfo/CMakeCache.txt
+        if [ $? -ne 0 ]; then
+          echo "Exception propogation was not enabled correctly."
+          exit 1
+        fi
+
+
+  ##############################
+  # Linux for selected_ops build
+  ##############################
+  - job: Linux_SelectedOpsBuild
+    pool:
+      name: 'onnxruntime-extensions-Linux-CPU'
+
+    steps:
+    # compiled as only one operator selected.
+    - bash: |
+        set -e -x -u
+        echo 'set (OCOS_ENABLE_BERT_TOKENIZER ON CACHE BOOL "" FORCE)' > cmake/_selectedoplist.cmake
+        ./build.sh -DOCOS_ENABLE_CPP_EXCEPTIONS=OFF -DOCOS_ENABLE_SELECTED_OPLIST=ON -DOCOS_ENABLE_CTEST=OFF
+      displayName: Build ort-extensions with only one operator was selected
+
+  ##############################
+  # Linux for pre-processing API
+  ##############################
+  - job: Linux_PPApiBuild
+    pool:
+      name: 'onnxruntime-extensions-Linux-CPU'
+
+    steps:
+    # compiled as only one operator selected.
+    - bash: |
+        set -e -x -u
+        ./build.sh -DOCOS_ENABLE_C_API=ON
+        cd out/Linux/RelWithDebInfo
+        ctest -C RelWithDebInfo --output-on-failure
+      displayName: Build ort-extensions with API enabled and run tests
+
+    - bash: |
+        set -e -x -u
+        ./build.sh -DOCOS_BUILD_PRESET=token_api_only -DOCOS_BUILD_SHARED_LIB=OFF
+        cd out/Linux/RelWithDebInfo
+        ctest -C RelWithDebInfo --output-on-failure
+      displayName: Build ort-extensions with tokenizer API only enabled and run tests
+
+
+- stage: MacOSBuilds
+  dependsOn: []
+  variables:
+    torch.packages: 'torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2'
+  jobs:
+
+  ###########
+  # macOS C++
+  ###########
+  - job: MacOSX
+    pool:
+      vmImage: 'macOS-14'
+
+    strategy:
+      matrix:
+        ort-1181:
+          ort.version: '1.18.1'
+          ort.dirname: 'onnxruntime-osx-x86_64-$(ort.version)'
+        ort-1171:
+          ort.version: '1.17.1'
+          ort.dirname: 'onnxruntime-osx-x86_64-$(ort.version)'
+        ort-1163:
+          ort.version: '1.16.3'
+          ort.dirname: 'onnxruntime-osx-x86_64-$(ort.version)'
+        ort-1151:
+          ort.version: '1.15.1'
+          ort.dirname: 'onnxruntime-osx-x86_64-$(ort.version)'
+
+    steps:
+    - template: templates/use-xcode-version.yml
+
+    # needed for onnxruntime
+    - script: brew install libomp
+      displayName: 'Install omp'
+
+    - template: templates/download-file.yml
+      parameters:
+        url: "https://github.com/microsoft/onnxruntime/releases/download/v$(ort.version)/onnxruntime-osx-x86_64-$(ort.version).tgz"
+        outputFilePath: "$(Build.SourcesDirectory)/onnxruntime-osx-x86_64-$(ort.version).tgz"
+
+    - task: ExtractFiles@1
+      inputs:
+        archiveFilePatterns: '**/*.tgz'
+        destinationFolder: '$(Build.SourcesDirectory)'
+        cleanDestinationFolder: false
+        overwriteExistingFiles: true
+      displayName: Unpack ONNXRuntime package.
+
+    - script: |
+        sh ./build.sh -DOCOS_ENABLE_CTEST=ON -DONNXRUNTIME_PKG_DIR=$(Build.SourcesDirectory)/$(ort.dirname)
+      displayName: build the customop library with onnxruntime
+
+    - script: |
+        cd out/Darwin/RelWithDebInfo
+        ctest -C RelWithDebInfo --output-on-failure
+      displayName: Run C++ native tests
+
+  ##############################
+  # MacOS for pre-processing API
+  ##############################
+  - job: MacOS_PPApiBuild
+    pool:
+      vmImage: 'macOS-14'
+
+    steps:
+    # compiled as only one operator selected.
+    - bash: |
+        set -e -x -u
+        ./build.sh -DOCOS_ENABLE_C_API=ON
+        cd out/Darwin/RelWithDebInfo
+        ctest -C RelWithDebInfo --output-on-failure
+      displayName: Build ort-extensions with API enabled and run tests
+
+  #############
+  # macOS Python
+  #############
+  - job: MacOSPython
+    pool:
+      vmImage: 'macOS-14'
+
+    strategy:
+      matrix:
+        py312-1192:
+          python.version: '3.12'
+          ort.version: '1.19.2'
+        py311-1181:
+          python.version: '3.11'
+          ort.version: '1.18.1'
+
+    steps:
+    - template: templates/use-xcode-version.yml
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(python.version)'
+        disableDownloadFromRegistry: true
+        addToPath: true
+
+    - script: |
+        python -m pip install --upgrade pip
+        python -m pip install --upgrade setuptools
+        python -m pip install --upgrade wheel
+        python -m pip install 'numpy < 2.0.0'
+        python -m pip install onnxruntime==$(ort.version)
+      displayName: Install requirements
+
+    - script: |
+        python -c "import onnxruntime;print(onnxruntime.__version__)"
+      displayName: Check installation
+
+    - script: |
+        python -m pip install -e .
+      displayName: Build and install the wheel
+
+    - script: python -m pip install -r requirements-dev.txt
+      displayName: Install requirements-dev.txt
+
+    - script: python -m pip install $(torch.packages)
+      displayName: Install pytorch
+
+    - script: cd test && python -m pytest . --verbose
+      displayName: Run python test
+      condition: and(succeeded(), eq(variables['python.version'], '3.11'))
+
+- stage: WindowsBuilds
+  dependsOn: []
+  variables:
+    torch.packages: 'torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1'
+  jobs:
+
+  #########
+  # Windows C++
+  #########
+  - job: WindowsC
+    pool:
+      name: 'onnxruntime-extensions-Windows-CPU'
+
+    strategy:
+      matrix:
+        ort-1181:
+          ort.version: '1.18.1'
+        ort-1171:
+          ort.version: '1.17.1'
+        ort-1163:
+          ort.version: '1.16.3'
+        ort-1151:
+          ort.version: '1.15.1'
+
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+        disableDownloadFromRegistry: true
+        addToPath: true
+        architecture: 'x64'
+      displayName: Use ADO python task
+
+    - template: templates/download-file.yml
+      parameters:
+        url: "https://github.com/microsoft/onnxruntime/releases/download/v$(ort.version)/onnxruntime-win-x64-$(ort.version).zip"
+        outputFilePath: "$(Build.SourcesDirectory)/onnxruntime-win-x64-$(ort.version).zip"
+
+    - task: ExtractFiles@1
+      inputs:
+        archiveFilePatterns: '**/*.zip'
+        destinationFolder: '$(Build.SourcesDirectory)'
+        cleanDestinationFolder: false
+        overwriteExistingFiles: true
+      displayName: Unpack ONNXRuntime package.
+
+    - script: |
+        @echo off
+        set vswherepath="%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+        for /f "usebackq delims=" %%i in (`%vswherepath% -latest -property installationPath`) do (
+          if exist "%%i\Common7\Tools\vsdevcmd.bat" (
+            set vsdevcmd="%%i\Common7\Tools\vsdevcmd.bat"
+          )
+        )
+
+        @echo %vsdevcmd% will be used as the VC compiler
+        @echo ##vso[task.setvariable variable=vsdevcmd]%vsdevcmd%
+      displayName: 'locate vsdevcmd via vswhere'
+
+    - script: |
+        call $(vsdevcmd)
+        call .\build.bat -DOCOS_ENABLE_CTEST=ON -DOCOS_ONNXRUNTIME_VERSION="$(ort.version)" -DONNXRUNTIME_PKG_DIR=.\onnxruntime-win-x64-$(ort.version) -DOCOS_ENABLE_C_API=ON
+      displayName: build the customop library with onnxruntime
+
+    - script: |
+        cd out/Windows
+        ctest -C RelWithDebInfo --output-on-failure
+      displayName: Run C++ native tests
+
+  - job: WindowsStaticVC
+    pool:
+      name: 'onnxruntime-extensions-Windows-CPU'
+
+    steps:
+    - script: |
+        call .\build.bat -DOCOS_ENABLE_CTEST=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+        cd out/Windows
+        ctest -C RelWithDebInfo --output-on-failure
+      displayName: build and test ort-extensions with VC static runtime.
+
+  - job: Windows_PPApiBuild
+    pool:
+      name: 'onnxruntime-extensions-Windows-CPU'
+
+    steps:
+    - script: |
+        call .\build.bat -DOCOS_ENABLE_C_API=ON
+        cd out\Windows
+        ctest -C RelWithDebInfo --output-on-failure
+      displayName: Build ort-extensions with API enabled and run tests
+
+  ################
+  # Windows Python
+  ################
+  - job: WindowsPython
+    pool:
+      name: 'onnxruntime-extensions-Windows-CPU'
+
+    strategy:
+      matrix:
+        py312-1192:
+          python.version: '3.12'
+          ort.version: '1.19.2'
+        py311-1181:
+          python.version: '3.11'
+          ort.version: '1.18.1'
+
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(python.version)
+        disableDownloadFromRegistry: true
+        addToPath: true
+        architecture: 'x64'
+      displayName: Use ADO python task
+
+    - script: |
+        python -m pip install --upgrade pip
+        python -m pip install onnxruntime==$(ort.version)
+        python -m pip install -r requirements-dev.txt
+      displayName: Install requirements{-dev}.txt and cmake python modules
+
+    - script: |
+        set CMAKE_ARGS=-DOCOS_ONNXRUNTIME_VERSION=$(ort.version)
+        python -m pip install -v .
+      displayName: Build the wheel
+
+    - script: |
+        python -m pip install $(torch.packages)
+      displayName: Install pytorch
+
+    - script: |
+        cd test && python -m pytest .
+      displayName: Run python test
+      condition: and(succeeded(), eq(variables['python.version'], '3.11'))
+
+  #################
+  # Windows PyDebug
+  #################
+  - job: WinPyDbgBuild
+    pool:
+      name: 'onnxruntime-extensions-Windows-CPU'
+
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+        disableDownloadFromRegistry: true
+        addToPath: true
+        architecture: 'x64'
+      displayName: Use ADO python task
+
+    - script: |
+        python -m pip install --upgrade setuptools pip
+        python -m pip install "numpy < 2.0.0"
+        python -m pip install -v -e .
+      displayName: Build onnxruntime-extensions in editable mode.
+      env:
+        OCOS_NO_OPENCV: 1
+        OCOS_SCB_DEBUG: 1
+
+    - script: |
+        python -m pip install -r requirements-dev.txt
+        python -m pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
+      displayName: Install dependencies for pytest
+
+    - script: |
+        cd test
+        python -m pytest --ignore=test_cv2.py --ignore=test_tools_add_pre_post_processing_to_model.py . --verbose
+      displayName: Run python test
+      env:
+        OCOS_SCB_DEBUG: '1'
+
+- stage: WindowsCUDABuilds
+  dependsOn: []
+  jobs:
+  - job: WindowsCUDABoth
+    pool:
+      name: 'onnxruntime-extensions-Win2022-GPU-A10'
+    variables:
+      ORT_VERSION: '1.17.1'
+    timeoutInMinutes: 120
+    steps:
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: '3.12'
+          disableDownloadFromRegistry: true
+          addToPath: true
+          architecture: 'x64'
+        displayName: Use ADO python task
+
+      - template: templates/set_winenv.yml
+        parameters:
+          EnvSetupScript: 'set_env_cuda.bat'
+          DownloadCUDA: true
+
+      - script: |
+          nvidia-smi
+          nvcc --version
+          where nvcc
+        displayName: check cuda version
+
+      - template: templates/download-file.yml
+        parameters:
+          url: "https://github.com/microsoft/onnxruntime/releases/download/v$(ORT_VERSION)/onnxruntime-win-x64-gpu-$(ORT_VERSION).zip"
+          outputFilePath: "$(Build.SourcesDirectory)/onnxruntime-win-x64-gpu-$(ORT_VERSION).zip"
+
+      - task: ExtractFiles@1
+        inputs:
+          archiveFilePatterns: '**/*.zip'
+          destinationFolder: '$(Build.SourcesDirectory)'
+          cleanDestinationFolder: false
+          overwriteExistingFiles: true
+        displayName: Unpack ONNXRuntime package.
+
+      - script: |
+          set CUDA_PATH=$(Agent.TempDirectory)\v11.8
+          call .\build.bat -T cuda="%CUDA_PATH%" -DOCOS_ENABLE_CTEST=ON^
+            -DCMAKE_CUDA_FLAGS_INIT=-allow-unsupported-compiler^
+            -DOCOS_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70;86^
+            -DOCOS_ONNXRUNTIME_VERSION="$(ORT_VERSION)" -DONNXRUNTIME_PKG_DIR=.\onnxruntime-win-x64-gpu-$(ORT_VERSION) -DOCOS_ENABLE_C_API=ON
+        displayName: build the customop library with onnxruntime
+
+      - script: |
+          cd out/Windows
+          ctest -C RelWithDebInfo --output-on-failure
+        displayName: Run C++ native tests
+
+      - script: |
+          set CUDA_PATH=$(Agent.TempDirectory)\v11.8
+          python -m pip install --upgrade setuptools pip
+          python -m pip install "numpy < 2.0.0" coloredlogs flatbuffers packaging protobuf sympy
+          python -m pip install onnxruntime-gpu==$(ORT_VERSION)
+          python -m pip install -v --config-settings "ortx-user-option=use-cuda,cuda_archs=70;86" .
+        displayName: Build and install onnxruntime-extensions CUDA package.
+
+      - script: |
+          python -m pip install -r requirements-dev.txt
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+        displayName: Install dependencies for Python unit tests
+
+      - script: |
+          cd test
+          python -m pytest . --verbose
+          cd cuda
+          python -m pytest . --verbose
+        displayName: Run python test for CPU and CUDA kernels
+
+- stage: LinuxCUDABuilds
+  dependsOn: []
+  jobs:
+  - job: LinuxGPU
+    pool:
+      name: 'onnxruntime-extensions-Linux-GPU-A10'
+    timeoutInMinutes: 120
+    variables:
+      ORT_VERSION: '1.17.1'
+      TORCH_VERSION: 'torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1'
+    steps:
+      - task: mspremier.PostBuildCleanup.PostBuildCleanup-task.PostBuildCleanup@3
+        displayName: 'Clean Agent Directories'
+        condition: always()
+
+      - script: |
+          nvidia-smi
+        displayName: check cuda version
+
+      - checkout: self
+        clean: true
+        submodules: none
+
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: '3.12'
+          addToPath: true
+
+      - template: templates/download-file.yml
+        parameters:
+          url: "https://github.com/microsoft/onnxruntime/releases/download/v$(ORT_VERSION)/onnxruntime-linux-x64-gpu-$(ORT_VERSION).tgz"
+          outputFilePath: "$(Build.SourcesDirectory)/onnxruntime-linux-x64-gpu-$(ORT_VERSION).tgz"
+
+      - task: ExtractFiles@1
+        inputs:
+          archiveFilePatterns: '**/*.tgz'
+          destinationFolder: '$(Build.SourcesDirectory)'
+          cleanDestinationFolder: false
+          overwriteExistingFiles: true
+        displayName: Unpack ONNXRuntime package.
+
+      - template: ../tools/ci_build/github/azure-pipeline/templates/get-docker-image-steps.yml
+        parameters:
+          Dockerfile: tools/ci_build/github/linux/docker/Dockerfile.ubuntu_cuda11_8_tensorrt8_6
+          Context: tools/ci_build/github/linux/docker
+          DockerBuildArgs: "--build-arg BUILD_UID=$( id -u )"
+          Repository: onnxruntime-extensionscuda11build
+          UpdateDepsTxt: false
+
+      - task: CmdLine@2
+        inputs:
+          script: |
+            docker run --gpus all --rm \
+              --volume $(Build.SourcesDirectory):/onnxruntime-extensions \
+              --volume $(Build.SourcesDirectory)/onnxruntime-linux-x64-gpu-$(ORT_VERSION):/onnxruntime \
+              -e CUDA_PATH=/usr/local/cuda-11.8 \
+              onnxruntime-extensionscuda11build \
+              /bin/bash -c "
+                set -ex; \
+                pushd /onnxruntime-extensions; \
+                sh ./build.sh -DOCOS_ENABLE_CTEST=ON -DOCOS_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DOCOS_ONNXRUNTIME_VERSION="$(ORT_VERSION)" -DONNXRUNTIME_PKG_DIR=/onnxruntime; \
+                popd; \
+                "
+          workingDirectory: $(Build.SourcesDirectory)
+        displayName: build the customop library with onnxruntime
+
+      - task: CmdLine@2
+        inputs:
+          script: |
+            docker run --gpus all --rm \
+              --volume $(Build.SourcesDirectory):/onnxruntime-extensions \
+              --volume $(Build.SourcesDirectory)/onnxruntime-linux-x64-gpu-$(ORT_VERSION):/onnxruntime \
+              -e CUDA_PATH=/usr/local/cuda-11.8 \
+              onnxruntime-extensionscuda11build \
+              /bin/bash -c "
+                set -ex; \
+                pushd /onnxruntime-extensions; \
+                cd out/Linux/RelWithDebInfo; \
+                ctest -C RelWithDebInfo --output-on-failure; \
+                popd; \
+                "
+          workingDirectory: $(Build.SourcesDirectory)
+        displayName: Run C++ native tests
+
+      - task: CmdLine@2
+        inputs:
+          script: |
+            docker run --gpus all --rm \
+              --volume $(Build.SourcesDirectory):/onnxruntime-extensions \
+              --volume $(Build.SourcesDirectory)/onnxruntime-linux-x64-gpu-$(ORT_VERSION):/onnxruntime \
+              -e CUDA_PATH=/usr/local/cuda-11.8 \
+              onnxruntime-extensionscuda11build \
+              /bin/bash -c "
+                set -ex; \
+                pushd /onnxruntime-extensions; \
+                python3 -m pip install --upgrade pip; \
+                python3 -m pip install --upgrade setuptools; \
+                python3 -m pip install onnxruntime-gpu==$(ORT_VERSION); \
+                python3 -m pip install -v --config-settings 'ortx-user-option=use-cuda,cuda_archs=70;86' . ; \
+                python3 -m pip install $(TORCH_VERSION) ; \
+                python3 -m pip install -r requirements-dev.txt; \
+                cd test && python -m pytest . --verbose; \
+                cd cuda && python -m pytest . --verbose; \
+                popd; \
+                "
+          workingDirectory: $(Build.SourcesDirectory)
+        displayName: Build the library and Python unit tests
+
+- stage: WebAssemblyBuilds
+  dependsOn: []
+  jobs:
+
+  #############
+  # WebAssembly
+  #############
+  - job: WebAssembly
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - script: |
+        cd $(Build.BinariesDirectory)
+        git clone https://github.com/emscripten-core/emsdk --depth 1 --branch 4.0.3
+        emsdk/emsdk install latest
+        emsdk/emsdk activate latest
+      displayName: Setup emscripten pipeline
+
+    - script: |
+        bash ./build.sh \
+        -DCMAKE_TOOLCHAIN_FILE=$(Build.BinariesDirectory)/emsdk/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake \
+        -DOCOS_ENABLE_STATIC_LIB=OFF   \
+        -DOCOS_ENABLE_SPM_TOKENIZER=ON \
+        -DOCOS_BUILD_PYTHON=OFF  \
+        -DOCOS_ENABLE_VISION=OFF \
+        -DOCOS_ENABLE_CTEST=OFF  \
+        -DOCOS_ENABLE_C_API=ON
+      displayName: build ort-extensions as an executable
+
+    - script: |
+        bash ./build.sh \
+        -DCMAKE_TOOLCHAIN_FILE=$(Build.BinariesDirectory)/emsdk/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake \
+        -DOCOS_ENABLE_STATIC_LIB=ON    \
+        -DOCOS_ENABLE_SPM_TOKENIZER=ON \
+        -DOCOS_BUILD_PYTHON=OFF  \
+        -DOCOS_ENABLE_VISION=OFF \
+        -DOCOS_ENABLE_CTEST=OFF  \
+        -DOCOS_ENABLE_C_API=ON
+      displayName: build ort-extensions as a static library
+
+- stage: AndroidBuilds
+  dependsOn: []
+  jobs:
+
+  #############
+  # Android
+  #############
+  - job: AndroidPackage_BuildOnly
+    pool:
+      vmImage: 'macOS-14'
+    timeoutInMinutes: 120
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: "3.12"
+        addToPath: true
+        architecture: "x64"
+      displayName: "Use Python 3.12"
+
+    - task: JavaToolInstaller@0
+      displayName: Use jdk 17
+      inputs:
+        versionSpec: '17'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'
+
+    - script: brew install coreutils ninja
+      displayName: Install coreutils and ninja
+
+    - bash: |
+        set -e -x
+
+        _BUILD_CFG="x86_64 $(Build.BinariesDirectory)/android_aar" ./build.android
+
+        VERSION=$(cat ./version.txt)
+        AAR_PATH="$(Build.BinariesDirectory)/android_aar/aar_out/com/microsoft/onnxruntime/onnxruntime-extensions-android/${VERSION}/onnxruntime-extensions-android-${VERSION}.aar"
+
+        # Do not output ##vso[] commands with `set -x` or they may be parsed again and include a trailing quote.
+        set +x
+        echo "##vso[task.setvariable variable=ORT_EXTENSIONS_AAR_PATH]${AAR_PATH}"
+      displayName: Build onnxruntime-extensions AAR package
+
+  - job: AndroidCpp_BuildOnly
+    pool:
+      vmImage: 'macOS-14'
+    timeoutInMinutes: 45
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: "3.12"
+        addToPath: true
+        architecture: "x64"
+      displayName: "Use Python 3.12"
+
+    - task: JavaToolInstaller@0
+      displayName: Use jdk 17
+      inputs:
+        versionSpec: '17'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'
+
+    - script: brew install ninja
+      displayName: Install ninja
+
+    - bash: |
+        python -m pip install cmake==3.31.6
+        python ./tools/build.py \
+          --config RelWithDebInfo \
+          --android \
+          --android_abi x86_64 \
+          --enable_cxx_tests \
+          --update --build --parallel
+      displayName: Build onnxruntime-extensions for Android
+
+  - job: Android_Verify16KbPageAlignment
+    pool:
+      vmImage: 'ubuntu-24.04'
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: "3.12"
+        addToPath: true
+        architecture: "x64"
+      displayName: "Use Python 3.12"
+
+    - task: JavaToolInstaller@0
+      displayName: Use jdk 17
+      inputs:
+        versionSpec: '17'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'
+
+    - bash: |
+        python tools/build.py \
+          --android \
+          --android_abi=arm64-v8a \
+          --android_api=27 \
+          --android_home=$ANDROID_HOME \
+          --android_ndk_path=$ANDROID_NDK_HOME \
+          --config=Release \
+          --update \
+          --parallel \
+          --build
+      displayName: Build onnxruntime-extensions for Android
+
+    - bash: |
+        set -e
+
+        echo "=== Verifying 16KB page size alignment ==="
+
+        # Find android built libraries
+        LIBS=$(find build/Android/Release/lib -name "libortextensions.so" -o -name "libonnxruntime_extensions4j_jni.so")
+
+        if [ -z "$LIBS" ]; then
+          echo "ERROR: Android built libraries not found"
+          find build/Android -name "*.so" -type f || true
+          exit 1
+        fi
+
+        # Use llvm-readelf from NDK
+        READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+        if [ ! -f "$READELF" ]; then
+          echo "ERROR: llvm-readelf not found at $READELF"
+          exit 1
+        fi
+
+        echo "Found libraries:"
+        echo "$LIBS"
+        echo ""
+
+        FAILED=0
+        for LIB in $LIBS; do
+          echo "Checking: $(basename $LIB)"
+          echo "Full path: $LIB"
+
+          # Display LOAD segments
+          $READELF -l "$LIB" | grep -A 1 "LOAD" || true
+
+          # Check for 16KB alignment (0x4000) in the Align field of LOAD segments
+          if $READELF -l "$LIB" | grep "LOAD" | awk '{print $NF}' | grep -q '^0x4000$'; then
+            echo "PASS: Found 16KB alignment (0x4000) in $(basename $LIB)"
+          else
+            echo "FAIL: Did not find 16KB alignment (0x4000) in $(basename $LIB)"
+            echo "Full segment details:"
+            $READELF -l "$LIB"
+            FAILED=1
+          fi
+          echo "---"
+        done
+
+        if [ $FAILED -ne 0 ]; then
+          echo ""
+          echo "ERROR: One or more libraries do not have 16KB page alignment"
+          exit 1
+        fi
+
+        echo ""
+        echo "SUCCESS: All libraries have correct 16KB page alignment"
+      displayName: Verify 16KB page alignment
+
+- stage: IosBuilds
+  dependsOn: []
+  jobs:
+
+  #############
+  # iOS
+  #############
+  - job: IosPackage
+    pool:
+      vmImage: 'macOS-14'
+    timeoutInMinutes: 120
+    steps:
+    - template: templates/use-xcode-version.yml
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+        disableDownloadFromRegistry: true
+        addToPath: true
+        architecture: 'x64'
+      displayName: "Use Python 3.12"
+
+    - script: |
+        python -m pip install "cmake<4.0.0"
+      displayName: "Install CMake"
+
+    - template: templates/set-package-version-variable-step.yml
+      parameters:
+        PackageVersionVariableName: ORT_EXTENSIONS_POD_VERSION
+
+    - script: |
+        python ./tools/ios/build_xcframework.py \
+          --output_dir $(Build.BinariesDirectory)/xcframework_out \
+          --platform_arch iphonesimulator x86_64 \
+          --config RelWithDebInfo \
+          --ios_deployment_target 15.0 \
+          -- \
+          --enable_cxx_tests
+      displayName: "Build xcframework for iphonesimulator x86_64"
+
+    - script: |
+        python ./tools/ios/assemble_pod_package.py \
+          --staging-dir $(Build.BinariesDirectory)/pod_staging \
+          --xcframework-output-dir $(Build.BinariesDirectory)/xcframework_out \
+          --pod-version ${ORT_EXTENSIONS_POD_VERSION}
+      displayName: "Assemble pod"
+
+    # Note: In this CI, we only specify to build for iphonesimulator x86_64 arch in build_framework.py command however 
+    # this test app's podfile by default is setup for all platforms, and due to that we have to explicitly exclude the 
+    # macos target below when installing the pod for the test app.
+    - script: |
+        ORT_EXTENSIONS_LOCAL_POD_PATH=$(Build.BinariesDirectory)/pod_staging \
+        EXCLUDE_MACOS_TARGET=true \
+          pod install
+      displayName: "Install pods for OrtExtensionsUsage"
+      workingDirectory: $(Build.SourcesDirectory)/test/ios/OrtExtensionsUsage
+
+    - script: |
+        set -e
+
+        SIMULATOR_DEVICE_INFO=$(python ./tools/ios/get_simulator_device_info.py --requested-runtime-version 18.2)
+
+        echo "Simulator device info:"
+        echo "${SIMULATOR_DEVICE_INFO}"
+
+        SIMULATOR_DEVICE_ID=$(jq --raw-output '.device_udid' <<< "${SIMULATOR_DEVICE_INFO}")
+
+        # Do not output ##vso[] commands with `set -x` or they may be parsed again and include a trailing quote.
+        set +x
+        echo "##vso[task.setvariable variable=ORT_EXTENSIONS_SIMULATOR_DEVICE_ID]${SIMULATOR_DEVICE_ID}"
+      displayName: "Get simulator device info"
+
+    - script: |
+        xcrun simctl bootstatus ${ORT_EXTENSIONS_SIMULATOR_DEVICE_ID} -b
+      displayName: "Wait for simulator device to boot"
+
+    - script: |
+        xcrun xcodebuild \
+          -sdk iphonesimulator \
+          -configuration Debug \
+          -parallel-testing-enabled NO \
+          -workspace $(Build.SourcesDirectory)/test/ios/OrtExtensionsUsage/OrtExtensionsUsage.xcworkspace \
+          -scheme OrtExtensionsUsage \
+          -destination "platform=iOS Simulator,id=${ORT_EXTENSIONS_SIMULATOR_DEVICE_ID}" \
+          test CODE_SIGNING_ALLOWED=NO
+      displayName: "Build and test OrtExtensionsUsage"

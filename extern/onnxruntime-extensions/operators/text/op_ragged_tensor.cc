@@ -1,0 +1,156 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+#include "string_utils.h"
+#include "string_tensor.h"
+#include "op_ragged_tensor.hpp"
+
+OrtStatusPtr RaggedTensorToSparse(const ortc::Tensor<int64_t>& n_element,
+                                  ortc::Tensor<int64_t>& output_0,
+                                  ortc::Tensor<int64_t>& output_1) {
+  const int64_t* p_n_elements = n_element.Data();
+
+  auto& d_length = n_element.Shape();
+
+  if (d_length.size() != 1)
+    return OrtW::CreateStatus(MakeString(
+                                  "First input must have one dimension not ", d_length.size(), ".")
+                                  .c_str(),
+                              ORT_INVALID_ARGUMENT);
+  int64_t n_els = d_length[0] - 1;
+
+  if (n_els < 0)
+    return OrtW::CreateStatus("Row-splits tensor must not be empty.", ORT_INVALID_ARGUMENT);
+
+  if (p_n_elements[0] != 0)
+    return OrtW::CreateStatus("Row-splits tensor must start at zero.", ORT_INVALID_ARGUMENT);
+
+  for (int64_t k = 1; k <= n_els; ++k) {
+    if (p_n_elements[k] < p_n_elements[k - 1])
+      return OrtW::CreateStatus("Row-splits tensor must be monotonic non-decreasing.", ORT_INVALID_ARGUMENT);
+  }
+
+  int64_t n_values = p_n_elements[n_els];
+  std::vector<int64_t> shape{n_values, 2};
+  std::vector<int64_t> shape2{2};
+
+  int64_t* out0 = output_0.Allocate(shape);
+  int64_t* out1 = output_1.Allocate(shape2);
+  out1[0] = n_els;
+  out1[1] = 0;
+  int64_t row = 0;
+  int64_t i, j, length;
+  for (i = 1; i < d_length[0]; ++i) {
+    length = p_n_elements[i] - p_n_elements[i - 1];
+    if (length > out1[1])
+      out1[1] = length;
+    for (j = 0; j < length; ++j) {
+      *out0++ = row;
+      *out0++ = j;
+    }
+    ++row;
+  }
+
+  return nullptr;
+}
+
+static int64_t GetMaxRaggedTensorCol(int64_t n, const int64_t* p_indices) {
+  int64_t size = n;
+  int64_t max_col = 0;
+  for (int64_t i = 1; i < size; ++i) {
+    max_col = std::max(max_col, p_indices[i] - p_indices[i - 1]);
+  }
+  return max_col;
+}
+
+OrtStatusPtr KernelRaggedTensoroDense::Compute(const ortc::Tensor<int64_t>& input0,
+                                               const ortc::Tensor<int64_t>& input1,
+                                               const ortc::Tensor<int64_t>& input2,
+                                               const ortc::Tensor<int64_t>& input3,
+                                               ortc::Tensor<int64_t>& output) const {
+  const int64_t* p_values = input1.Data();
+  const int64_t* p_missing = input2.Data();
+  const int64_t* p_indices = input3.Data();
+
+  int64_t size = input3.NumberOfElement();
+  int64_t n_values = input1.NumberOfElement();
+
+  if (size < 1)
+    return OrtW::CreateStatus("Offsets tensor must not be empty.", ORT_INVALID_ARGUMENT);
+
+  for (int64_t k = 0; k < size; ++k) {
+    if (p_indices[k] < 0 || p_indices[k] > n_values)
+      return OrtW::CreateStatus(
+          MakeString("Offset ", p_indices[k], " at index ", k,
+                     " is out of valid range [0, ", n_values, "] for values tensor with ", n_values, " elements.")
+              .c_str(),
+          ORT_INVALID_ARGUMENT);
+  }
+
+  for (int64_t k = 1; k < size; ++k) {
+    if (p_indices[k] < p_indices[k - 1]) {
+      return OrtW::CreateStatus(
+          MakeString("Offsets tensor must be monotonic non-decreasing, but offsets[", k - 1, "]=", p_indices[k - 1],
+                     " > offsets[", k, "]=", p_indices[k], ".")
+              .c_str(),
+          ORT_INVALID_ARGUMENT);
+    }
+  }
+
+  int64_t max_col = GetMaxRaggedTensorCol(size, p_indices);
+
+  std::vector<int64_t> shape_out{size - 1, max_col};
+  int64_t* dense = output.Allocate(shape_out);
+
+  int64_t pos = 0;
+  int64_t j, pos_end;
+  int64_t shape_out_size = shape_out[0] * shape_out[1];
+  for (int64_t i = 0; i < size - 1; ++i) {
+    pos_end = pos + max_col;
+    if (pos_end > shape_out_size)
+      return OrtW::CreateStatus(MakeString(
+                                    "Unexpected index ", pos_end, " greather than ", shape_out[0], "x", shape_out[1],
+                                    " - i=", i, " size=", size, ".")
+                                    .c_str(),
+                                ORT_INVALID_ARGUMENT);
+    for (j = p_indices[i]; j < p_indices[i + 1]; ++j, ++pos) {
+      dense[pos] = p_values[j];
+    }
+    for (; pos < pos_end; ++pos) {
+      dense[pos] = p_missing[0];
+    }
+  }
+
+  return nullptr;
+}
+
+OrtStatusPtr StringRaggedTensorToDense(const ortc::Tensor<int64_t>& input0,
+                                       const ortc::Tensor<std::string>& input1,
+                                       const ortc::Tensor<int64_t>& input2,
+                                       const ortc::Tensor<std::string>& input3,
+                                       ortc::Tensor<std::string>& output) {
+  auto& input = input1.Data();
+  const int64_t* p_indices = input2.Data();
+  int64_t size = input3.NumberOfElement();
+  int64_t max_col = GetMaxRaggedTensorCol(size, p_indices);
+  std::vector<int64_t> shape_out{size - 1, max_col};
+
+  int64_t shape_out_size = shape_out[0] * shape_out[1];
+  std::vector<std::string> dense(static_cast<size_t>(max_col * (size - 1)));
+  int64_t pos = 0;
+  int64_t j, pos_end;
+  for (int64_t i = 0; i < size - 1; ++i) {
+    pos_end = pos + max_col;
+    if (pos_end > shape_out_size)
+      return OrtW::CreateStatus(MakeString(
+                                    "Unexpected index ", pos_end, " greather than ", shape_out[0], "x", shape_out[1],
+                                    " - i=", i, " size=", size, ".")
+                                    .c_str(),
+                                ORT_INVALID_ARGUMENT);
+    for (j = p_indices[i]; j < p_indices[i + 1]; ++j, ++pos) {
+      dense[static_cast<size_t>(pos)] = input[static_cast<size_t>(j)];
+    }
+    pos = pos_end;
+  }
+  output.SetStringOutput(dense, shape_out);
+  return nullptr;
+}

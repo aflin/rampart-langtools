@@ -24,3 +24,12 @@ RUN curl -fsSL -o /etc/yum.repos.d/cuda.repo \
     yum install -y --nogpgcheck ${CUDA_PKGS} && \
     yum clean all && \
     ( ln -sf stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so 2>/dev/null || true )
+
+# Optional cuDNN (separate layer so the toolkit layer above stays cached on rebuild).
+# Only the CUDA-12+ images set this -- rampart-onnx's FULL CUDA EP needs cuDNN at build
+# time (libs -> /usr/lib64, headers -> /usr/include, i.e. CUDNN_HOME=/usr). llama.cpp
+# and faiss don't use cuDNN, so cu11 leaves it empty. From the same NVIDIA cuda.repo.
+ARG CUDNN_PKGS=""
+RUN if [ -n "${CUDNN_PKGS}" ]; then \
+      yum install -y --nogpgcheck ${CUDNN_PKGS} && yum clean all ; \
+    fi

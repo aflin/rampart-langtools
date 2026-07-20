@@ -1,0 +1,35 @@
+[build-system]
+# Minimum requirements for the build system to execute.
+requires = ["setuptools", "wheel", "ninja", "cmake"]  # PEP 508 specifications.
+build-backend = "backend"
+backend-path = [".pyproject"]
+
+[tool.black]
+line-length = 120
+
+[tool.ruff]
+line-length = 120
+
+[tool.cibuildwheel]
+# Note: the below skip command doesn't do much currently, the platforms to
+# build wheels for in CI are controlled in `wheels_linux` and `wheels_macos.yml`.
+skip = "cp36-* cp37-* pp37-* *-manylinux_i686 *_s390x *-musllinux_aarch64"
+build-verbosity = "3"
+
+[[tool.cibuildwheel.overrides]]
+select = "*-manylinux*x86_64*"
+before-all = "./tools/install_deps.sh many64"
+test-command = "{project}/tools/test_cibuildwheel.sh {project}"
+
+[[tool.cibuildwheel.overrides]]
+select = "*-manylinux*i686*"
+before-all = "./tools/install_deps.sh many86"
+
+[[tool.cibuildwheel.overrides]]
+select = "*-musllinux*"
+before-all = "./tools/install_deps.sh musl"
+
+[[tool.cibuildwheel.overrides]]
+select = "*win*"
+before-build = "tools\\install_deps.bat install"
+test-command = "{project}\\tools\\test_cibuildwheel.bat {project}"

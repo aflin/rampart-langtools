@@ -209,3 +209,281 @@ target_include_directories(llama_gen_shim_obj PRIVATE
     ${EXTERN_DIR}/llama.cpp/ggml/include
 )
 add_dependencies(llama_gen_shim_obj llama-common llama ggml)
+
+# ----------------------------------------------------------------------------
+# ONNX RUNTIME
+#
+# LT_ONNX gates the whole section (module OR GPU runtime dir).  Default ON;
+# forced OFF automatically when this CMake is too old for ORT's deps.  The
+# 2_17-tier ovens pass -DLT_ONNX=0 explicitly: ORT 1.27 requires glibc >= 2.28
+# and a newer gcc than manylinux2014 carries, so those tiers ship every module
+# EXCEPT rampart-onnx (the 2_28 tier is the onnx-capable Linux tier).
+#
+# Unlike llama.cpp/sentencepiece/faiss, ONNX Runtime is NOT consumed via
+# add_subdirectory(): its CMake is a self-contained top-level project driven by
+# build.py (~80 cache vars + FetchContent deps) and is not meant to be embedded
+# as a subproject. So we drive its own build out-of-tree via ExternalProject --
+# this keeps the normal `cmake .. && make` workflow building ORT automatically
+# (no separate prebuild step). It emits libonnxruntime.so into
+# ${CMAKE_BINARY_DIR}/extern/onnxruntime/Release (same build/extern/<dep>
+# location the add_subdirectory deps use), which we consume as an IMPORTED .so.
+# Public headers live in the vendored source tree (flat C API dir + CPU factory).
+#
+# NB: the ORT build downloads its deps via FetchContent -> needs network on the
+# first build, and needs CMake >= 3.28 (onnx dep floor is 3.26). It is slow
+# (~30 min) the first time; ExternalProject stamps it so later builds skip it.
+# ONNXRUNTIME_LIB_DIR can be overridden (-D) so alternate build trees can point
+# at one already-built ORT instead of rebuilding it.
+option(LT_ONNX "Build rampart-onnx (or, on GPU flavors, its ORT runtime dir)" ON)
+if(LT_ONNX AND CMAKE_VERSION VERSION_LESS 3.28)
+  message(STATUS "rampart-onnx: CMake ${CMAKE_VERSION} < 3.28 (ORT dep floor) -> disabled")
+  set(LT_ONNX OFF)
+endif()
+if(NOT LT_ONNX)
+  set(ONNX_LIBS "")
+  set(ONNX_GPU OFF)
+  message(STATUS "rampart-onnx: disabled (LT_ONNX=0)")
+else()
+
+include(ExternalProject)
+set(ONNX_DIR ${EXTERN_DIR}/onnxruntime)
+set(ONNX_INCLUDE_DIRS
+    ${ONNX_DIR}/include/onnxruntime/core/session
+    ${ONNX_DIR}/include/onnxruntime/core/providers/cpu
+)
+set(ONNXRUNTIME_LIB_DIR "${CMAKE_BINARY_DIR}/extern/onnxruntime/Release"
+    CACHE PATH "Directory of the (ExternalProject-built) ONNX Runtime static archives")
+# CPU flavor: two merged static archives produced by rampart-build-cpu.sh.
+set(ONNX_CORE_A "${ONNXRUNTIME_LIB_DIR}/libonnxruntime_core.a")  # 10 ORT internal libs
+set(ONNX_DEPS_A "${ONNXRUNTIME_LIB_DIR}/libonnxruntime_deps.a")  # abseil/onnx/protobuf/re2/...
+# GPU flavor: ORT can't static-link the CUDA EP (it's a dlopen'd shared provider),
+# so rampart-build-cuda.sh does a SHARED build emitting these three. libonnxruntime.so
+# carries soname libonnxruntime.so.1 (-> .so.1.27.0); the module DT_NEEDs that and
+# finds it + the providers beside itself via $ORIGIN rpath (set in CMakeLists).
+set(ONNX_SHARED_LIB       "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so")
+set(ONNX_PROVIDERS_SHARED "${ONNXRUNTIME_LIB_DIR}/libonnxruntime_providers_shared.so")
+set(ONNX_PROVIDERS_CUDA   "${ONNXRUNTIME_LIB_DIR}/libonnxruntime_providers_cuda.so")
+
+# rampart-onnx GPU flavor gate. ORT 1.27's CUDA EP requires CUDA >= 12.0, so a cu11
+# (CUDA 11.8) build can't use it -- onnx there falls back to the static CPU EP. Only
+# engage the GPU EP on a GPU build with a CUDA-12+ toolkit (or when the version is
+# not yet known, which is the cu12/cu13 ovens' case at this point).
+set(ONNX_GPU OFF)
+if(LT_ENABLE_GPU AND NOT APPLE)
+  # Resolve the CUDA toolkit version robustly. CMAKE_CUDA_COMPILER_VERSION is set by
+  # enable_language(CUDA) -- but that ran inside the llama.cpp add_subdirectory() (a
+  # child scope), so it does NOT propagate back up here. Relying on it left the var
+  # empty on a native CUDA-11 build (e.g. firefly, CUDA 11.8 nvcc at /usr/bin), which
+  # fell through to ONNX_GPU=ON and made ORT try to build its CUDA EP with a dangling
+  # /usr/local/cuda/bin/nvcc. CMAKE_CUDA_COMPILER (a *cache* var) IS visible here, so
+  # query it directly. The cu12/cu13 ovens land on 12.x/13.x this way and stay GPU.
+  set(_onnx_cuda_ver "${CMAKE_CUDA_COMPILER_VERSION}")
+  if(NOT _onnx_cuda_ver AND CMAKE_CUDA_COMPILER)
+    execute_process(
+      COMMAND "${CMAKE_CUDA_COMPILER}" --version
+      OUTPUT_VARIABLE _onnx_nvcc_out ERROR_QUIET)
+    if(_onnx_nvcc_out MATCHES "release ([0-9]+\\.[0-9]+)")
+      set(_onnx_cuda_ver "${CMAKE_MATCH_1}")
+    endif()
+  endif()
+  if(_onnx_cuda_ver AND _onnx_cuda_ver VERSION_LESS 12.0)
+    message(WARNING
+      "rampart-onnx: CUDA ${_onnx_cuda_ver} is < 12 -- ORT 1.27's CUDA execution "
+      "provider requires CUDA >= 12, so the GPU onnx runtime will NOT be built. "
+      "rampart-onnx will still be built as a CPU-only module (embed/rerank run on "
+      "the CPU). llama.cpp/faiss keep their CUDA ${_onnx_cuda_ver} GPU support; only "
+      "onnx GPU acceleration is unavailable at this toolkit version. Build with a "
+      "CUDA >= 12 toolkit to get the GPU onnx runtime.")
+  elseif(NOT _onnx_cuda_ver)
+    message(WARNING
+      "rampart-onnx: no CUDA toolkit version could be resolved -- the GPU onnx "
+      "runtime will NOT be built. rampart-onnx will still be built as a CPU-only "
+      "module.")
+  else()
+    message(STATUS "rampart-onnx: CUDA ${_onnx_cuda_ver} >= 12 -> onnx builds the GPU EP")
+    set(ONNX_GPU ON)
+  endif()
+endif()
+
+if(ONNX_GPU)
+  # Match the arch coverage the ggml/faiss GPU build uses: build-in-oven.sh pins
+  # CMAKE_CUDA_ARCHITECTURES per variant (cu12 x86 = 80;86;89;90;100;120;120-virtual),
+  # and we inherit it so onnx stays in sync with llama.cpp/faiss. ORT normalizes
+  # Blackwell to the arch-specific form itself (adds 100a/120a in
+  # cuda_configuration.cmake), so no pre-rewrite is needed here. Fallback = Ada-only.
+  # NB: ORT recompiles its kernel set per -real arch, so the full fleet is a MUCH
+  # longer build (multi-hour) than a single arch -- narrow with -DONNX_CUDA_ARCH=... to
+  # iterate (e.g. just "89-real;89-virtual" for an Ada-only test box).
+  if(CMAKE_CUDA_ARCHITECTURES)
+    set(_onnx_arch_default "${CMAKE_CUDA_ARCHITECTURES}")
+  else()
+    set(_onnx_arch_default "89-real;89-virtual")
+  endif()
+  set(ONNX_CUDA_ARCH "${_onnx_arch_default}" CACHE STRING "CUDA archs for the ORT CUDA EP")
+  # FULL CUDA EP by default (complete kernel set -> transformers actually run on GPU).
+  # Needs cuDNN at build time; the cu12/cu13 ovens install it (Dockerfile.cuda
+  # CUDNN_PKGS) at CUDNN_HOME=/usr. Set ONNX_CUDA_MINIMAL=1 for a cuBLAS-only EP with
+  # no cuDNN (smaller; but most transformer ops fall back to CPU -> little GPU gain).
+  set(ONNX_CUDA_MINIMAL "0"   CACHE STRING "Build the ORT CUDA EP without cuDNN when 1")
+  set(ONNX_CUDNN_HOME   "/usr" CACHE PATH   "cuDNN root for the full ORT CUDA EP")
+  # ORT CUDA build parallelism. Its cutlass kernels (flash-attn, quantized GEMM) are
+  # memory-monsters, and each nvcc compiles one .cu for EVERY -real arch at once -- so
+  # memory ~ parallel x arches. sm_89 (1 arch) was fine at 8; the 6-arch fleet at 8
+  # OOM-locked a 15 GB host. Default 2 is safe for the fleet on ~16 GB; raise via
+  # -DONNX_CUDA_PARALLEL=N on a big-RAM builder. (Outer langtools -j is unaffected.)
+  set(ONNX_CUDA_PARALLEL "1" CACHE STRING "ORT CUDA build --parallel (memory ~ parallel x arches; measured: 15GB box needs 1 for a fleet, 2 spikes into swap, 8 locks. Raise via -D on a big-RAM builder.)")
+  # Transport the arch list comma-separated: a ';' would be split by CMake list
+  # semantics inside `-E env`, corrupting the var. The script converts ',' -> ';'.
+  string(REPLACE ";" "," ONNX_CUDA_ARCH_CSV "${ONNX_CUDA_ARCH}")
+  set(ONNX_BUILD_CMD ${CMAKE_COMMAND} -E env
+        "ONNX_CUDA_ARCH=${ONNX_CUDA_ARCH_CSV}"
+        "ONNX_CUDA_MINIMAL=${ONNX_CUDA_MINIMAL}"
+        "CUDNN_HOME=${ONNX_CUDNN_HOME}"
+        "ONNX_CUDA_PARALLEL=${ONNX_CUDA_PARALLEL}"
+        sh ${ONNX_DIR}/rampart-build-cuda.sh ${CMAKE_BINARY_DIR}/extern/onnxruntime)
+  set(ONNX_BYPRODUCTS ${ONNX_SHARED_LIB} ${ONNX_PROVIDERS_SHARED} ${ONNX_PROVIDERS_CUDA})
+else()
+  set(ONNX_BUILD_CMD sh ${ONNX_DIR}/rampart-build-cpu.sh ${CMAKE_BINARY_DIR}/extern/onnxruntime)
+  set(ONNX_BYPRODUCTS ${ONNX_CORE_A} ${ONNX_DEPS_A})
+endif()
+
+# Drive ORT's own build.sh (via the cpu/cuda wrapper) as an external build.
+# CONFIGURE/UPDATE/PATCH/INSTALL are no-ops. BUILD_BYPRODUCTS lets Ninja/Make track them.
+ExternalProject_Add(onnxruntime_ep
+    SOURCE_DIR          ${ONNX_DIR}
+    DOWNLOAD_COMMAND    ""
+    UPDATE_COMMAND      ""
+    PATCH_COMMAND       ""
+    CONFIGURE_COMMAND   ""
+    BINARY_DIR          ${CMAKE_BINARY_DIR}/extern/onnxruntime
+    BUILD_COMMAND       ${ONNX_BUILD_CMD}
+    INSTALL_COMMAND     ""
+    BUILD_BYPRODUCTS    ${ONNX_BYPRODUCTS}
+    USES_TERMINAL_BUILD ON
+)
+
+# --------------------------------------------------------------------------
+# ONNX RUNTIME EXTENSIONS (tokenizers)
+# --------------------------------------------------------------------------
+# Robust C++ tokenizers replacing the JS wordpiece + the rampart-sentencepiece
+# callout: WordPiece via extensions' BertTokenizer C++ class (used directly),
+# SentencePiece/BPE via the Ortx C API (OrtxCreateTokenizer). Built static +
+# CPU-only (tokenization never touches the GPU, so identical in every flavor)
+# and folded into ONE relocatable object with its bundled protobuf/re2 symbols
+# LOCALIZED, so they don't collide with ORT's copies at link time (ORT's
+# libonnxruntime_deps.a bundles the same libs -- ~1655 overlapping symbols).
+# See rampart-build-ext.sh for the ld -r + objcopy --localize-symbols step.
+set(ONNXEXT_DIR ${EXTERN_DIR}/onnxruntime-extensions)
+set(ONNXEXT_OBJ "${CMAKE_BINARY_DIR}/extern/onnxruntime-extensions/onnxext_all.o"
+    CACHE FILEPATH "The (ExternalProject-built) combined+localized extensions object")
+set(ONNXEXT_INCLUDE_DIRS
+    ${ONNXEXT_DIR}/include
+    ${ONNXEXT_DIR}/operators/tokenizer
+    ${ONNXEXT_DIR}/base
+)
+# protobuf per flavor: CPU statically links ORT's FULL protobuf into the module
+# (ext must NOT add a second copy -> double static-init SIGSEGV; sentencepiece
+# binds to ORT's); GPU links the SHARED libonnxruntime.so.1 whose protobuf is
+# hidden, so ext must carry its own protobuf-lite.
+if(ONNX_GPU)
+  set(ONNXEXT_BUNDLE_PB "1")
+else()
+  set(ONNXEXT_BUNDLE_PB "0")
+endif()
+if(NOT ONNX_GPU)
+ExternalProject_Add(onnxext_ep
+    SOURCE_DIR          ${ONNXEXT_DIR}
+    DOWNLOAD_COMMAND    ""
+    UPDATE_COMMAND      ""
+    PATCH_COMMAND       ""
+    CONFIGURE_COMMAND   ""
+    BINARY_DIR          ${CMAKE_BINARY_DIR}/extern/onnxruntime-extensions
+    BUILD_COMMAND       ${CMAKE_COMMAND} -E env "ONNXEXT_BUNDLE_PROTOBUF=${ONNXEXT_BUNDLE_PB}"
+                        sh ${ONNXEXT_DIR}/rampart-build-ext.sh ${CMAKE_BINARY_DIR}/extern/onnxruntime-extensions
+    INSTALL_COMMAND     ""
+    BUILD_BYPRODUCTS    ${ONNXEXT_OBJ}
+    USES_TERMINAL_BUILD ON
+)
+endif()  # NOT ONNX_GPU: extensions build (module-only dependency)
+
+if(ONNX_GPU)
+  # UNIFIED-MODULE SCHEME: a GPU (cu12/cu13) build no longer produces a
+  # rampart-onnx module at all.  The ONE rampart-onnx.so (built by the cpu
+  # flavors, static CPU ORT inside) dlopens this flavor's runtime at first use
+  # if it finds modules/onnx-${SUFFIX}/ beside itself (see onnx_shim.cc's
+  # selection ladder: env override > driver version > sm.list > built-in CPU).
+  # So here we only build the shared ORT core + CUDA providers and install
+  # them, with upstream filenames intact (ORT dlopens the providers by
+  # hardcoded name from the core's own dir), into the flavor subdir --
+  # which is what lets cu12 and cu13 COEXIST in one modules/ directory.
+  set(ONNX_LIBS "")
+  set(ONNX_RUNTIME_DIR_NAME "onnx-${SUFFIX}")
+  # sm.list: the -real arches baked into this runtime's CUDA kernels; the
+  # selection ladder prefers a runtime whose list contains the device's exact
+  # compute capability (miss = demoted, not rejected: ORT's PTX may JIT).
+  # (Install rules for the runtime dir live in CMakeLists.txt -- RP_PATH is
+  # not known yet when this file is included.)
+  set(_sm_entries "")
+  foreach(_a IN LISTS ONNX_CUDA_ARCH)
+    string(REGEX REPLACE "-real$" "" _a2 "${_a}")
+    if(NOT _a2 MATCHES "-virtual$")
+      string(REGEX REPLACE "[^0-9]" "" _a3 "${_a2}")   # 120a -> 120
+      if(_a3)
+        list(APPEND _sm_entries "${_a3}")
+      endif()
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES _sm_entries)
+  string(REPLACE ";" " " ONNX_SM_LIST "${_sm_entries}")
+  message(STATUS "rampart-onnx: GPU flavor -> runtime dir ${ONNX_RUNTIME_DIR_NAME} (sm: ${ONNX_SM_LIST}); the module itself comes from the cpu flavor")
+else()
+  # CPU: ORT is statically linked into rampart-onnx.so -- no runtime libonnxruntime.so,
+  # nothing extra to install/rpath. --whole-archive the core so its CPU provider/kernel
+  # static initializers survive; deps archive is normal-linked. -Bsymbolic-functions
+  # (top-level) keeps ORT's bundled protobuf/abseil from clashing with other modules'.
+  if(APPLE)
+    # Apple ld: -force_load,<archive> == --whole-archive for one archive; no librt.
+    # CoreML + Foundation: the statically-linked CoreML EP (rampart-build-cpu.sh
+    # passes --use_coreml on Darwin) is Objective-C++ against those frameworks.
+    set(ONNX_LIBS
+        "-Wl,-force_load,${ONNX_CORE_A}"
+        ${ONNX_DEPS_A}
+        ${ONNXEXT_OBJ}
+        "-framework CoreML"
+        "-framework Foundation"
+        -ldl -lpthread
+    )
+  else()
+    set(ONNX_LIBS
+        -Wl,--whole-archive ${ONNX_CORE_A} -Wl,--no-whole-archive
+        ${ONNX_DEPS_A}
+        ${ONNXEXT_OBJ}
+        -ldl -lrt -lpthread
+    )
+  endif()
+endif()
+
+# C++ shim fronting the ORT C API (keeps rampart-onnx.c pure C). The vendored ORT
+# headers exist at configure time, so this compiles without waiting on the ORT
+# build; only the final rampart-onnx link needs libonnxruntime.so. Mirrors
+# llama_gen_shim_obj.
+if(NOT ONNX_GPU)
+add_library(onnx_shim_obj OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern/onnxruntime/wrapper/onnx_shim.cc)
+set_target_properties(onnx_shim_obj PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+)
+target_include_directories(onnx_shim_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern/onnxruntime/wrapper
+    ${ONNX_INCLUDE_DIRS}
+    ${ONNXEXT_INCLUDE_DIRS}
+)
+# Extensions' bert_tokenizer.hpp transitively includes onnxruntime_c_api.h; it
+# resolves to OUR vendored 1.27 header (ONNX_INCLUDE_DIRS, listed first) -- the
+# C API is backward-compatible and the BertTokenizer class layout is ORT-version
+# independent (no OrtApi types in its members).
+target_compile_definitions(onnx_shim_obj PRIVATE RAMPART_ONNX_EXT=1)
+endif()  # NOT ONNX_GPU: extensions + shim + module link libs (cpu flavors only)
+endif()  # LT_ONNX

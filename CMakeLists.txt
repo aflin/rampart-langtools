@@ -47,23 +47,30 @@ endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/extern/extern.cmake)
 
-find_program(RAMPART_EXECUTABLE rampart)
-if(NOT RAMPART_EXECUTABLE)
-  message(FATAL_ERROR "rampart not found in PATH")
+# Resolve rampart's install prefix (its process.installPath; modules install to
+# <prefix>/modules, headers come from <prefix>/include).  Normally we ask the rampart
+# binary, but the cross-glibc ovens can't: they mount the host's rampart install into
+# an OLDER-glibc manylinux container, and a rampart built against a newer glibc than
+# the container provides won't even execute there ("/lib64/libc.so.6: version
+# GLIBC_2.xx not found").  The oven already knows the prefix, so it passes
+# -DRP_PATH=<prefix> to skip running the binary entirely.
+if(NOT RP_PATH)
+  find_program(RAMPART_EXECUTABLE rampart)
+  if(NOT RAMPART_EXECUTABLE)
+    message(FATAL_ERROR "rampart not found in PATH (or pass -DRP_PATH=<rampart install prefix>)")
+  endif()
+  execute_process(
+    COMMAND ${RAMPART_EXECUTABLE} -c "console.log(process.installPath)"
+    RESULT_VARIABLE _res
+    OUTPUT_VARIABLE RP_PATH
+    ERROR_VARIABLE  _err
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  if(NOT _res EQUAL 0)
+    message(FATAL_ERROR "rampart get installPath failed: ${_err}")
+  endif()
 endif()
-
-# Get the install path of rampart
-execute_process(
-  COMMAND ${RAMPART_EXECUTABLE} -c "console.log(process.installPath)"
-  RESULT_VARIABLE _res
-  OUTPUT_VARIABLE RP_PATH
-  ERROR_VARIABLE  _err
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-
-if(NOT _res EQUAL 0)
-  message(FATAL_ERROR "rampart get installPath failed: ${_err}")
-endif()
+message(STATUS "rampart install prefix (RP_PATH) = ${RP_PATH}")
 
 
 include_directories(
@@ -202,12 +209,16 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 add_library(rampart-langtools SHARED
     faiss_detect.cpp
     rampart-langtools.c
+    rp-chunker.c
+    rp-embed-cache.c
     $<TARGET_OBJECTS:llama_gen_shim_obj>
 )
 
 # llama.cpp
 add_library(rampart-llamacpp SHARED
     rampart-llamacpp.c
+    rp-chunker.c
+    rp-embed-cache.c
     $<TARGET_OBJECTS:llama_gen_shim_obj>
 )
 
@@ -681,10 +692,109 @@ install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llam
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-faiss${LT_NAME_SUFFIX}.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-sentencepiece.so\")")
 
+# rampart-models: pure-JS model downloader/locator (single file, embedded
+# catalog).  Installed into modules/ so `require('rampart-models')` works.
+install(FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/rampart-models.js"
+  DESTINATION "${RP_PATH}/modules"
+)
+
 # test scripts, runnable from the install tree (e.g. rampart ${RP_PATH}/test/llamacpp-test.js)
 install(FILES
   "${CMAKE_CURRENT_SOURCE_DIR}/llamacpp-test.js"
   "${CMAKE_CURRENT_SOURCE_DIR}/faiss-test.js"
   DESTINATION "${RP_PATH}/test"
 )
+
+# ===========================================================================
+# rampart-onnx : ONNX Runtime bindings. extern.cmake defines the `onnxruntime`
+# IMPORTED target (+ ONNX_LIBS / ONNX_INCLUDE_DIRS / ONNXRUNTIME_LIB_DIR), the
+# onnx_shim_obj object lib, and the onnxruntime_ep ExternalProject that actually
+# builds libonnxruntime.so. We depend on onnxruntime_ep so a plain `make` builds
+# ORT first, then links it here. Self-contained block, out of the per-dep
+# plumbing above.
+# ===========================================================================
+if(ONNX_LIBS)
+  add_library(rampart-onnx SHARED
+    rampart-onnx.c
+    rp-chunker.c
+    rp-embed-cache.c
+    $<TARGET_OBJECTS:onnx_shim_obj>
+  )
+  # build + merge the ORT static archives (ExternalProject) before linking,
+  # plus the extensions tokenizers object (onnxext_ep -> onnxext_all.o)
+  add_dependencies(rampart-onnx onnxruntime_ep onnxext_ep)
+  # rampart-onnx.c only needs onnx_shim.h + rampart.h; the shim object already
+  # carries the ORT headers.  The sentencepiece wrapper header is header-only
+  # and used by the rp_onnx_embed_* C API to declare spm_processor_t; the
+  # actual SPM symbols are dlsym'd at runtime from rampart-sentencepiece.
+  target_include_directories(rampart-onnx PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern/onnxruntime/wrapper
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern/sentencepiece/wrapper
+  )
+  # ONE unsuffixed module for every flavor/tier: it contains a full static CPU
+  # ORT and dlopens an OPTIONAL modules/onnx-cuNN/ runtime dir at first use
+  # (absolute path via dladdr -- no $ORIGIN rpath needed for that).
+  set(ONNX_RPATH "${LT_RPATH}")
+  set_target_properties(rampart-onnx PROPERTIES
+    SUFFIX ".so"
+    PREFIX ""
+    OUTPUT_NAME "rampart-onnx"
+    INSTALL_RPATH "${ONNX_RPATH}"
+    BUILD_RPATH   "${ONNX_RPATH}"
+  )
+  if(APPLE)
+    # macOS equivalent of the version script: export only the module entry point
+    # so the statically-linked ORT (protobuf/abseil/onnx) stays private and can't
+    # clash with other modules' bundled copies.
+    target_link_options(rampart-onnx PRIVATE
+      "-Wl,-headerpad_max_install_names"
+      "-Wl,-undefined,dynamic_lookup"
+      "-Wl,-install_name,@rpath/rampart-onnx.so"
+      "-Wl,-exported_symbol,_duk_open_module"
+      # the C embed API (dlsym'd by rampart-sql) -- mirrors rampart-onnx.map
+      "-Wl,-exported_symbol,_rp_onnx_embed_*"
+    )
+  else()
+    # Localize all of statically-linked ORT's symbols (bundled protobuf/abseil/
+    # onnx/...) -- export only duk_open_module -- so they don't collide via
+    # RTLD_GLOBAL with other modules' bundled deps (see rampart-onnx.map).
+    target_link_options(rampart-onnx PRIVATE
+      "-Wl,-soname,@rpath/rampart-onnx.so"
+      "-Wl,-Bsymbolic-functions"
+      "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/rampart-onnx.map"
+      # ORT's MLAS .S objects lack .note.GNU-stack; force a non-executable stack.
+      "-Wl,-z,noexecstack"
+      # Statically-linked ORT registers static-dtor exit handlers whose code lives
+      # in this .so. Mark it non-unloadable so rampart's dlclose can't unmap it
+      # before libc runs those handlers at exit -- otherwise __run_exit_handlers
+      # jumps into freed text and segfaults (manifested on the glibc-2.17 runtime).
+      "-Wl,-z,nodelete"
+    )
+  endif()
+  target_link_libraries(rampart-onnx PRIVATE
+    ${ONNX_LIBS}
+    stdc++
+  )
+  install(TARGETS rampart-onnx DESTINATION "${RP_PATH}/modules")
+  install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-onnx.so\")")
+  install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/onnx-test.js"
+    DESTINATION "${RP_PATH}/test")
+  message(STATUS "rampart-langtools: rampart-onnx target enabled")
+elseif(ONNX_GPU)
+  # GPU (cu12/cu13) flavor: no module -- install this flavor's ORT runtime dir
+  # (modules/onnx-${SUFFIX}/) for the unified rampart-onnx.so to dlopen.
+  # FOLLOW_SYMLINK_CHAIN installs exactly the .so -> .so.1 -> .so.1.27.0 chain;
+  # providers keep their upstream names (ORT dlopens them by hardcoded name
+  # from the core's own dir), which is what lets cu12 + cu13 COEXIST.
+  install(CODE "file(INSTALL \"${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so\"
+                     DESTINATION \"${RP_PATH}/modules/${ONNX_RUNTIME_DIR_NAME}\" FOLLOW_SYMLINK_CHAIN)")
+  install(FILES ${ONNX_PROVIDERS_SHARED} ${ONNX_PROVIDERS_CUDA}
+          DESTINATION "${RP_PATH}/modules/${ONNX_RUNTIME_DIR_NAME}")
+  install(CODE "file(WRITE \"${RP_PATH}/modules/${ONNX_RUNTIME_DIR_NAME}/sm.list\" \"${ONNX_SM_LIST}\n\")")
+  message(STATUS "rampart-langtools: rampart-onnx GPU runtime dir ${ONNX_RUNTIME_DIR_NAME} (sm: ${ONNX_SM_LIST})")
+else()
+  message(STATUS "rampart-langtools: rampart-onnx skipped (ONNX Runtime not built)")
+endif()
 

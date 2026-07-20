@@ -1,0 +1,74 @@
+<?xml version='1.0' encoding='utf-8'?>
+<package>
+  <metadata>
+    <id>Microsoft.ML.OnnxRuntime.Extensions</id>
+    <version>0.8.0</version>
+    <authors>Microsoft</authors>
+    <owners>Microsoft</owners>
+    <description>ONNX Runtime Extensions NuGet Package</description>
+    <releaseNotes>
+      1. NuGet package for the .NET platform. This package offers comprehensive platform support, including Windows, Linux, MacOS, Android, and iOS. Both x64 and arm64 architectures are supported, where applicable.
+      2. Support for pre-processing and post-processing of the Whisper model, inclusive of Audio and Tokenizer decoding operators.
+      3. Extends support for pre-processing and post-processing of object-detection models, including a new DrawBoundingBoxes operator. Pre/post processing tools can add non-max-suppression to the model to select the best bounding boxes, and scale those to the original image. See the end-to-end example in yolo_e2e.py.
+      4. Introduces the Audio Domain, complemented with AudioCodec and optimized STFT Operators, enhancing audio processing capabilities.
+      5. Enabled optional input/output support for some operators such as GPT2Tokenizer, CLIPTokenizer, and RobertaTokenizer.
+      6. Refined the implementation of offset mapping for BBPE-style tokenizers for more operators and efficiency improvement.
+      7. Other bug and security fixes.
+	</releaseNotes>
+    <copyright>© Microsoft Corporation. All rights reserved.</copyright>
+    <tags>ONNX ONNXRuntime AI Machine Learning</tags>
+    <icon>ORT_icon_for_light_bg.png</icon>
+    <license type="file">LICENSE.txt</license>
+    <readme>README.md</readme>
+    <projectUrl>https://github.com/Microsoft/onnxruntime-extensions</projectUrl>
+    <repository type="git" url="https://github.com/Microsoft/onnxruntime-extensions.git" commit="COMMIT_ID" />
+  </metadata>
+  <files>
+    <file src="LICENSE.txt" target="LICENSE.txt" />
+    <file src="README.md" target="README.md" />
+    <file src="ORT_icon_for_light_bg.png" target="ORT_icon_for_light_bg.png" />
+    <file src="..\ThirdPartyNotices.txt" target="ThirdPartyNotices.txt" />
+    <!--
+      NOTE: If you wish to create a local nuget package for testing, update the relevant src paths below
+      to point to the local build you wish to test, and comment out the entries for any platforms you don't
+      need in the nuget package.
+      Run `nuget pack NativeNuget.nuspec` from this directory to produce the package for local testing.
+    -->
+    <!-- Windows and Linux via netstandard -->
+    <file src="..\nuget-artifacts\onnxruntime-extensions-win-x64\lib\ortextensions.dll" target="runtimes\win-x64\native" />
+    <file src="..\nuget-artifacts\onnxruntime-extensions-win-x64\lib\ortextensions.lib" target="runtimes\win-x64\native" />
+    <file src="..\nuget-artifacts\onnxruntime-extensions-win-x86\lib\ortextensions.dll" target="runtimes\win-x86\native" />
+    <file src="..\nuget-artifacts\onnxruntime-extensions-win-x86\lib\ortextensions.lib" target="runtimes\win-x86\native" />
+    <file src="..\nuget-artifacts\onnxruntime-extensions-win-arm64\lib\ortextensions.dll" target="runtimes\win-arm64\native" />
+    <file src="..\nuget-artifacts\onnxruntime-extensions-win-arm64\lib\ortextensions.lib" target="runtimes\win-arm64\native" />
+    <file src="..\nuget-artifacts\onnxruntime-extensions-linux-aarch64\lib\libortextensions.so" target="runtimes\linux-arm64\native" />
+    <file src="..\nuget-artifacts\onnxruntime-extensions-linux-x64\lib\libortextensions.so" target="runtimes\linux-x64\native" />
+    <!-- Include headers for native C++ development -->
+    <file src="..\nuget-artifacts\onnxruntime-extensions-win-x64\include\**\*.*" target="build\native\include" />
+    <file src="targets\netstandard\Microsoft.ML.OnnxRuntime.Extensions.props" target="build\netstandard1.1" />
+    <file src="targets\netstandard\Microsoft.ML.OnnxRuntime.Extensions.props" target="build\netstandard2.0" />
+    <file src="targets\netstandard\Microsoft.ML.OnnxRuntime.Extensions.targets" target="build\netstandard1.1" />
+    <file src="targets\netstandard\Microsoft.ML.OnnxRuntime.Extensions.targets" target="build\netstandard2.0" />
+    <!-- Android via Xamarin/MAUI -->
+    <file src="..\nuget-artifacts\onnxruntime-extensions-android\onnxruntime-extensions.aar" target="runtimes\android\native" />
+    <file src="targets\monoandroid11.0\Microsoft.ML.OnnxRuntime.Extensions.targets" target="build\monoandroid11.0" />
+    <file src="targets\monoandroid11.0\Microsoft.ML.OnnxRuntime.Extensions.targets" target="buildTransitive\monoandroid11.0" />
+    <file src="targets\net6.0-android\Microsoft.ML.OnnxRuntime.Extensions.targets" target="build\net6.0-android31.0" />
+    <file src="targets\net6.0-android\Microsoft.ML.OnnxRuntime.Extensions.targets" target="buildTransitive\net6.0-android31.0" />
+    <!-- iOS via Xamarin/MAUI. -->
+    <file src="..\nuget-artifacts\onnxruntime_extensions.xcframework.zip" target="runtimes\ios\native\" />
+    <file src="targets\xamarinios10\Microsoft.ML.OnnxRuntime.Extensions.targets" target="build\xamarinios10" />
+    <file src="targets\xamarinios10\Microsoft.ML.OnnxRuntime.Extensions.targets" target="buildTransitive\xamarinios10" />
+    <file src="targets\net6.0-ios\Microsoft.ML.OnnxRuntime.Extensions.targets" target="build\net6.0-ios15.4" />
+    <file src="targets\net6.0-ios\Microsoft.ML.OnnxRuntime.Extensions.targets" target="buildTransitive\net6.0-ios15.4" />
+    <!-- .net 6 macOS -->
+    <file src="..\nuget-artifacts\onnxruntime-extensions-osx-x86_64\lib\libortextensions.dylib" target="runtimes\osx.10.14-x64\native" />
+    <file src="..\nuget-artifacts\onnxruntime-extensions-osx-arm64\lib\libortextensions.dylib" target="runtimes\osx.10.14-arm64\native"/>
+    
+    <file src="targets\net6.0-macos\Microsoft.ML.OnnxRuntime.Extensions.targets" target="build\net6.0-macos12.3" />
+    <file src="targets\net6.0-macos\Microsoft.ML.OnnxRuntime.Extensions.targets" target="buildTransitive\net6.0-macos12.3" />
+    <!-- .net 6 macCatalyst -->
+    <file src="targets\net6.0-maccatalyst\_._" target="build\net6.0-maccatalyst14.0" />
+    <file src="targets\net6.0-maccatalyst\_._" target="buildTransitive\net6.0-maccatalyst14.0" />
+  </files>
+</package>

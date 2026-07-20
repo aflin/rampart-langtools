@@ -10,7 +10,6 @@
  *   rampart llamacpp-test.js
  */
 rampart.globalize(rampart.utils);
-load.curl;
 
 /* locate rampart-llamacpp.so, in order:
    1) build/  2) build_gpu/  3) build_cpu/  (local builds, relative to this script)
@@ -35,27 +34,20 @@ function loadModule() {
 }
 var llamacpp = loadModule();
 
-/* ---- models: downloaded under ~/.rampart/models/<category>/, src on HuggingFace
-   (standard, reusable location so demos and other tools can find them) -------- */
-var MODELROOT = (process.env.HOME || '/tmp') + '/.rampart/models';
+/* ---- models: located + fetched via rampart-models.js (gguf), cached under
+   ~/.rampart/models/<category>/ (standard, reusable location so demos and other
+   tools find them).  rampart-models.js is beside this script in the source tree,
+   or an installed module (modules/rampart-models.js) from the install tree. --- */
+function loadModels() {
+    var sp = process.scriptPath;
+    try { return require(sp + '/rampart-models.js'); }
+    catch (e) { try { return require('rampart-models'); } catch (e2) { return null; } }
+}
+var models = loadModels();
 var MODELS = {
-    embed: {
-        name: 'all-minilm-l6-v2_f16.gguf',
-        dir:  MODELROOT + '/embed',
-        url:  'https://huggingface.co/leliuga/all-MiniLM-L6-v2-GGUF/resolve/main/all-MiniLM-L6-v2.F16.gguf',
-        size: '~45 MB',
-        what: 'embedding test'
-    },
-    gen: {
-        name: 'qwen2.5-0.5b-instruct-q4_k_m.gguf',
-        dir:  MODELROOT + '/gen',
-        url:  'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf',
-        size: '~470 MB',
-        what: 'generation / inference test'
-    }
+    embed: { name: 'all-minilm-l6-v2',      quant: 'F16',    what: 'embedding test' },
+    gen:   { name: 'qwen2.5-0.5b-instruct', quant: 'Q4_K_M', what: 'generation / inference test' }
 };
-/* full destination path for each model */
-for (var _k in MODELS) MODELS[_k].file = MODELS[_k].dir + '/' + MODELS[_k].name;
 
 /* ================================================================
    test harness (modeled on rampart-iroh/iroh-test.js)
@@ -81,7 +73,7 @@ function testFeature(name, test) {
 }
 
 /* ================================================================
-   ask + download (synchronous curl.fetch; progress per downloadLangDeriv.js)
+   ask + obtain (download delegated to rampart-models.js)
    ================================================================ */
 function ask(question) {
     printf("%s", question);
@@ -89,58 +81,25 @@ function ask(question) {
     return fgets(stdin, 255).trim().toLowerCase();
 }
 
-/* Return the model path if available (already on disk or downloaded), else null
-   if the user declined or the download failed. */
+/* Return the model file path (fetching it via rampart-models.js if absent, with
+   a y/N confirm and rampart-models' own progress display), or null if the module
+   is missing, the user declines, or the fetch fails.  A model already on disk
+   resolves straight through -- the confirm hook fires only for a real download. */
 function obtain(m) {
-    var st = stat(m.file);
-    if (st && st.size > 0) {
-        printf("  using existing %s\n", m.file);
-        return m.file;
-    }
-
-    var r = ask(sprintf("Download %s (%s) for the %s?\n  It will be saved to %s  [y/N]: ",
-                        m.name, m.size, m.what, m.file));
-    if (r !== 'y' && r !== 'yes') return null;
-
-    printf("Downloading %s\n  -> %s\n", m.url, m.file);
-    try { mkdir(m.dir); } catch(e) {}   // ensure ~/.rampart/models/<cat>/ exists (mkdir creates parents)
-    var f = fopen(m.file, 'w+');
-    var nchunks = 0, status = -1;
+    if (!models) { printf("  rampart-models.js not found; skipping %s\n", m.name); return null; }
     try {
-        /* synchronous (blocking) fetch; chunkCallback streams the body to disk.
-           A normal `callback` is required whenever chunkCallback is used — fetch
-           still blocks, the callback just delivers the final result. */
-        curl.fetch(m.url, {
-            location:     true,    // follow HF redirect to the CDN
-            returnText:   false,
-            skipFinalRes: true,    // don't buffer the whole file in memory
-            chunkCallback: function(res) { f.fprintf('%s', res.body); },
-            progressCallback: function(res) {
-                if (nchunks++ % 30) return;
-                var tot = res.progress, rate = tot / (res.totalTime * 1024), unit = "KB/s";
-                if (rate > 1024) { rate /= 1024; unit = "MB/s"; }
-                if (res.expectedTotal != -1)
-                    printf("\r    %.1f%%  %d / %d bytes  (%.2f %s)   ",
-                           100 * tot / res.expectedTotal, tot, res.expectedTotal, rate, unit);
-                else
-                    printf("\r    %d bytes  (%.2f %s)   ", tot, rate, unit);
-                fflush(stdout);
-            },
-            callback: function(res) { status = res.status; }
+        return models.ggufGet(m.name, {
+            quant: m.quant,
+            confirm: function(info) {
+                var r = ask(sprintf("Download %s (%s) for the %s?\n  -> %s  [y/N]: ",
+                                    info.name, info.size, m.what, info.dest));
+                return r === 'y' || r === 'yes';
+            }
         });
     } catch(e) {
-        f.fclose();
-        printf("\n  download error: %s\n", e.message || e);
+        printf("  fetch failed: %s\n", e.message || e);
         return null;
     }
-    f.fclose();
-    var st2 = stat(m.file);
-    if (!st2 || st2.size === 0) {
-        printf("\n  download produced no data (status %d)\n", status);
-        return null;
-    }
-    printf("\r    done: %d bytes%20s\n", st2.size, "");
-    return m.file;
 }
 
 /* ================================================================

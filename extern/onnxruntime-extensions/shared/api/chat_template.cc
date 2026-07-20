@@ -1,0 +1,505 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "tokenizer_impl.h"
+namespace ort_extensions {
+
+OrtxStatus TokenizerImpl::LoadChatTemplate() {
+  // Load the chat template from the tokenizer configuration
+  chat_template = (tok_config_->tokenizer_class_ == "WhisperTokenizer") ? R"({{ messages | map(attribute='content') | join('\n') }})" : tok_config_->chat_template_;
+  if (chat_template.size()) {
+    try {
+      chat_template_root_ = minja::Parser::parse(chat_template, {});
+    } catch (const std::runtime_error&) {
+      return OrtxStatus(kOrtxOK, "Warning: The chat template for this model is not yet supported, trying to apply chat template will cause an error.");
+    }
+  }
+
+  return OrtxStatus(kOrtxOK, "Loaded chat template.");
+}
+
+TokenizerImpl::MessageList TokenizerImpl::ParseJson(const std::string& json_str) {
+  nlohmann::ordered_json json_obj = nlohmann::json::parse(json_str, nullptr, false, true);
+  // Check if the parsed JSON is an array
+  if (!json_obj.is_array()) {
+    return {};
+  }
+  // Create a vector to hold the parsed messages
+  MessageList messages;
+  for (const auto& message : json_obj) {
+    // Check if the message is an object
+    if (!message.is_object()) {
+      return {};
+    }
+    // Add the message to the vector
+    auto msg = message.get<std::unordered_map<std::string, nlohmann::ordered_json>>();
+    // convert msg to a string-string map
+    std::unordered_map<std::string, std::string> msg_str;
+    for (const auto& [key, value] : msg) {
+      std::string value_str = value.dump();
+      // remove the quotes from the string
+      if (value_str.size() > 1 && value_str[0] == '"' && value_str[value_str.size() - 1] == '"') {
+        value_str.erase(0, 1);
+        value_str.erase(value_str.size() - 1, 1);
+      }
+      msg_str[key] = value_str;
+    }
+    messages.push_back(msg_str);
+  }
+
+  return messages;
+}
+
+void TokenizerImpl::InitializeChatParameters(const char* template_str,
+                                             const std::vector<std::string>& custom_tools_param,
+                                             bool tools_in_user_message_param, const std::string& strftime_param,
+                                             const std::string& date_str,
+                                             const std::vector<std::string>& builtin_tools_param) {
+  // Initialize parameters with provided or default values
+  custom_tools = custom_tools_param;
+  tools_in_user_message = tools_in_user_message_param;
+  strftime_now = strftime_param;
+  date_string = date_str;
+  builtin_tools = builtin_tools_param;
+
+  bos_token = tok_config_->bos_token_;
+  eos_token = tok_config_->eos_token_;
+  if (template_str && *template_str) {
+    chat_template = template_str;
+  } else {
+    chat_template = tok_config_->chat_template_;
+  }
+}
+
+// This chat template implementation uses a Minja engine, a lightweight Jinja implementation in C++,
+// hence it does not automatically support built-in filters or custom functions unless they are provided.
+// We can thereby write common functions such as strftime_now here.
+
+minja::Value strftime_function(const std::shared_ptr<minja::Context>&, minja::ArgumentsValue& args) {
+    std::string format = "%Y-%m-%d";
+
+    if (args.has_named("format") && args.get_named("format").is_string()) {
+        format = args.get_named("format").to_str();
+    } else if (!args.args.empty() && args.args[0].is_string()) {
+        format = args.args[0].to_str();
+    }
+
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+
+    std::tm tm;
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+
+    char buf[100];
+    if (std::strftime(buf, sizeof(buf), format.c_str(), &tm)) {
+        return minja::Value(std::string(buf));
+    }
+    return minja::Value("");
+}
+
+/*
+
+ConvertParameters
+--------------------------------------------------------------------------
+Converts an OpenAI-style "parameters" object into the Minja/Phi-4 expected
+format for tools.
+
+OpenAI tool/function definitions typically follow this JSON schema structure:
+
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "param_name": {
+        "type": "string",
+        "description": "..."
+      },
+      ...
+    },
+    "required": ["param_name", ...]
+  }
+
+But Minja/Phi-4 templates expect a simpler object mapping directly from
+parameter names to their type/description:
+
+  "parameters": {
+    "param_name": {
+      "type": "string",
+      "description": "..."
+    }
+  }
+
+This function detects the OpenAI "type":"object" pattern and flattens it
+accordingly. If the parameters are already in the expected format, they are
+returned as-is.
+
+*/
+static json ConvertParameters(const json& parameters) {
+  json out_params = json::object();
+
+  // If already in normalized style, simply return as-is
+  // Else normalize OpenAI style: e.g. {"type":"object","properties":{...},"required":[...]}
+  if (parameters.is_object() && parameters.contains("properties")) {
+    for (auto& [prop_name, prop_schema] : parameters.at("properties").items()) {
+      json param_entry = json::object();
+      
+      if (prop_schema.contains("type")) {
+        // Per the OpenAI spec, the "type" field in a property schema is any valid JSON value:
+        // a string (e.g. "string"), an array (e.g. ["string", "null"]), an object, etc.
+        const auto& type_val = prop_schema["type"];
+
+        if (type_val.is_string()) {
+          // Simple string type — normalize "string" to "str"
+          std::string type = type_val.get<std::string>();
+          param_entry["type"] = (type == "string") ? "str" : type;
+        } else if (type_val.is_array()) {
+          // Array of types (e.g. ["string", "null"]) — extract the first non-null type
+          std::string type;
+          for (const auto& t : type_val) {
+            if (t.is_string() && t.get<std::string>() != "null") {
+              type = t.get<std::string>();
+              break;
+            }
+          }
+          if (type.empty()) {
+            type = "null";
+          }
+          param_entry["type"] = (type == "string") ? "str" : type;
+        } else {
+          // Any other JSON value (object, number, bool, etc.) — pass through as-is
+          param_entry["type"] = type_val;
+        }
+      }
+
+      if (prop_schema.contains("description")) {
+        param_entry["description"] = prop_schema["description"];
+      }
+
+      out_params[prop_name] = param_entry;
+    }
+  } else {
+    // Already in Minja style (e.g. Phi-4), just return
+    out_params = parameters;
+  }
+
+  return out_params;
+}
+
+/*
+
+NormalizeTools
+--------------------------------------------------------------------------
+Accepts a raw JSON string representing an array of tool definitions, and
+normalizes them into a unified format that the Minja engine can render.
+
+This is required because OpenAI and Phi-4 define tools slightly differently.
+
+Specifically, our chat template engine now handles three formats:
+
+1. Phi-4 / Minja format (already normalized):
+   [
+     {
+       "name": "get_horoscope",
+       "description": "...",
+       "parameters": { ... }
+     }
+   ]
+
+2. OpenAI "type": "tool" format:
+   [
+     {
+       "type": "tool",
+       "name": "get_horoscope",
+       "description": "...",
+       "parameters": {
+         "type": "object",
+         "properties": {
+           "sign": { "type": "string" }
+         }
+       }
+     }
+   ]
+
+   → normalized by flattening "parameters" through ConvertParameters.
+
+3. OpenAI "type": "function" format with a "function" sub-object:
+   [
+     {
+       "type": "function",
+       "function": {
+         "name": "get_weather",
+         "description": "...",
+         "parameters": {
+           "type": "object",
+           "properties": {
+             "location": { "type": "string" }
+           }
+         }
+       }
+     }
+   ]
+
+   → normalized by unwrapping the "function" field, then flattening parameters.
+
+By performing this normalization once at chat template application time,
+the rest of the templating logic (Minja, chat templates, etc.) can treat all
+tool arrays uniformly — without special-casing OpenAI or Phi-4 formats.
+
+Example:
+
+Input (OpenAI function format):
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "...",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "location": { "type": "string" }
+        }
+      }
+    }
+  }
+]
+
+Output (normalized):
+[
+  {
+    "name": "get_weather",
+    "description": "...",
+    "parameters": {
+      "location": { "type": "string" }
+    }
+  }
+]
+
+*/
+static json NormalizeTools(const char* tools_str) {
+  if (!tools_str || *tools_str == '\0') {
+    return json::array();
+  }
+
+  json raw_tools = json::parse(tools_str);
+  json normalized = json::array();
+
+  for (auto& tool : raw_tools) {
+    json norm_tool = json::object();
+
+    // OpenAI type:function
+    if (tool.contains("type") && tool["type"] == "function" && tool.contains("function")) {
+      const json& fn = tool["function"];
+      norm_tool["name"] = fn.value("name", "");
+      norm_tool["description"] = fn.value("description", "");
+      if (fn.contains("parameters")) {
+        norm_tool["parameters"] = ConvertParameters(fn["parameters"]);
+      } else {
+        norm_tool["parameters"] = json::object();
+      }
+
+    // OpenAI type:tool (e.g. {"type":"tool","name":...})
+    } else if (tool.contains("type") && tool["type"] == "tool") {
+      norm_tool["name"] = tool.value("name", "");
+      norm_tool["description"] = tool.value("description", "");
+      if (tool.contains("parameters")) {
+        norm_tool["parameters"] = ConvertParameters(tool["parameters"]);
+      } else {
+        norm_tool["parameters"] = json::object();
+      }
+
+    // Already normalized (Minja/Phi-4 style)
+    } else {
+      norm_tool = tool;
+    }
+
+    normalized.push_back(norm_tool);
+  }
+
+  return normalized;
+}
+
+/*
+ * This function normalizes quotes in tool-related strings within the input message. This normalization is crucial for
+ * ensuring consistent JSON serialization and deserialization when working with tool calls. Specifically, the function
+ * helps avoid differences between `json::dump` and `json::parse` behavior, which can occur when single quotes are used
+ * incorrectly in tools. This also leads to missing initial tool tag tokens (<|tool_call|>) during inference.
+ *
+ * In the case of Phi-4, when tools are embedded within messages, Minja's handling of tools within the message body
+ * (instead of treating them as separate input keys/values) can lead to issues with the serialization process. For instance,
+ * `json::dump` might escape single quotes, but `json::parse` might not interpret them correctly, resulting in inconsistent
+ * output when processing tools as part of a message.
+ *
+ * To mitigate this, the function scans through the string and normalizes single quotes to double quotes in the context
+ * of tool calls. This ensures that tool keys and values are serialized consistently, and the tool call context remains
+ * intact. The function specifically looks for single quotes that are preceded or followed by specific characters
+ * (such as '{', ':', ' ', or ',') which typically indicate the presence of tool keys and values.
+ *
+ * Parameters:
+ * - input (const std::string&): The input string containing single quotes that may need to be normalized.
+ *
+ * Returns:
+ * - std::string: A new string where appropriate single quotes are replaced by double quotes.
+ *
+ * Example:
+ * - If the input string is "{'key': 'value'}", the function will return "{\"key\": \"value\"}".
+ */
+std::string normalize_tool_quotes(const std::string& input) {
+    std::string output = input;
+    size_t length = output.size();
+
+    // Iterate through the string
+    for (size_t i = 0; i < length; ++i) {
+        // Look for single quotes preceded or followed by specific characters for tool calls
+        if (output[i] == '\'') {
+            bool replace = false;
+            char precede_char = (i > 0) ? output[i - 1] : '\0'; // Character before the single quote
+            char follow_char = (i < length - 1) ? output[i + 1] : '\0'; // Character after the single quote
+
+            // Check if the current single quote is in the right context
+            if ((precede_char == '{' || precede_char == ':' || precede_char == ' ' || precede_char == ',') || 
+                (follow_char == '}' || follow_char == ':' || follow_char == ' ' || follow_char == ',')) {
+                replace = true;
+            }
+
+            // Only replace if the condition is met
+            if (replace) {
+                output[i] = '\"';
+            }
+        }
+    }
+
+    return output;
+}
+
+OrtxStatus TokenizerImpl::ApplyChatTemplate(const char* template_str, const char* message, const char* tools,
+                                            std::string& output, std::vector<extTokenId_t>& ids_vec,
+                                            bool add_generation_prompt, bool tokenize) const {
+  OrtxStatus status;
+  std::string input_str = minja::normalize_newlines(message);
+
+  // Whisper does not have explicit chat template functionality.
+  // However, the expected logic (same for HF and OAI) should emulate concatenating message['content'],
+  // with no roles, separators, etc. We thereby automatically handle this in ORT Extensions as well.
+  auto activated_str = (tok_config_->tokenizer_class_ == "WhisperTokenizer") ? R"({{ messages | map(attribute='content') | join('\n') }})" : tok_config_->chat_template_.c_str();
+  
+  if (template_str && *template_str) {
+    activated_str = template_str;
+  }
+
+  if (*activated_str == '\0') {
+    return {kOrtxErrorInvalidArgument, "Empty chat template."};
+  }
+
+  // Parse the chat template with Minja (a C++ Jinja templating engine).
+  using json = nlohmann::ordered_json;
+  std::string text;
+  try {
+    json actual_messages = json::parse(input_str.c_str());
+    auto root = chat_template_root_;
+    if (activated_str == template_str) {
+      root = minja::Parser::parse(template_str, {});
+    }
+    if (root == nullptr) {
+      // Note that this will get caught in the "catch" where we return status.
+      throw std::runtime_error("Invalid or unsupported chat template.");
+    }
+
+    std::shared_ptr<minja::Context> context;
+
+    // Check Phi-4-mini tool call case for quote normalization
+    bool phi_4_mini = false;
+
+    // Determine whether to skip tool normalization based on template content.
+    // GPT-OSS/Harmony templates access `tool.function` directly (they expect the raw OpenAI format),
+    // so NormalizeTools() would break them by unwrapping the function object.
+    // Other templates (Phi-4, Qwen) either use a flat format or access `tool_call.function`.
+    bool skip_tool_normalization = false;
+    {
+      std::string tmpl_str(activated_str);
+      // Look for "tool.function" in the template (Harmony/GPT-OSS expects raw OpenAI tool objects).
+      skip_tool_normalization = tmpl_str.find("tool.function") != std::string::npos;
+    }
+
+    // Case 1: Check if tools are inside messages (for Phi-4-mini)
+    if (actual_messages.is_array()) {
+      for (auto& message_obj : actual_messages) {
+        if (message_obj.contains("tools")) {
+          // Set flag for Phi-4 tools to true
+          phi_4_mini = true;
+
+          if (skip_tool_normalization) {
+            // GPT-OSS/Harmony: parse tools as-is without normalization
+            const auto tools_text = message_obj["tools"].get<std::string>();
+            json tools_json = json::parse(tools_text, nullptr, /*allow_exceptions=*/false);
+            if (tools_json.is_discarded()) {
+              throw std::runtime_error("Invalid tools JSON.");
+            }
+            message_obj["tools"] = std::move(tools_json);
+          } else {
+            // Normalize the tools inside the message
+            json tools_json = NormalizeTools(message_obj["tools"].get<std::string>().c_str());
+            message_obj["tools"] = tools_json;
+          }
+        }
+      }
+    }
+
+    // Case 2: Check if we received tools separately (for Qwen or others)
+    if (tools && *tools) {
+      std::string tools_str = minja::normalize_newlines(tools);
+      json tools_json;
+      if (skip_tool_normalization) {
+        // GPT-OSS/Harmony: pass raw tools without normalization
+        tools_json = json::parse(tools_str, nullptr, /*allow_exceptions=*/false);
+        if (tools_json.is_discarded()) {
+          throw std::runtime_error("Invalid tools JSON.");
+        }
+      } else {
+        tools_json = NormalizeTools(tools_str.c_str());
+      }
+
+      // Add tools to the context
+      context = minja::Context::make(json({
+          {"messages", actual_messages},
+          {"tools", tools_json},
+          {"add_generation_prompt", add_generation_prompt},
+      }));
+    } else {
+      // No tools input, just use the messages
+      context = minja::Context::make(json({
+          {"messages", actual_messages},
+          {"add_generation_prompt", add_generation_prompt},
+      }));
+    }
+
+    // Set required context values
+    context->set("strftime_now", minja::Value::callable(strftime_function));
+    context->set("bos_token", tok_config_->bos_token_);
+    context->set("eos_token", tok_config_->eos_token_);
+
+    // Render the template
+    text = root->render(context);
+
+    // Normalize tool quotes (for tool keys and values) to avoid json::dump vs. json::parse differences
+    // which show up for Phi-4 due to Minja handling of tools within messages rather than as an added input.
+    output = phi_4_mini ? normalize_tool_quotes(text) : text;
+  } catch (const std::runtime_error& e) {
+    status = {kOrtxErrorInvalidArgument, e.what()};
+  }
+
+  if (!status.IsOk()) {
+    return status;
+  }
+
+  if (tokenize) {
+    status = std::visit([&](auto& tokenizer) { return tokenizer->ComputeNoOp(output, ids_vec, false); }, tokenizer_);
+  }
+
+  return status;
+}
+
+}  // namespace ort_extensions

@@ -57,6 +57,11 @@
 
 #define LANGTOOLS_MAIN_INCLUDE
 
+/* the amalgamated units skip their own includes (guard above), so provide
+ * the shared chunker header here for rampart-llamacpp.c's embed path */
+#include "rp-chunker.h"
+#include "rp-embed-cache.h"
+
 /* *******************************************************
                 LLAMACPP INCLUDE
    ******************************************************* */

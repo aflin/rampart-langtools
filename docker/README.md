@@ -1,112 +1,122 @@
 # rampart-langtools docker oven
 
-Builds the **langtools modules** (FAISS, llama.cpp, sentencepiece) for the
-portable `centos7-x86_64` target (glibc 2.17 floor) inside a self-contained
-[manylinux2014] "oven" container.
+Builds the **langtools modules** — `rampart-faiss`, `rampart-llamacpp`,
+`rampart-sentencepiece`, and `rampart-onnx` (ONNX Runtime) — as **portable,
+permissively-licensed `.so`s** inside [manylinux] "oven" containers. Building in
+an oven with an old glibc floor but a modern compiler means the result runs on
+that glibc and everything newer, without bundling CUDA, the NVIDIA driver, or any
+GPL runtime.
 
-There are **two images**, so a CPU build never has to download CUDA:
-- **`rampart-langtools-oven`** — the cpu/default base (devtoolset-11 + OpenBLAS, **no CUDA**).
-- **`rampart-langtools-oven-cuda`** — `FROM` the base + the CUDA 11.8 toolkit, built **only** when you ask for `cuda`.
-
-The base is self-contained on purpose (not `FROM` the core rampart oven): it
-builds its own OpenBLAS **once** at image-build time, then is reused — so an
-ordinary langtools change never rebuilds OpenBLAS.
-
-The rampart headers and binary are **not** baked in: `build.sh` bind-mounts the
-installed `/usr/local/rampart-ml`, and the build resolves `$RP_PATH` from
-`rampart -c "console.log(process.installPath)"`.
+> This is the concise operator overview. The deep "why + how + gotchas" companion
+> lives outside the committed tree (`no-commit/langtools-docker.md`); onnx
+> packaging specifics are in `extern/onnxruntime-vendoring.md`.
 
 ```
-docker/build.sh <stage> [cpu|cuda]
+docker/build.sh <stage> [variant]
 ```
 
-## Commands
+## Tiers (glibc floors → install prefix)
 
-| Command | Output | CUDA? |
+The install **prefix encodes the tier**; the module filename suffix (`_cpu`,
+`_cu12`, …) distinguishes flavors within a tree.
+
+| Prefix | glibc floor | Base image | Contents |
+|---|---|---|---|
+| `/usr/local/rampart-2_17` | 2.17 | manylinux2014 | CPU modules — max reach; **no onnx** (ORT needs glibc ≥ 2.28) |
+| `/usr/local/rampart-2_28` | 2.28 | manylinux_2_28 | CPU **and** GPU modules; newer SIMD; **onnx-capable** |
+
+## Variants
+
+`./build.sh build [variant]` — the token drives base image, toolchain, CUDA,
+build dir, module suffix, and default install tier:
+
+| variant | glibc | CUDA | suffix | default prefix | onnx |
+|---|---|---|---|---|---|
+| *(none)* / `cpu` | 2.17 | — | *(none)* / `_cpu` | `rampart-2_17` | skipped (`LT_ONNX=0`) |
+| `cpu_2_28` | 2.28 | — | `_cpu` | `rampart-2_28` | **builds `rampart-onnx.so`** (CPU) |
+| `cu11` (x86) | 2.17 | 11.8 | `_cu11` | `rampart-2_17` | skipped (CUDA < 12) |
+| `cu11` (arm) | 2.28 | 11.8 | `_cu11` | `rampart-2_28` | skipped (CUDA < 12) |
+| `cu11_2_28` | 2.28 | 11.8 | `_cu11` | `rampart-2_28` | skipped (CUDA < 12) |
+| `cu12` | 2.28 | 12.8 | `_cu12` | `rampart-2_28` | **builds `modules/onnx-cu12/` runtime dir** |
+| `cu13` | 2.28 | 13.0 | `_cu13` | `rampart-2_28` | **builds `modules/onnx-cu13/` runtime dir** |
+
+**rampart-onnx is one unified module.** The single `rampart-onnx.so` (built by the
+`cpu_2_28` variant) is CPU-complete on its own; the `cu12`/`cu13` variants build
+only a drop-in GPU **runtime directory** (`modules/onnx-cuNN/`) that the module
+auto-selects at load time if present. cu11/2_17 tiers omit onnx entirely (ORT
+1.27's CUDA EP needs CUDA ≥ 12, and ORT needs glibc ≥ 2.28). See
+`extern/onnxruntime-vendoring.md`.
+
+## Stages
+
+| Command | What it does |
+|---|---|
+| `build.sh build [variant]` | compile into `build/oven[-variant]/` |
+| `build.sh install [variant]` | install the modules into `<prefix>/modules` (+ test scripts) |
+| `build.sh shell [variant]` | interactive shell in the matching oven |
+| `build.sh save-image [variant]` | persist the oven image to `build/<image>.image.tar.gz` |
+
+Typical flow (build and install with the **same token**):
+```
+docker/build.sh build cu12
+docker/build.sh install cu12
+```
+
+## Flags
+
+- `--rebuild-image [build [variant]]` — force a fresh oven image first (after a
+  Dockerfile edit; cache-aware).
+- `-d <dir>` — install into `<dir>` instead of the tier default. If `<dir>` isn't
+  the build's home tier, the modules are **grafted** (copied in) rather than
+  rebuilt — e.g. put one cu11 build in both trees.
+
+## Environment knobs
+
+All forwarded into the oven by `build.sh`. Prefix the command
+(`ONNX_CUDA_PARALLEL=3 ./build.sh build cu12`) or export them.
+
+| Var | Default | Meaning |
 |---|---|---|
-| `docker/build.sh build` | `build/oven/` → `rampart-langtools.so` (unsuffixed) | no |
-| `docker/build.sh build cpu` | `build/oven-cpu/` → `rampart-langtools_cpu.so` | no |
-| `docker/build.sh build cuda` | `build/oven-cuda/` → `rampart-langtools_cuda.so` | **yes** (builds the cuda image) |
-| `docker/build.sh install [cpu\|cuda]` | install matching modules into `/usr/local/rampart-ml/modules` | — |
-| `docker/build.sh shell [cpu\|cuda]` | interactive shell in the (base or cuda) oven | — |
-| `docker/build.sh save-image [cuda]` | persist the cpu (or cuda) image to a `.tar.gz` | — |
-| `docker/build.sh --rebuild-image [build [cpu\|cuda]]` | force a fresh image first | — |
+| `LT_BUILD_PARALLEL` | `nproc` | main compile `-j` |
+| `ONNX_CUDA_PARALLEL` | `1` | ORT CUDA-EP build parallelism |
+| `ONNX_CPU_PARALLEL` | `8` | ORT CPU-EP build parallelism |
+| `ONNX_CUDA_ARCH` | per-variant | override ORT CUDA arch list, e.g. `89-real;89-virtual` |
+| `ONNX_CUDA_MINIMAL` | `0` | `1` = cuBLAS-only CUDA EP, no cuDNN (smaller; fewer GPU ops) |
+| `LT_TARGET` | — | build ONE cmake target, e.g. `onnxruntime_ep` |
 
-The same applies to `rampart-faiss` and `rampart-llamacpp` (e.g. `build` →
-`rampart-faiss.so`, `build cpu` → `rampart-faiss_cpu.so`). `rampart-sentencepiece.so`
-is always unsuffixed (it has no GPU variant). Typical flows:
+### Tuning `ONNX_CUDA_PARALLEL` (the ORT GPU build is the long pole)
 
-```
-docker/build.sh build           # plain modules, no CUDA pulled
-docker/build.sh install
+The ORT CUDA execution provider compiles cutlass/flash-attn kernels for **every**
+`-real` arch in the variant's list at once, so it's the memory monster of the
+build. Empirically:
 
-docker/build.sh build cuda      # GPU modules; first run downloads the CUDA toolkit
-docker/build.sh install cuda
-```
+> **peak RAM ≈ `ONNX_CUDA_PARALLEL` × 4 × ~2 GB**  (nvcc uses 4 threads each)
 
-### no-suffix vs cpu vs cuda
+For the **full arch fleet** (cu12 x86 = `80;86;89;90;100;120`), sized to RAM:
 
-- **`build`** (no arg) — the canonical CPU modules with **bare names**
-  (`rampart-langtools.so`). Uses the base image; **no CUDA download**.
-- **`build cpu`** — identical build but **`_cpu`-suffixed** names, for when you
-  want cpu and cuda installed side by side. Also no CUDA.
-- **`build cuda`** — `_cuda`-suffixed names; uses the cuda image. The CUDA
-  libraries are **not bundled**: `libcudart.so.11.0`, `libcublas.so.11`, and
-  `libcuda.so.1` (driver) must already be present on the GPU box.
-
-All three keep the glibc 2.17 floor; the CPU build bundles `libgomp`/`libgfortran`
-(resolved via `RPATH $ORIGIN/../lib`).
-
-## Mounted directories
-
-Nothing host-facing is baked into the image — it's all bind-mounted at
-`docker run` time. `$REPO` is the langtools repo root
-(`/usr/local/src/rampart-langtools`).
-
-| Stage | Host path → container path | Mode |
+| RAM | safe | max (watch `free -g`) |
 |---|---|---|
-| **build** | `/usr/local/src/rampart-langtools` → `/lt` | rw |
-| | `/usr/local/rampart-ml` → `/usr/local/rampart-ml` | **ro** |
-| | `/etc/passwd` → `/etc/passwd` | ro |
-| | `/etc/group` → `/etc/group` | ro |
-| **install** | `/usr/local/src/rampart-langtools` → `/lt` | rw |
-| | `/usr/local/rampart-ml` → `/usr/local/rampart-ml` | rw |
-| **shell** | `/usr/local/src/rampart-langtools` → `/lt` | rw |
-| | `/usr/local/rampart-ml` → `/usr/local/rampart-ml` | **ro** |
+| 15 GB | 1 | 1 |
+| 64 GB | **3** | 4 |
 
-Why each one:
+Going higher just spills into swap and gets **slower** — you're memory-bound, not
+CPU-bound. The real speed lever is **fewer arches**: for a single-GPU dev build,
+`ONNX_CUDA_ARCH="89-real;89-virtual"` cuts per-nvcc RAM ~6× and lets you raise
+`ONNX_CUDA_PARALLEL` to saturate the cores. Keep the full list for shippable
+artifacts.
 
-- **Repo (`/lt`)** — always rw: the build writes outputs to `build/oven[-<variant>]/`.
-- **`/usr/local/rampart-ml`** — the *installed* centos7 rampart. Mounted **ro at
-  build** (reads headers + runs the binary for `$RP_PATH`) and **rw at install**
-  (drops modules into `…/modules`). Only this subdir is mounted, not all of
-  `/usr/local`, or it would shadow the oven's own cmake + OpenBLAS.
-- **`/etc/passwd` + `/etc/group`** (ro) — only on `build`, which runs as your uid
-  (`--user`) so the uid resolves to a name. `install` runs as root (to write the
-  system modules dir), so it doesn't mount these.
+## Mounts & images
 
-Everything else (devtoolset-11, OpenBLAS, and — for cuda — the CUDA toolkit)
-lives **inside** the image. `install` always uses the base image (it only does
-`cmake --install`, which needs no CUDA).
+Nothing host-facing is baked into the image — it's bind-mounted at `docker run`:
+the repo at `/lt` (rw; outputs land in `build/oven*`), and the installed rampart
+prefix at its **real path** (`:ro` for build/shell, rw for install; the build
+reads headers from `<prefix>/include` and installs to `<prefix>/modules`). The
+build is handed the prefix directly via `-DRP_PATH` — it does **not** execute the
+mounted `rampart` binary, so a host rampart built against a newer glibc than the
+oven still works.
 
-## The oven images
+Images persist in your local docker store; `build.sh` finds them automatically,
+restores from a saved `.image.tar.gz` if present, else builds them. A plain
+`docker image prune -f` won't remove them (only `docker rmi` / `prune -a`).
 
-Both images live in your local docker store and persist across reboots and
-container runs — `build.sh` finds them automatically.
-
-`save-image` writes the cpu image to `build/rampart-langtools-oven.image.tar.gz`
-(or `save-image cuda` → `build/rampart-langtools-oven-cuda.image.tar.gz`). Only
-needed to move an image to another machine, back it up before an aggressive
-prune, or keep a daemon-independent snapshot. If a tarball exists, `ensure_*`
-restores it with `docker load` instead of rebuilding.
-
-After editing a `Dockerfile`, rebuild with `--rebuild-image` (cache-aware — it
-reuses the base/devtoolset/OpenBLAS layers; `--rebuild-image build cuda` rebuilds
-the cuda image).
-
-> A plain `docker image prune -f` only removes **dangling** (untagged) images and
-> won't touch these. Only `docker rmi`, `docker image prune -a`, `docker system
-> prune -a`, or a docker reinstall remove them — and even then the `Dockerfile`s
-> reproduce them deterministically (needs network).
-
-[manylinux2014]: https://github.com/pypa/manylinux
+[manylinux]: https://github.com/pypa/manylinux

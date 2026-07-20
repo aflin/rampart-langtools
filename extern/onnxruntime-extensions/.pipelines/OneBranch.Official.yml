@@ -1,0 +1,60 @@
+#################################################################################
+#                         OneBranch Pipelines - Official                        #
+# This pipeline was created by EasyStart from a sample located at:              #
+#   https://aka.ms/obpipelines/easystart/samples                                #
+# Documentation:  https://aka.ms/obpipelines                                    #
+# Yaml Schema:    https://aka.ms/obpipelines/yaml/schema                        #
+# Retail Tasks:   https://aka.ms/obpipelines/tasks                              #
+# Support:        https://aka.ms/onebranchsup                                   #
+#################################################################################
+
+trigger: none
+
+parameters: # parameters are shown up in ADO UI in a build queue time
+- name: 'debug'
+  displayName: 'Enable debug output'
+  type: boolean
+  default: false
+
+- name: ExtraEnv
+  displayName: 'Extra env variable set to CIBW_ENVIRONMENT, in form of "A=1 B=2 C=3"'
+  type: string
+  default: 'ExampleEnvVar=ON'
+
+variables:
+- template: /.pipelines/templates/onebranch-common-variables.yml@self
+  parameters:
+    debug: ${{ parameters.debug }}
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+
+extends:
+  template: v2/OneBranch.Official.CrossPlat.yml@templates
+  parameters:
+    cloudvault:
+      enabled: false
+    globalSdl:
+      asyncSdl:
+        enabled: false
+      tsa:
+        enabled: true
+      binskim:
+        break: true # always break the build on binskim issues in addition to TSA upload
+        analyzeTargetGlob: '**\RelWithDebInfo\ortextensions.dll'  # avoid scanning the 3rd party DLLs.
+      codeql:
+        compiled:
+          enabled: true
+        cadence: 10
+      policheck:
+        break: true # always break the build on policheck issues. You can disable it by setting to 'false'
+        exclusionsFile: '$(REPOROOT)\.config\policheck_exclusions.xml'
+
+    stages:
+    - template: /.pipelines/templates/onebranch-windows-build-stage.yml@self
+      parameters:
+        CibwEnv: ${{ parameters.ExtraEnv }}

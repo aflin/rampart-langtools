@@ -527,8 +527,7 @@ static bool build_context(lgen_engine *e, char *err, size_t errlen) {
             ggml_backend_dev_t devs[2] = { cpu_dev, nullptr };
             cmp.n_gpu_layers = 0;
             cmp.devices      = devs;
-            fprintf(stderr, "rampart-llamacpp: GPU context init failed for '%s'; retrying gen on CPU\n",
-                    p->model_path);
+            lt_warn("rampart-llamacpp: GPU context init failed for '%s'; retrying gen on CPU\n", p->model_path);
             e->model = model_acquire_path(p->model_path, &cmp, err, errlen);
             if (e->model) {
                 e->vocab   = llama_model_get_vocab(e->model);
@@ -582,6 +581,13 @@ struct llama_model *lgen_model_acquire(const char *path, const struct llama_mode
     return model_acquire_path(path, mp, errbuf, errlen);
 }
 void lgen_model_addref(struct llama_model *m)  { model_addref(m); }
+int lgen_model_addref_checked(struct llama_model *m) {
+    if (!m) return 0;
+    std::lock_guard<std::mutex> lk(g_model_cache_mtx);
+    for (auto &e : g_model_cache)
+        if (e.model == m) { e.refcount++; return 1; }
+    return 0;   /* refcount already hit zero: the model was freed */
+}
 void lgen_model_release(struct llama_model *m) { model_release(m); }
 
 lgen_engine *lgen_engine_create(const lgen_engine_params *p, char *errbuf, size_t errlen) {
@@ -600,8 +606,9 @@ lgen_engine *lgen_engine_create(const lgen_engine_params *p, char *errbuf, size_
     /* Load the full model + build the context NOW, on the calling (rampart)
      * thread. This mirrors how embedding (initEmbed) loads on its worker thread
      * and decodes there: many rampart threads each run their own context's Metal
-     * concurrently and safely. The context is pinned to this thread; a thread or
-     * pid (fork) change is handled via lgen_engine_rebind() before the next use. */
+     * concurrently and safely. The context is pinned to this thread; on a thread
+     * or pid (fork) change the caller (lg_get_info in rampart-llamacpp.c) builds
+     * a fresh per-thread engine from the stored params instead of reusing this one. */
     if (!build_context(e, errbuf, errlen)) { delete e; return nullptr; }
     return e;
 }
@@ -620,18 +627,6 @@ void lgen_engine_free(lgen_engine *e) {
     drop_context(e);
     if (e->model) { model_release(e->model); e->model = nullptr; }
     delete e;
-}
-
-/* rebuild the context on the current thread (after a thread or fork/pid change).
- * The caller (rampart-llamacpp.c) detects the change via get_thread_num()/getpid
- * and calls this before submitting. Returns 0 on success, -1 on failure. */
-int lgen_engine_rebind(lgen_engine *e, char *errbuf, size_t errlen) {
-    if (!e) { set_err(errbuf, errlen, "null engine"); return -1; }
-    /* drop in-flight work bound to the old context (slots/samplers are invalid
-     * on the new thread); queued requests are kept and will start on the new ctx */
-    for (auto &slot : e->slots) if (slot.smpl) { common_sampler_free(slot.smpl); slot.smpl = nullptr; }
-    drop_context(e);
-    return build_context(e, errbuf, errlen) ? 0 : -1;
 }
 
 uint32_t lgen_engine_n_ctx(lgen_engine *e)   { return e ? (e->n_ctx ? e->n_ctx : e->n_ctx_cfg) : 0; }
@@ -655,7 +650,7 @@ uint64_t lgen_engine_submit(lgen_engine *e, const lgen_request *req,
                             lgen_on_piece on_piece, lgen_on_done on_done,
                             void *ud, char *errbuf, size_t errlen) {
     if (!e || !req) { set_err(errbuf, errlen, "bad submit args"); return 0; }
-    if (!e->ctx)    { set_err(errbuf, errlen, "engine has no context (rebind needed)"); return 0; }
+    if (!e->ctx)    { set_err(errbuf, errlen, "engine has no context"); return 0; }
 
     gen_request *r = new gen_request();
     if (req->prompt && req->prompt[0])               { r->has_prompt = true;   r->prompt = req->prompt; }

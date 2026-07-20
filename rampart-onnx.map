@@ -1,0 +1,28 @@
+# Linker version script for rampart-onnx.so.
+#
+# ONNX Runtime is statically linked in, bundling its own protobuf (3.21),
+# abseil, onnx, re2, etc. rampart dlopen's modules with RTLD_GLOBAL, so without
+# this every one of those symbols would be published into the global namespace
+# and collide with other modules that bundle the same libs at a different
+# version -- e.g. rampart-sentencepiece links protobuf 3.14, and its generated
+# .pb.cc would bind to ORT's 3.21 and abort on the version check.
+#
+# Export ONLY the rampart module entry point; localize everything else so the
+# bundled C++ deps stay private to this .so. (The shared libonnxruntime.so got
+# this for free via its own export list; a static link must do it explicitly.)
+{
+  global:
+    duk_open_module;
+    /* C-callable embed API for rampart-sql's `sql.set({onnxEmbed:...})`.
+     * Adding just these five keeps the ORT/protobuf collision-avoidance
+     * intact (everything else in the .so remains localized). */
+    rp_onnx_embed_load;
+    rp_onnx_embed_text;
+    rp_onnx_embed_doc;
+    rp_onnx_embed_spans;
+    rp_onnx_embed_dim;
+    rp_onnx_embed_set_cache_cap;
+    rp_onnx_embed_release;
+  local:
+    *;
+};

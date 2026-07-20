@@ -1,0 +1,24 @@
+Pod::Spec.new do |spec|
+    spec.name                   = "@NAME@"
+    spec.version                = "@VERSION@"
+    spec.summary                = "@SUMMARY@"
+    spec.description            = "@DESCRIPTION@"
+    spec.authors                = { "ONNX Runtime Extensions Authors" => "onnxruntime@microsoft.com" }
+    spec.license                = { :type => "MIT", :file => "@LICENSE_FILE@" }
+    spec.homepage               = "https://github.com/microsoft/onnxruntime-extensions"
+    spec.source                 = { :http => "file:///http_source_placeholder" }
+    spec.ios.deployment_target  = "@IOS_DEPLOYMENT_TARGET@"
+
+    macosx_deployment_target =  "@MACOSX_DEPLOYMENT_TARGET@"
+    if macosx_deployment_target != ""
+        spec.osx.deployment_target = macosx_deployment_target
+    end
+
+    spec.ios.framework  = 'MobileCoreServices'
+    spec.osx.framework  = 'CoreServices'
+    spec.vendored_frameworks    = "@XCFRAMEWORK_DIR@"
+    spec.static_framework       = true
+    spec.source_files           = "@PUBLIC_HEADERS_DIR@/*.h"
+    spec.preserve_paths         = [ "@LICENSE_FILE@" ]
+    spec.library                = "c++"
+end

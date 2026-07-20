@@ -15,6 +15,16 @@ make install
 
 Supported on **macOS 11 (Big Sur) and newer**, on both Apple Silicon and Intel.
 embed, rerank, and text generation are all verified on macOS 11+.
+rampart-onnx builds and passes its full suite on macOS too (all objects at the
+11.0 deployment target).
+
+### FreeBSD support
+
+rampart-llamacpp, rampart-faiss, rampart-sentencepiece and **rampart-onnx** all
+build and pass their suites on FreeBSD (amd64).  One extra package is needed
+for the onnx build: `pkg install patch` (GNU patch -- see
+`extern/onnxruntime-vendoring.md` for the details and the two vendored ORT
+patches that make FreeBSD work).
 
 ## rampart-llamacpp use:
 
@@ -38,13 +48,24 @@ var emb = llamacpp.initEmbed('all-minilm-l6-v2_f16.gguf');
 
 var mytext = "about a paragraph of text follows...";
 // create a semantic vector from text:
-// also available is embedTextToFp32Buf() and embedTextToNumbers()
+// also available: embedTextToFp32Buf(), embedTextToNumbers(), and
+// embedTextsToNumbers([texts]) -> [ {avgVec:[...]}, ... ] (one per text)
 var v = emb.embedTextToFp16Buf(mytext);
 
-// v = {vecs[vec1, vec2, ...], avgVec: avgOfVecs}
-// If passage is not too large for model, v.vecs.length==1
-// and v.vecs[0] == v.avgVec
-// Otherwise avgVec will be a renormalized average of vecs[]
+// v = { vecs: [vec1, vec2, ...],           one vector per chunk
+//       avgVec: avgOfVecs,                  renormalized average of vecs[]
+//       coherence: 0..1,                    avg pairwise cosine between chunks (1 = single chunk)
+//       chunks: [{start,end,tokens,text,oversized?}] } text span of each chunk
+//       (oversized:true = one of several sub-windows of a too-big paragraph)
+//
+// Chunking is structure-aware (rp-chunker.c, shared with rampart-onnx):
+// one vector per blank-line paragraph (fragments under minTokens merged),
+// single-newline lines packed to the model window at line boundaries, and a
+// sliding token window with 1/8 overlap when the text has no structure (or
+// a single paragraph exceeds the window). If the text fits in one chunk,
+// v.vecs.length==1 and v.vecs[0] == v.avgVec.
+// initEmbed options: split:'auto'|'window', minTokens (default 32,
+// -1 disables merging), packParagraphs:true (fewer, window-sized chunks).
 
 //store vector and text somewhere
 sql.exec("insert into vecs values (?,?,?,?)", [v.avgVec, docId, Title, Text]);
@@ -62,8 +83,16 @@ var llamacpp=require('rampart-llamacpp');
 var rrmodel = process.scriptPath + '/data/models/bge-reranker-v2-m3-Q8_0.gguf';
 var rr = llamacpp.initRerank(rrmodel);
 
-// get the score of how well a document/paragraph answers a question:
+// get the score of how well a document/paragraph answers a question
+// (sigmoid-squashed to 0..1 by default; initRerank(model,{sigmoid:false}) for raw):
 var score = rr.rerank(qestion, mydoc);
+
+// rank many documents: returns [{document, score, index}] sorted by score
+// descending (index = the document's position in your array):
+var ranked = rr.rerank(qestion, [doc1, doc2, doc3]);
+
+// or just the scores, in DOCUMENT order:
+var scores = rr.rerank(qestion, [doc1, doc2, doc3], true);
 ```
 
 ### Text Generation (experimental):

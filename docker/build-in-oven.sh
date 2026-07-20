@@ -88,16 +88,48 @@ case "$STAGE" in
                    -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
     fi
 
+    # rampart-onnx tiering: ORT 1.27 needs glibc >= 2.28 + a newer gcc than the
+    # 2_17 (manylinux2014) ovens have, and cu11 tiers don't ship an onnx runtime
+    # (ORT's CUDA EP needs CUDA >= 12).  So: 2_17-tier + cu11 variants build all
+    # modules EXCEPT onnx; cpu_2_28 builds the unified rampart-onnx.so; cu12/cu13
+    # build only their modules/onnx-cuNN/ runtime dirs.
+    ONNX_GATE=""
+    case "$VARIANT" in
+      ""|cpu|cu11|cu11_2_28) ONNX_GATE="-DLT_ONNX=0" ;;
+    esac
+
     mkdir -p "$BUILD"
+    # Optional onnx knobs forwarded from the host env (build.sh passes them with -e):
+    #   ONNX_CUDA_PARALLEL -- ORT CUDA build --parallel (memory ~ parallel x arches;
+    #     raise on a big-RAM builder, e.g. 44 on the 512GB box; default 1 in extern.cmake).
+    #   ONNX_CUDA_ARCH     -- override the ORT CUDA arch list.
+    ONNX_FLAGS=""
+    [ -n "${ONNX_CUDA_PARALLEL:-}" ] && ONNX_FLAGS="$ONNX_FLAGS -DONNX_CUDA_PARALLEL=$ONNX_CUDA_PARALLEL"
+    [ -n "${ONNX_CUDA_ARCH:-}" ]     && ONNX_FLAGS="$ONNX_FLAGS -DONNX_CUDA_ARCH=$ONNX_CUDA_ARCH"
+    # ONNX_CUDA_MINIMAL=1: cuBLAS-only CUDA EP, no cuDNN at build or run time
+    # (embed/rerank matmuls still on GPU; conv-family ops fall back). For ovens
+    # without cuDNN and cuDNN-less deploy targets (e.g. Jetson without JetPack's
+    # cuDNN installed).
+    [ -n "${ONNX_CUDA_MINIMAL:-}" ]  && ONNX_FLAGS="$ONNX_FLAGS -DONNX_CUDA_MINIMAL=$ONNX_CUDA_MINIMAL"
     # -DSUFFIX="" (empty variant) -> unsuffixed; cpu/cuNN -> _cpu/_cuNN.
-    # Pin RAMPART_EXECUTABLE to the mounted path; otherwise find_program's cached
-    # value in an existing build dir can point at a stale (unmounted) rampart path
-    # and the installPath query fails.  -D overrides the cache on reconfigure.
+    # Pass RP_PATH (rampart's install prefix) directly instead of letting CMake run the
+    # mounted rampart to query it: this oven's glibc can be OLDER than the host's, and a
+    # host-built rampart then fails to execute inside the container ("libc.so.6: version
+    # GLIBC_2.xx not found").  $PREFIX is exactly rampart's installPath, so hand it over.
+    # (RAMPART_EXECUTABLE is still pinned for any tooling that wants it, but is no longer
+    # executed for the install-path query.)
     "$CMAKE" -S "$LT" -B "$BUILD" \
         -DCMAKE_BUILD_TYPE=Release \
+        -DRP_PATH="$PREFIX" \
         -DRAMPART_EXECUTABLE="$PREFIX/bin/rampart" \
-        -DSUFFIX="$SUFFIX" $GPU_FLAGS
-    "$CMAKE" --build "$BUILD" -j"$(nproc)"
+        -DSUFFIX="$SUFFIX" $GPU_FLAGS $ONNX_FLAGS $ONNX_GATE
+    # LT_TARGET: optionally build ONE cmake target (e.g. onnxruntime_ep to get
+    # just a flavor's ORT runtime dir without rebuilding llamacpp/faiss).
+    # Parallelism for the MAIN build = all cores by default; override with
+    # LT_BUILD_PARALLEL (forwarded by build.sh) to raise/cap it -- e.g. when nproc
+    # under-reports, or to leave headroom.  (The ORT sub-build has its OWN knobs:
+    # ONNX_CPU_PARALLEL, default 8; ONNX_CUDA_PARALLEL, default 1 -- see extern.cmake.)
+    "$CMAKE" --build "$BUILD" -j"${LT_BUILD_PARALLEL:-$(nproc)}" ${LT_TARGET:+--target "$LT_TARGET"}
     # record the install dir baked into this build (= rampart's installPath at
     # configure); the install stage verifies it matches before installing.
     printf '%s\n' "$PREFIX" > "$BUILD/.rampart-prefix"
@@ -134,6 +166,21 @@ case "$STAGE" in
             strip -S "$PREFIX/modules/$(basename "$so")" 2>/dev/null || true
         done
         [ -f "$LT/llamacpp-test.js" ] && { mkdir -p "$PREFIX/test"; install -m 644 "$LT/llamacpp-test.js" "$PREFIX/test/"; }
+        [ -f "$LT/rampart-models.js" ] && install -m 644 "$LT/rampart-models.js" "$PREFIX/modules/"
+        # unified rampart-onnx: the module is UNSUFFIXED (one .so for cpu+gpu)...
+        if [ -f "$BUILD/rampart-onnx.so" ]; then
+            install -m 755 "$BUILD/rampart-onnx.so" "$PREFIX/modules/"
+            strip -S "$PREFIX/modules/rampart-onnx.so" 2>/dev/null || true
+        fi
+        # ...and a cuNN build produces a runtime DIR instead of a module
+        if [ -n "$SUFFIX" ] && [ -d "$BUILD/extern/onnxruntime/Release" ] && \
+           [ -f "$BUILD/extern/onnxruntime/Release/libonnxruntime.so.1.27.0" ]; then
+            RTD="$PREFIX/modules/onnx-$SUFFIX"
+            mkdir -p "$RTD"
+            cp -P "$BUILD/extern/onnxruntime/Release/libonnxruntime.so"* "$RTD/" 2>/dev/null || true
+            cp "$BUILD/extern/onnxruntime/Release/libonnxruntime_providers_shared.so" \
+               "$BUILD/extern/onnxruntime/Release/libonnxruntime_providers_cuda.so" "$RTD/" 2>/dev/null || true
+        fi
     fi
     echo
     ls -l "$PREFIX"/modules/rampart-*"${SUFFIX:+_$SUFFIX}".so 2>/dev/null || true

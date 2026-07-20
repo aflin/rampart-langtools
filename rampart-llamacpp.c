@@ -22,6 +22,8 @@
 #include "llama.h"
 #include "ggml-backend.h"     /* ggml_backend_dev_by_type: CPU-only context fallback */
 #include "llama_gen_shim.h"   /* C ABI for the multi-session generation engine */
+#include "rp-chunker.h"        /* structure-aware embed chunking (shared with rampart-onnx) */
+#include "rp-embed-cache.h"    /* content-keyed doc-result LRU (shared with rampart-onnx) */
 #include "rampart.h"
 
 #ifdef __APPLE__
@@ -31,26 +33,108 @@
 
 #endif
 
+#include <stdarg.h>
+
+/* get_current_thread() lives in the rampart binary (like the duk_* symbols).
+ * Keep the reference WEAK so a non-rampart host that dlopens this module just
+ * for the rp_embed_* C API still loads and runs -- there lt_thr_ctx() below
+ * returns NULL instead of faulting on the call. */
+#pragma weak get_current_thread
+
+/* ---- this.errMsg: warnings + non-fatal errors ------------------------------
+ * Three rules: a failure throws a JS error; a warning goes to this.errMsg; NOTHING
+ * is written to stdout/stderr (RAMPART_LT_GPU_DEBUG is the one opt-in hatch).
+ *
+ * errMsg mirrors rampart-sql (rp_log_copy_to_errMsg there): warnings accumulate on
+ * `this` -- the module object for llamacpp.initGen(), a handle for handle methods,
+ * exactly as Sql/sql share the property -- and are cleared at the top of each call.
+ * It is deliberately SEPARATE from getLog(), which is ggml/llama's informational
+ * firehose and would bury a warning like "GPU context init failed". */
+/* The duk context of the CALLING rampart thread: reachable from ANY C code here --
+ * the CUDA probe below, the gen shim, and the rp_embed_* exports that rampart-sql
+ * calls -- not just from a duk_ret_t that was handed a ctx.  NULL only in a bare
+ * non-rampart host (no JS to carry the warning). */
+static duk_context *lt_thr_ctx(void)
+{
+    RPTHR *t = get_current_thread ? get_current_thread() : NULL;
+    return t ? t->ctx : NULL;
+}
+
+static void lt_errmsg_append(duk_context *ctx, const char *msg);
+
+/* A warning, from anywhere in the module (including llama_gen_shim.cc).  Goes
+ * straight onto this.errMsg -- no buffer, no drain.  RAMPART_LT_GPU_DEBUG=1 also
+ * echoes to stderr; that opt-in hatch is the only thing that may write there. */
+void lt_warn(const char *fmt, ...)
+{
+    duk_context *ctx = lt_thr_ctx();
+    char line[1024];
+    size_t l;
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (getenv("RAMPART_LT_GPU_DEBUG")) fputs(line, stderr);   /* opt-in hatch */
+    if (!ctx) return;                  /* non-rampart host: no JS to carry it */
+    l = strlen(line);
+    while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = '\0';
+    if (l) lt_errmsg_append(ctx, line);
+}
+
+#define LT_MODULE_STASH DUK_HIDDEN_SYMBOL("lt_module")
+
+/* Push the object a warning belongs on: `this` when there is one (the module for
+ * llamacpp.initEmbed(), a handle for handle methods -- as Sql/sql share errMsg),
+ * else the module object itself.  The fallback matters because some entry points
+ * are reached with no `this`: initGen dispatches through a JS wrapper, and the
+ * rp_embed_* exports are called from rampart-sql.  Returns 0 if neither exists
+ * (nothing is stashed until duk_open_module runs). */
+static int lt_push_errmsg_target(duk_context *ctx)
+{
+    duk_push_this(ctx);
+    if (duk_is_object(ctx, -1)) return 1;
+    duk_pop(ctx);
+    duk_push_global_stash(ctx);
+    if (!duk_get_prop_string(ctx, -1, LT_MODULE_STASH) || !duk_is_object(ctx, -1)) {
+        duk_pop_2(ctx);
+        return 0;
+    }
+    duk_remove(ctx, -2);                 /* drop the stash, leave the module object */
+    return 1;
+}
+
+static void lt_errmsg_append(duk_context *ctx, const char *msg)
+{
+    if (!lt_push_errmsg_target(ctx)) return;
+    if (duk_get_prop_string(ctx, -1, "errMsg")) {
+        const char *s = duk_get_string(ctx, -1);
+        if (s && *s) duk_push_sprintf(ctx, "%s\n%s", s, msg);
+        else         duk_push_string(ctx, msg);
+        duk_remove(ctx, -2);
+    } else {
+        duk_pop(ctx);
+        duk_push_string(ctx, msg);
+    }
+    duk_put_prop_string(ctx, -2, "errMsg");
+    duk_pop(ctx);
+}
+
+/* clear this.errMsg -- at the top of every JS entry point */
+static void lt_errmsg_clear(duk_context *ctx)
+{
+    if (!lt_push_errmsg_target(ctx)) return;
+    duk_del_prop_string(ctx, -1, "errMsg");
+    duk_pop(ctx);
+}
+
+
 // --- CUDA availability check ---
 #if ( defined(LT_ENABLE_GPU) && !defined(__APPLE__) )
     #define HAVE_CUDA 1
 
     #include <cuda_runtime.h>
     #include "ggml-backend.h"
-
-    static int has_gpu_backend()
-    {
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
-        {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU)
-            {
-                return 1;
-            }
-        }
-        return 0;
-    }
 
     /* sm numbers this build has NATIVE SASS for, baked from CMAKE_CUDA_ARCHITECTURES
      * at configure (e.g. "87 90 100 120").  ggml rewrites Blackwell/Hopper archs to
@@ -87,7 +171,7 @@
             static int warned = 0;
             if (!warned) {
                 warned = 1;
-                fprintf(stderr, "rampart-llamacpp: no usable CUDA GPU (%s) -- running on CPU\n",
+                lt_warn("rampart-llamacpp: no usable CUDA GPU (%s) -- running on CPU\n",
                         ce != cudaSuccess ? cudaGetErrorString(ce) : "0 devices");
             }
             return 1;  /* no CUDA GPU -> CPU build runs, allow */
@@ -102,6 +186,32 @@
         int cc = p.major * 10 + p.minor;             /* 12.1 -> 121, 8.7 -> 87 */
         if (dbg) fprintf(stderr, "[lt-gpu] device %d '%s' cc %d.%d (%d) vs sm '%s'\n",
                          device, p.name, p.major, p.minor, cc, LT_CUDA_SM_LIST);
+        /* Driver-version floor.  This module's kernels are native-arch SASS built by the
+         * oven's nvcc (CUDART_VERSION).  A cubin built with toolkit X will NOT load on a
+         * driver older than X (NVIDIA guarantees cubin forward-compat only, not backward)
+         * -- so on a too-old driver ggml aborts mid-graph in ggml_cuda_error (seen: a
+         * CUDA-12.8 cu12 module on a 535 / CUDA-12.2 driver -> abort in ggml_cuda_op_add).
+         * cudaDriverGetVersion() reports the max CUDA the installed driver supports; refuse
+         * cleanly when it's below this module's build version instead of letting the launch
+         * abort with a cryptic backtrace.  Checked BEFORE the sm-list match on purpose: the
+         * cc can be present yet the SASS still fail to load on an old driver.  (onnx/ORT is
+         * immune -- it JITs kernels from PTX; ggml ships real-arch SASS only.) */
+        int drv = 0;
+        if (cudaDriverGetVersion(&drv) == cudaSuccess && drv > 0 && drv < CUDART_VERSION) {
+            if (dbg) fprintf(stderr, "[lt-gpu] driver CUDA %d.%d < build CUDA %d.%d -> REFUSE\n",
+                             drv/1000, (drv%1000)/10, CUDART_VERSION/1000, (CUDART_VERSION%1000)/10);
+            if (eb && n)
+                snprintf(eb, n,
+                    "GPU '%s' (sm_%d): the NVIDIA driver supports CUDA %d.%d, but this "
+                    "rampart-llamacpp was built for CUDA %d.%d -- the driver is too old to "
+                    "load its GPU kernels (they would abort mid-graph).  Upgrade the NVIDIA "
+                    "driver to one shipping CUDA %d.%d or newer, or use the cuNN module that "
+                    "matches your driver (e.g. cu11 for a CUDA 11.x driver).",
+                    p.name, cc, drv/1000, (drv%1000)/10,
+                    CUDART_VERSION/1000, (CUDART_VERSION%1000)/10,
+                    CUDART_VERSION/1000, (CUDART_VERSION%1000)/10);
+            return 0;
+        }
         for (const char *s = LT_CUDA_SM_LIST; *s; ) {
             char *end;
             long v = strtol(s, &end, 10);
@@ -128,6 +238,31 @@
     #undef HAVE_CUDA
 
 #endif
+
+/* Fork policy (Aaron, 2026-07): rampart forks only at STARTUP (rampart-server
+ * daemon mode, which has an explicit postForkFunc); forking after models are
+ * live is unsupported.  GPU runtimes (CUDA, macOS Metal) usually CRASH when a
+ * forked child touches inherited driver state, so any post-fork use of a
+ * GPU-backed handle is REFUSED with a clear error.  CPU-only operation is
+ * allowed to continue after a fork (contexts are rebuilt per pid).
+ *
+ * lt_gpu_in_use(): true iff ggml has a GPU-class backend device registered
+ * (CUDA on Linux, Metal on macOS).  Registration happens at model load, so by
+ * the time a post-fork check runs (a model existed before the fork), the
+ * inherited registry answers correctly.  Pure-CPU builds compile no GPU
+ * backends and always return 0. */
+static int lt_gpu_in_use(void)
+{
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU)
+            return 1;
+    return 0;
+}
+
+#define LT_FORK_REFUSAL "llama.cpp: this handle was created before a fork() and " \
+    "a GPU backend (CUDA/Metal) is initialized -- using it in the child would " \
+    "crash the GPU runtime. Fork before loading models (rampart-server daemon " \
+    "mode + postForkFunc), or run this model on CPU."
 
 
 typedef struct rp_llama_info
@@ -274,17 +409,25 @@ extern void event_free(struct event *ev);
 // Build a fresh per-thread engine + info from creation params. The model is
 // shared via the shim's refcounted cache, so this only allocates a new context
 // + slots on the current thread (cheap next to loading weights).
-static rp_llama_info *lg_new_info(duk_context *ctx, const lgen_engine_params *p)
+/* non-throwing core (lg_init_gen must free its chat_template before a throw) */
+static rp_llama_info *lg_new_info_e(const lgen_engine_params *p, char *err, size_t errlen)
 {
-    char err[256];
-    lgen_engine *eng = lgen_engine_create(p, err, sizeof err);
-    if (!eng) RP_THROW(ctx, "initGen: %s", err);
+    lgen_engine *eng = lgen_engine_create(p, err, errlen);
+    if (!eng) return NULL;
     rp_llama_info *info = NULL;
     CALLOC(info, sizeof(rp_llama_info));
     info->thr = get_current_thread();
     info->eng = eng;
     info->init_thr = get_thread_num();
     info->init_pid = (int)getpid();
+    return info;
+}
+
+static rp_llama_info *lg_new_info(duk_context *ctx, const lgen_engine_params *p)
+{
+    char err[256];
+    rp_llama_info *info = lg_new_info_e(p, err, sizeof err);
+    if (!info) RP_THROW(ctx, "initGen: %s", err);
     return info;
 }
 
@@ -325,10 +468,8 @@ static rp_llama_info *lg_get_info(duk_context *ctx)
         return info;
     }
 
-#ifdef HAVE_CUDA
-    if (owner_pid != -1 && owner_pid != cur_pid && has_gpu_backend())
-        RP_THROW(ctx, "llama.cpp - cannot fork llama.cpp with CUDA initialized");
-#endif
+    if (owner_pid != -1 && owner_pid != cur_pid && lt_gpu_in_use())
+        RP_THROW(ctx, LT_FORK_REFUSAL);
 
     // used on a new thread (or after fork): build a new per-thread engine from
     // the stored creation params and stash it in THIS copy's own hidden slots.
@@ -795,6 +936,7 @@ static char *lt_read_file_alloc(duk_context *ctx, const char *fn) {
 
 static duk_ret_t lg_init_gen(duk_context *ctx)
 {
+    lt_errmsg_clear(ctx);   /* errMsg reflects THIS call */
     const char *model_path = REQUIRE_STRING(ctx, 0, "initGen: first argument must be a String (path to .gguf)");
     duk_idx_t o = duk_is_object(ctx, 1) ? 1 : -1;
 
@@ -853,7 +995,12 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
     p.mparams       = mp;
     p.cparams       = cp;
 
-    rp_llama_info *info = lg_new_info(ctx, &p); // builds engine (shared model) + info
+    char nerr[256] = {0};
+    rp_llama_info *info = lg_new_info_e(&p, nerr, sizeof nerr); // engine (shared model) + info
+    if (!info) {
+        free(chat_template);   /* would leak across the longjmp otherwise */
+        RP_THROW(ctx, "initGen: %s", nerr);
+    }
     lgen_engine *eng = info->eng;
 
     duk_push_object(ctx);
@@ -997,6 +1144,7 @@ static int rp_in_vm(void)
 
 static duk_ret_t lg_init_gen_batched(duk_context *ctx)
 {
+    lt_errmsg_clear(ctx);   /* errMsg reflects THIS call */
     REQUIRE_STRING(ctx, 0, "initGen: first argument must be a String (path to .gguf)");
     /* opts (optional object) at index 1 */
 
@@ -1089,15 +1237,22 @@ static duk_ret_t emb_free_(duk_context *ctx)
     int own_context = (lctx && ctx_thr == cur_thr && ctx_pid == cur_pid);
     int is_origin   = (org_thr == cur_thr && org_pid == cur_pid);
 
-    // per-handle resource: only the origin copy frees it
-    if (is_origin)
+    // rerank_toks: the origin copy owns the one made at init; a copy that
+    // REBUILT on its own thread (own_context, not origin) replaced its pointer
+    // with a private struct at rebuild -- it owns that one.  A copy that never
+    // rebuilt still points at the origin's struct and must not free it.
+    if (is_origin || own_context)
     {
         if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rerank_toks")))
         {
             void *toks = duk_get_pointer(ctx, -1);
             if (toks) free(toks);
+            duk_pop(ctx);
+            duk_push_pointer(ctx, NULL);
+            duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rerank_toks"));
         }
-        duk_pop(ctx);
+        else
+            duk_pop(ctx);
     }
 
     // per-context resources: only the copy that built this context frees them
@@ -1203,15 +1358,285 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
 #define PACK16 1
 #define PACK32 2
 
-/* pack != 0 - return fp16 */
-static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
+/* ============================================================
+ * Structure-aware document embedding (rp-chunker.c, shared source with
+ * rampart-onnx).  Text is chunked at semantic boundaries -- one vector per
+ * blank-line paragraph (fragments under min_tokens merged), single-newline
+ * lines greedily packed to the window, sliding token window with 1/8 overlap
+ * as the no-structure / oversized-paragraph fallback -- then each chunk is
+ * decoded and pooled.  Used by embedTextTo* (JS) and rp_embed_text (C ABI).
+ * ============================================================ */
+
+typedef struct { size_t start, end, n_tokens; } ll_chunk_span;
+
+/* rp_chunk_count_fn over llama_tokenize (probe mode; includes specials) */
+static size_t ll_chunk_count(void *user, const char *t, size_t l)
 {
-    if (duk_is_buffer_data(ctx, 0))
-        duk_buffer_to_string(ctx, 0);
+    const struct llama_vocab *v = (const struct llama_vocab *)user;
+    int need = llama_tokenize(v, t, (int)l, NULL, 0,
+                              /*add_special*/true, /*parse_special*/true);
+    if (need < 0) need = -need;
+    return (size_t)need;
+}
 
-    const char *text = REQUIRE_STRING(ctx, 0, "rampart-llama-cpp:embedTextToBuf - argument must be a String");
+/* Decode toks[0..n) as one independent sequence (positions 0..n-1, KV
+ * cleared) and write the L2-normalized pooled embedding to dst[vec_dim]. */
+static int ll_decode_pooled(struct llama_context *lctx, enum llama_pooling_type p,
+                            const llama_token *toks, int n, int vec_dim,
+                            float *dst, char *err, size_t errlen)
+{
+    llama_memory_clear(llama_get_memory(lctx), /*clear_kv=*/true);
 
-    int vec_dim = 0;
+    struct llama_batch batch = llama_batch_init(/*capacity*/n, /*embd*/0, /*n_seq_max*/1);
+    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+        llama_batch_free(batch);
+        if (err) snprintf(err, errlen, "llama_batch_init failed");
+        return -1;
+    }
+    for (int i = 0; i < n; ++i) {
+        batch.token[i]     = toks[i];
+        batch.pos[i]       = i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = 1;
+    }
+    batch.n_tokens = n;
+
+    if (llama_decode(lctx, batch) != 0) {
+        llama_batch_free(batch);
+        if (err) snprintf(err, errlen, "llama_decode failed");
+        return -1;
+    }
+    const float *emb = (p == LLAMA_POOLING_TYPE_NONE)
+                     ? llama_get_embeddings_ith(lctx, n - 1)
+                     : llama_get_embeddings_seq(lctx, 0);
+    llama_batch_free(batch);
+    if (!emb) {
+        if (err) snprintf(err, errlen, "no embedding returned");
+        return -1;
+    }
+    double norm2 = 0.0;
+    for (int i = 0; i < vec_dim; ++i) norm2 += (double)emb[i] * (double)emb[i];
+    float inv = norm2 > 0.0 ? (float)(1.0 / sqrt(norm2)) : 1.0f;
+    for (int i = 0; i < vec_dim; ++i) dst[i] = emb[i] * inv;
+    return 0;
+}
+
+/* Chunk + decode a whole document.  On success returns vec_dim (>0) and fills
+ * (any out pointer may be NULL):
+ *   *out_vecs = malloc'd float[k*vec_dim]   unit chunk vectors, row-major
+ *   *out_k    = k
+ *   *out_spans= malloc'd ll_chunk_span[k]   byte span of each chunk in text
+ *               (+ its decoded token count; window sub-chunks share a span)
+ *   *out_avg  = malloc'd float[vec_dim]     normalize(mean of unit chunk vecs)
+ *   *out_coh  = avg pairwise cosine between unit chunk vecs, [0,1]; 1.0 when k==1
+ * Returns 0 with err[0]==0 for empty/whitespace text; err set on real errors. */
+static int ll_embed_doc(struct llama_context *lctx, const struct llama_vocab *vocab,
+                        const char *text, size_t tlen,
+                        const char *dpfx, size_t dpfx_len,   /* per-doc chunk prefix (title) */
+                        int vec_dim,
+                        int split_mode, int min_tokens, int pack_para,
+                        int sentence_split,
+                        int spans_only,   /* 1 = skip decode; spans/k only */
+                        float **out_vecs, size_t *out_k, ll_chunk_span **out_spans,
+                        float **out_avg, float *out_coh,
+                        char *err, size_t errlen)
+{
+    if (out_vecs) *out_vecs = NULL;
+    if (out_k) *out_k = 0;
+    if (out_spans) *out_spans = NULL;
+    if (out_avg) *out_avg = NULL;
+    if (out_coh) *out_coh = 0.0f;
+    if (err && errlen) err[0] = '\0';
+    if (!lctx || !vocab || !text || tlen == 0 || vec_dim <= 0) return 0;
+
+    const int n_ctx    = llama_n_ctx(lctx);
+    int       n_ubatch = llama_n_ubatch(lctx);
+    if (n_ubatch <= 0) n_ubatch = n_ctx;
+    int chunk_tokens = (n_ctx < n_ubatch ? n_ctx : n_ubatch);
+    if (chunk_tokens <= 0) {
+        if (err) snprintf(err, errlen, "invalid limits (n_ctx=%d ubatch=%d)", n_ctx, n_ubatch);
+        return 0;
+    }
+    int overlap = chunk_tokens / 8;
+    if (overlap >= chunk_tokens) overlap = chunk_tokens - 1;
+    int stride = chunk_tokens - overlap;
+    if (stride < 1) stride = chunk_tokens;
+
+    /* Per-document prefix tokens (no specials).  Injected into each
+     * decoded window below; chunk boundaries / spans / k never depend on
+     * it (window budget stays chunk_tokens), so abstract()'s span
+     * recomputation -- which doesn't know the prefix -- stays exact.
+     * A full window loses its last dp_n tokens of decode input. */
+    llama_token *dp_toks = NULL;
+    int dp_n = 0;
+    if (dpfx && dpfx_len && !spans_only) {
+        int pneed = llama_tokenize(vocab, dpfx, (int)dpfx_len, NULL, 0, false, true);
+        if (pneed <= 0) pneed = -pneed;
+        if (pneed > 0) {
+            dp_toks = (llama_token *)calloc((size_t)pneed, sizeof(*dp_toks));
+            if (!dp_toks) { if (err) snprintf(err, errlen, "oom prefix"); return 0; }
+            dp_n = llama_tokenize(vocab, dpfx, (int)dpfx_len, dp_toks, pneed, false, true);
+            if (dp_n <= 0) dp_n = -dp_n;
+            if (dp_n > pneed) dp_n = pneed;
+            if (dp_n > chunk_tokens - 2) dp_n = chunk_tokens - 2;
+        }
+    }
+
+    /* 1) structure-aware chunking (token counts include specials, matching
+     *    the per-chunk add_special tokenization below) */
+    rp_chunk_opts co = { chunk_tokens, min_tokens, pack_para, split_mode, sentence_split };
+    rp_chunk_span *spans = NULL;
+    size_t nspan = 0;
+    if (rp_chunk_text(text, tlen, &co, ll_chunk_count, (void *)vocab, &spans, &nspan) != 0) {
+        if (err) snprintf(err, errlen, "chunking failed");
+        free(dp_toks);
+        return 0;
+    }
+    if (!nspan) { free(spans); free(dp_toks); return 0; }   /* empty text */
+
+    const enum llama_pooling_type p = llama_pooling_type(lctx);
+    if (!spans_only)
+        llama_set_embeddings(lctx, true);
+
+    float *vecs = NULL;
+    ll_chunk_span *vspans = NULL;
+    size_t k = 0, cap = 0;
+    int failed = 0;
+
+    for (size_t si = 0; si < nspan && !failed; si++) {
+        const char *ct = text + spans[si].start;
+        int clen = (int)(spans[si].end - spans[si].start);
+
+        int need = llama_tokenize(vocab, ct, clen, NULL, 0, true, true);
+        if (need <= 0) need = -need;
+        if (need <= 0) continue;               /* whitespace-only span */
+        llama_token *toks = (llama_token *)calloc((size_t)need, sizeof(*toks));
+        if (!toks) { failed = 1; if (err) snprintf(err, errlen, "oom tokens"); break; }
+        int nw = llama_tokenize(vocab, ct, clen, toks, need, true, true);
+        if (nw <= 0) nw = -nw;
+        if (nw > need) nw = need;
+
+        /* one decode if it fits; else the sliding-window fallback within
+         * this span (oversized paragraph / unstructured text).  In
+         * spans_only mode the window walk still runs (span/k parity
+         * with the real embed) but no decode happens. */
+        for (int start = 0; start < nw; start += stride) {
+            int n = nw - start;
+            if (n > chunk_tokens) n = chunk_tokens;
+            if (k == cap) {
+                size_t nc = cap ? cap * 2 : 8;
+                float *nv = spans_only ? vecs
+                    : (float *)realloc(vecs, nc * (size_t)vec_dim * sizeof(float));
+                ll_chunk_span *ns = (ll_chunk_span *)realloc(vspans, nc * sizeof(*ns));
+                if (nv || spans_only) vecs = nv;
+                if (ns) vspans = ns;
+                if ((!nv && !spans_only) || !ns) { failed = 1; if (err) snprintf(err, errlen, "oom vecs"); break; }
+                cap = nc;
+            }
+            if (!spans_only) {
+                int drc;
+                if (dp_n > 0) {
+                    /* [BOS?] prefix window-tokens(trimmed) -- window walk
+                     * and spans stay prefix-independent. */
+                    llama_token bos = llama_vocab_bos(vocab);
+                    int lead = (start == 0 && n > 0 && toks[0] == bos) ? 1 : 0;
+                    int keep = n - lead;
+                    if (dp_n + keep + lead > chunk_tokens)
+                        keep = chunk_tokens - dp_n - lead;
+                    if (keep < 0) keep = 0;
+                    int m = 0;
+                    llama_token *dbuf = (llama_token *)malloc(
+                        (size_t)(lead + dp_n + keep) * sizeof(*dbuf));
+                    if (!dbuf) { failed = 1; if (err) snprintf(err, errlen, "oom prefix buf"); break; }
+                    if (lead) dbuf[m++] = toks[0];
+                    memcpy(dbuf + m, dp_toks, (size_t)dp_n * sizeof(*dbuf)); m += dp_n;
+                    memcpy(dbuf + m, toks + start + lead, (size_t)keep * sizeof(*dbuf)); m += keep;
+                    drc = ll_decode_pooled(lctx, p, dbuf, m, vec_dim,
+                                           vecs + k * (size_t)vec_dim, err, errlen);
+                    free(dbuf);
+                } else {
+                    drc = ll_decode_pooled(lctx, p, toks + start, n, vec_dim,
+                                           vecs + k * (size_t)vec_dim, err, errlen);
+                }
+                if (drc != 0) { failed = 1; break; }
+            }
+            vspans[k] = (ll_chunk_span){ spans[si].start, spans[si].end, (size_t)n };
+            k++;
+            if (start + chunk_tokens >= nw) break;
+        }
+        free(toks);
+    }
+    free(spans);
+    free(dp_toks);
+    if (failed || k == 0) {
+        free(vecs); free(vspans);
+        if (!failed && err && errlen) err[0] = '\0';   /* nothing tokenizable */
+        return 0;
+    }
+
+    /* avgVec + coherence over the unit chunk vectors */
+    if (out_avg || out_coh) {
+        float *avg = (float *)malloc((size_t)vec_dim * sizeof(float));
+        if (!avg) { free(vecs); free(vspans); if (err) snprintf(err, errlen, "oom avg"); return 0; }
+        double coh = 1.0;
+        if (k == 1) {
+            memcpy(avg, vecs, (size_t)vec_dim * sizeof(float));
+        } else {
+            double n2 = 0.0;
+            for (int d = 0; d < vec_dim; d++) {
+                double m = 0.0;
+                for (size_t i = 0; i < k; i++) m += (double)vecs[i * (size_t)vec_dim + d];
+                avg[d] = (float)(m / (double)k);
+                n2 += (double)avg[d] * (double)avg[d];
+            }
+            float inv = n2 > 0.0 ? (float)(1.0 / sqrt(n2)) : 1.0f;
+            for (int d = 0; d < vec_dim; d++) avg[d] *= inv;
+            /* coherence = AVERAGE PAIRWISE COSINE between the unit chunk vecs
+             * (k-independent; raw |mean| has a 1/sqrt(k) floor).  Identity:
+             * |mean|^2 = 1/k + (k-1)/k * cbar; clamp to [0,1]. */
+            coh = ((double)k * n2 - 1.0) / ((double)k - 1.0);
+            if (coh < 0.0) coh = 0.0;
+            if (coh > 1.0) coh = 1.0;
+        }
+        if (out_avg) *out_avg = avg; else free(avg);
+        if (out_coh) *out_coh = (float)coh;
+    }
+    if (out_vecs) *out_vecs = vecs; else free(vecs);
+    if (out_k) *out_k = k;
+    if (out_spans) *out_spans = vspans; else free(vspans);
+    return vec_dim;
+}
+
+/* push one vector in the requested pack mode (plain fixed buffer for the
+ * fp16/fp32 modes, matching the historical embedTextToBuf return values) */
+static void ll_push_vec(duk_context *ctx, const float *v, int dim, int pack)
+{
+    if (pack == PACK16) {
+        uint16_t *o = (uint16_t *)duk_push_fixed_buffer(ctx, (duk_size_t)dim * 2);
+        rpvec_f32_to_f16(v, o, (size_t)dim);
+    } else if (pack == PACK32) {
+        float *o = (float *)duk_push_fixed_buffer(ctx, (duk_size_t)dim * 4);
+        memcpy(o, v, (size_t)dim * sizeof(float));
+    } else {
+        duk_push_array(ctx);
+        for (int d = 0; d < dim; d++) {
+            duk_push_number(ctx, (double)v[d]);
+            duk_put_prop_index(ctx, -2, (duk_uarridx_t)d);
+        }
+    }
+}
+
+/* Resolve this embed handle (`this`): model, vec_dim, chunk opts, and the
+ * per-thread llama_context (rebuilt on a new thread/pid, with a CHECKED model
+ * refcount so a copy whose origin was destroyed fails cleanly).  Pushes `this`
+ * and LEAVES it on the stack. */
+static struct llama_context *emb_resolve(duk_context *ctx, const char *what,
+                                         struct llama_model **out_model,
+                                         int *out_dim, int *out_split,
+                                         int *out_min, int *out_pack,
+                                         int *out_sent)
+{
     struct llama_model *lmodel = NULL;
     struct llama_context *lctx = NULL;
 
@@ -1226,7 +1651,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     duk_pop(ctx);
 
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("vec_dim"));
-    vec_dim = duk_get_int(ctx, -1);
+    *out_dim = duk_get_int(ctx, -1);
     duk_pop(ctx);
 
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_thread"));
@@ -1244,24 +1669,26 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     if (curthr != thrno || pidno != curpid )
     {
 
-#ifdef HAVE_CUDA
-        // forking after is bad, mkay
-        if(pidno != curpid && has_gpu_backend() )
-        {
-            RP_THROW(ctx, "llama.cpp - cannot fork llama.cpp with CUDA initialized");
-        }
-#endif
+        // Post-fork refusal: GPU runtimes don't survive fork (CPU continues).
+        if (pidno != curpid && lt_gpu_in_use())
+            RP_THROW(ctx, LT_FORK_REFUSAL);
         duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("cp_buf"));
         struct llama_context_params *cp_buf = duk_get_buffer_data(ctx, -1, NULL);
         duk_pop(ctx);
+
+        // Take this copy's model refcount FIRST, and checked: if the origin copy
+        // (sole ref holder) was destroyed before our first use here, the model is
+        // already freed -- fail cleanly rather than building a context on freed
+        // memory. (Released in emb_free when this copy's context is freed.)
+        if (!lgen_model_addref_checked(lmodel))
+            RP_THROW(ctx, "rampart-llama-cpp:%s - model was destroyed "
+                          "(the originating handle was destroy()ed); create a new handle", what);
         lctx = llama_init_from_model(lmodel, *cp_buf);
 
-        if (!lctx)
-            RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - failed to create llama context on this thread");
-
-        // this copy now holds its own context using the shared model: take a model
-        // refcount for it (released in emb_free when this context is freed).
-        lgen_model_addref(lmodel);
+        if (!lctx) {
+            lgen_model_release(lmodel);
+            RP_THROW(ctx, "rampart-llama-cpp:%s - failed to create llama context on this thread", what);
+        }
 
         duk_push_pointer(ctx, lctx);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
@@ -1273,262 +1700,275 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     }
 
     if (!lctx)
-    {
-        RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - NULL llama_context");
-        return 0;
+        RP_THROW(ctx, "rampart-llama-cpp:%s - NULL llama_context", what);
+
+    /* chunking options stored at initEmbed (split/minTokens/packParagraphs) */
+    *out_split = 0; *out_min = 0; *out_pack = 0;
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("chunk_split"));
+    if (duk_is_number(ctx, -1)) *out_split = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("chunk_min"));
+    if (duk_is_number(ctx, -1)) *out_min = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("chunk_pack"));
+    if (duk_is_number(ctx, -1)) *out_pack = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    *out_sent = 0;
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("chunk_sent"));
+    if (duk_is_number(ctx, -1)) *out_sent = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+
+    *out_model = lmodel;
+    return lctx;
+}
+
+/* avgVec + coherence over k unit chunk vectors (mirrors onnx_embed_avg for
+ * the custom-split path): avg = normalize(mean); coherence = average
+ * pairwise cosine, 1.0 for k == 1.  Returns malloc'd float[dim]. */
+static float *ll_avg_coh(const float *vecs, size_t k, int dim, float *out_coh)
+{
+    float *avg = malloc((size_t)dim * sizeof(float));
+    if (!avg) return NULL;
+    if (k == 1) {
+        memcpy(avg, vecs, (size_t)dim * sizeof(float));
+        if (out_coh) *out_coh = 1.0f;
+        return avg;
     }
+    double norm = 0.0;
+    for (int d = 0; d < dim; d++) {
+        double m = 0.0;
+        for (size_t i = 0; i < k; i++) m += (double)vecs[i * (size_t)dim + d];
+        m /= (double)k;
+        avg[d] = (float)m;
+        norm += m * m;
+    }
+    norm = sqrt(norm);
+    if (norm > 0.0)
+        for (int d = 0; d < dim; d++) avg[d] = (float)((double)avg[d] / norm);
+    if (out_coh) {
+        /* mean pairwise cosine == (|sum|^2 - k) / (k(k-1)) for unit vecs */
+        double c = ((double)k * (double)k * norm * norm - (double)k) /
+                   ((double)k * ((double)k - 1.0));
+        if (c < 0.0) c = 0.0;
+        if (c > 1.0) c = 1.0;
+        *out_coh = (float)c;
+    }
+    return avg;
+}
+
+/* pack != 0 - return fp16 */
+static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
+{
+    if (duk_is_buffer_data(ctx, 0))
+        duk_buffer_to_string(ctx, 0);
+
+    REQUIRE_STRING(ctx, 0, "rampart-llama-cpp:embedTextToBuf - argument must be a String");
+    duk_size_t tlen = 0;
+    const char *text = duk_get_lstring(ctx, 0, &tlen);   /* NUL-safe length */
+
+    int vec_dim = 0, split = 0, minTok = 0, packPara = 0, sentSpl = 0;
+    struct llama_model *lmodel = NULL;
+    struct llama_context *lctx = emb_resolve(ctx, "embedTextToBuf", &lmodel,
+                                             &vec_dim, &split, &minTok, &packPara, &sentSpl);
 
     const struct llama_vocab *vocab = llama_model_get_vocab(lmodel);
 
-    // ---- tokenize full input (probe length)
-    int need = llama_tokenize(vocab, text, (int)strlen(text),
-                              /*tokens*/ NULL, /*n_tokens_max*/ 0,
-                              /*add_special*/ true, /*parse_special*/ true);
-    if (need <= 0)
-        need = -need; // some builds return negative "needed"
+    /* custom splitter (initEmbed split:function): fn(text) -> [String,...];
+     * ONE VECTOR PER STRING, always (mirrors chunkembed(strlst)): a string
+     * that fits the model window gets its exact vector; an oversized string
+     * gets its embed()-style COMBINED (average) vector over its sub-chunks.
+     * chunks report {text, tokens} -- no byte spans (the splitter's text
+     * needn't appear in the input verbatim). */
+    duk_push_this(ctx);
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("chunk_splitfn"));
+    if (duk_is_function(ctx, -1)) {
+        duk_remove(ctx, -2);                        /* this */
+        duk_dup(ctx, 0);                            /* text */
+        duk_call(ctx, 1);
+        if (!duk_is_array(ctx, -1))
+            RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - the split function must return an Array of Strings");
+        duk_idx_t arr = duk_normalize_index(ctx, -1);
+        size_t k = (size_t)duk_get_length(ctx, arr), i;
+        if (k == 0) {
+            duk_push_object(ctx);
+            duk_push_array(ctx);
+            duk_put_prop_string(ctx, -2, "vecs");
+            return 1;
+        }
+        /* calloc: overflow-checked k*size (user split array length) */
+        float  *all  = calloc(k, (size_t)vec_dim * sizeof(float));
+        size_t *ntok = calloc(k, sizeof(size_t));
+        if (!all || !ntok) { free(all); free(ntok); RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - oom"); }
+        int dim = 0;
+        for (i = 0; i < k; i++) {
+            duk_get_prop_index(ctx, arr, (duk_uarridx_t)i);
+            duk_size_t slen = 0;
+            const char *s = duk_is_string(ctx, -1) ? duk_get_lstring(ctx, -1, &slen) : NULL;
+            if (!s || !slen) {
+                free(all); free(ntok);
+                RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - split chunk %lu is not a non-empty String",
+                         (unsigned long)i);
+            }
+            float *v = NULL, *avg1 = NULL;
+            float coh1 = 0.0f;
+            size_t kk = 0;
+            ll_chunk_span *spans = NULL;
+            char err2[256] = {0};
+            dim = ll_embed_doc(lctx, vocab, s, (size_t)slen, NULL, 0, vec_dim,
+                               RP_CHUNK_AUTO, 0, 0, 0, 0,
+                               &v, &kk, &spans, &avg1, &coh1, err2, sizeof err2);
+            duk_pop(ctx);                           /* the string */
+            if (!dim || !kk || !avg1) {
+                free(all); free(ntok); free(v); free(avg1); free(spans);
+                RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - %s (chunk %lu)",
+                         err2[0] ? err2 : "embed failed", (unsigned long)i);
+            }
+            /* the combined vector: == the exact vector when the string fits
+             * one window (kk == 1), the normalized mean of its sub-chunk
+             * vectors otherwise */
+            memcpy(all + i * (size_t)dim, avg1, (size_t)dim * sizeof(float));
+            ntok[i] = 0;
+            if (spans) {
+                size_t j;
+                for (j = 0; j < kk; j++) ntok[i] += (size_t)spans[j].n_tokens;
+            }
+            free(v); free(avg1); free(spans);
+        }
+        float coh = 0.0f;
+        float *avg = ll_avg_coh(all, k, dim, &coh);
+        if (!avg) { free(all); free(ntok); RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - oom"); }
+        duk_push_object(ctx);
+        duk_push_array(ctx);
+        for (i = 0; i < k; i++) {
+            ll_push_vec(ctx, all + i * (size_t)dim, dim, pack);
+            duk_put_prop_index(ctx, -2, (duk_uarridx_t)i);
+        }
+        duk_put_prop_string(ctx, -2, "vecs");
+        ll_push_vec(ctx, avg, dim, pack);
+        duk_put_prop_string(ctx, -2, "avgVec");
+        duk_push_number(ctx, (double)coh);
+        duk_put_prop_string(ctx, -2, "coherence");
+        duk_push_array(ctx);
+        for (i = 0; i < k; i++) {
+            duk_push_object(ctx);
+            duk_get_prop_index(ctx, arr, (duk_uarridx_t)i);
+            duk_put_prop_string(ctx, -2, "text");
+            duk_push_number(ctx, (double)ntok[i]);
+            duk_put_prop_string(ctx, -2, "tokens");
+            duk_put_prop_index(ctx, -2, (duk_uarridx_t)i);
+        }
+        duk_put_prop_string(ctx, -2, "chunks");
+        free(all); free(ntok); free(avg);
+        return 1;
+    }
+    duk_pop_2(ctx);                                 /* fn slot + this */
 
-    if (need <= 0)
-    {
-        // empty/whitespace-only input: same {vecs:[...]} shape as the normal path
+    /* structure-aware chunk + decode (rp-chunker; see ll_embed_doc) */
+    char err[256] = {0};
+    float *vecs = NULL, *avg = NULL;
+    float coh = 0.0f;
+    size_t k = 0;
+    ll_chunk_span *spans = NULL;
+    int dim = ll_embed_doc(lctx, vocab, text, (size_t)tlen, NULL, 0, vec_dim,
+                           split, minTok, packPara, sentSpl, 0,
+                           &vecs, &k, &spans, &avg, &coh, err, sizeof err);
+    if (!dim) {
+        if (err[0])
+            RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - %s", err);
+        /* empty/whitespace input: same { vecs: [] } shape as before */
         duk_push_object(ctx);
         duk_push_array(ctx);
         duk_put_prop_string(ctx, -2, "vecs");
         return 1;
     }
 
-    // materialize tokens
-    llama_token *toks = NULL;
-    CALLOC(toks, (size_t)need * sizeof *toks);
-
-    int nw = llama_tokenize(vocab, text, (int)strlen(text), toks, need, /*add_special*/ true, /*parse_special*/ true);
-
-    if (nw <= 0)
-        nw = -nw;
-    if (nw > need)
-        nw = need;
-
-    // runtime limits
-    const int n_ctx = llama_n_ctx(lctx);
-    int n_ubatch = llama_n_ubatch(lctx); // recent llama.cpp API
-    if (n_ubatch <= 0)
-        n_ubatch = n_ctx; // permissive fallback
-
-    // chunking params
-    int chunk_tokens = (n_ctx < n_ubatch ? n_ctx : n_ubatch);
-    int overlap = chunk_tokens / 8;
-
-    if (chunk_tokens <= 0)
-    {
-        free(toks);
-        RP_THROW(ctx, "invalid runtime limits (ctx=%d, ubatch=%d)", n_ctx, n_ubatch);
-        return 0;
-    }
-
-    if (overlap < 0)
-        overlap = 0;
-    if (overlap >= chunk_tokens)
-        overlap = chunk_tokens - 1;
-    int stride = chunk_tokens - overlap;
-
-    // for avg vector
-    float *avgvec = NULL;
-    CALLOC(avgvec, sizeof(float) * vec_dim);
-
-    // f32 staging buffer for the fp16 pack path (heap, not a VLA: vec_dim is
-    // model-controlled and could overflow the stack)
-    float *f32tmp = NULL;
-    if (pack == PACK16)
-        CALLOC(f32tmp, sizeof(float) * vec_dim);
-
-    // the return object
     duk_push_object(ctx);
-
-    // result array (Array of ArrayBuffer)
-    duk_idx_t arr_idx = duk_push_array(ctx);
-
-    int k = 0;
-
-    const enum llama_pooling_type p = llama_pooling_type(lctx);
-
-    llama_set_embeddings(lctx, true); // b9494: ensure embeddings output mode is on
-
-    for (int start = 0; start < nw; start += stride, ++k)
-    {
-        llama_memory_clear(llama_get_memory(lctx), /*clear_kv=*/true);
-        int n = nw - start;
-        if (n > chunk_tokens)
-            n = chunk_tokens;
-
-        // encoder path requires: n_tokens <= n_ubatch
-        if (n > n_ubatch)
-        {
-            free(toks);
-            free(avgvec);
-            free(f32tmp);
-            RP_THROW(ctx, "chunk too large for micro-batch (n=%d > n_ubatch=%d). Increase ubatch and/or batch.", n, n_ubatch);
-            return 0;
-        }
-
-        // build batch for this chunk
-        struct llama_batch batch = llama_batch_init(/*capacity*/ n, /*embd*/ 0, /*n_seq_max*/ 1);
-        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits)
-        {
-            llama_batch_free(batch);
-            free(toks);
-            free(avgvec);
-            free(f32tmp);
-            RP_THROW(ctx, "llama_batch_init failed");
-            return 0;
-        }
-        for (int i = 0; i < n; ++i)
-        {
-            batch.token[i] = toks[start + i];
-            batch.pos[i] = i; // 0..n-1 within this window
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0; // single sequence id 0
-            batch.logits[i] = 1;    // contribute to pooled embedding
-        }
-        batch.n_tokens = n;
-        // NOTE (llama.cpp b9494): embedding/pooling now uses llama_decode with the
-        // per-token output flags (batch.logits[i]=1) set above; the old workaround
-        // of nulling batch.logits and calling llama_encode yields no pooled output.
-
-        if (llama_decode(lctx, batch) != 0)
-        {
-            llama_batch_free(batch);
-            free(toks);
-            free(avgvec);
-            free(f32tmp);
-            RP_THROW(ctx, "llama_decode failed on chunk %d (tokens %d..%d)", k, start, start + n - 1);
-            return 0;
-        }
-
-        // read pooled embedding
-        const float *emb =
-            (p == LLAMA_POOLING_TYPE_NONE) ? llama_get_embeddings_ith(lctx, n - 1) : llama_get_embeddings_seq(lctx, 0);
-
-        llama_batch_free(batch);
-
-        if (!emb)
-        {
-            free(toks);
-            free(avgvec);
-            free(f32tmp);
-            RP_THROW(ctx, "no embedding returned (chunk %d)", k);
-            return 0;
-        }
-
-        // L2-normalize and pack to fp16 (little-endian) or else make an array of Numbers
-        double norm2 = 0.0;
-        for (int i = 0; i < vec_dim; ++i)
-            norm2 += (double)emb[i] * (double)emb[i];
-
-        float inv = norm2 > 0.0 ? (float)(1.0 / (sqrt(norm2))) : 1;
-
-        if (pack == PACK16)
-        {
-            uint16_t *out = (uint16_t *)duk_push_fixed_buffer(ctx, (duk_size_t)(2 * vec_dim));
-            for (int i = 0; i < vec_dim; ++i)
-            {
-                f32tmp[i] = emb[i] * inv;
-                avgvec[i] += f32tmp[i];
-            }
-            rpvec_f32_to_f16(f32tmp, out, vec_dim);
-        }
-        else if (pack == PACK32)
-        {
-            float *out = (float *)duk_push_fixed_buffer(ctx, (duk_size_t)(4 * vec_dim));
-            for (int i = 0; i < vec_dim; ++i)
-            {
-                out[i] = emb[i] * inv;
-                avgvec[i] += out[i];
-            }
-        }
-        else
-        {
-            duk_push_array(ctx);
-            for (int i = 0; i < vec_dim; ++i)
-            {
-                double v = (double)emb[i] * (double)inv;
-                duk_push_number(ctx, v);
-                duk_put_prop_index(ctx, -2, (duk_uarridx_t)i);
-                avgvec[i] += v;
-            }
-        }
-
-        // arr[k] = buffer/array of Numbers(doubles)
-        duk_put_prop_index(ctx, arr_idx, (duk_uarridx_t)k);
+    duk_push_array(ctx);
+    for (size_t i = 0; i < k; i++) {
+        ll_push_vec(ctx, vecs + i * (size_t)dim, dim, pack);
+        duk_put_prop_index(ctx, -2, (duk_uarridx_t)i);
     }
-    // we have only one, just copy it to avgvec
-    if (k == 1)
-    {
-        free(toks);
-        free(avgvec); // not needed - same as existing sole vec
-        free(f32tmp);
-        // [ ..., object, array ]
-        duk_dup(ctx, -1);
-        // [ ..., object, array, arraydup ]
-        duk_put_prop_string(ctx, -3, "vecs");
-        // [ ..., object, arraydup ]
-        duk_get_prop_index(ctx, -1, 0);
-        // [ ..., object, arraydup, vec ]
-        duk_put_prop_string(ctx, -3, "avgVec");
-        // [ ..., object, arraydup]
-        duk_pop(ctx);
-        // [ ..., object]
-        return 1;
-    }
-
     duk_put_prop_string(ctx, -2, "vecs");
-
-    if (k > 1)
-    {
-        double norm2 = 0.0;
-
-        for (int i = 0; i < vec_dim; ++i)
-        {
-            avgvec[i] /= (float)k;
-            norm2 += (double)avgvec[i] * (double)avgvec[i];
+    ll_push_vec(ctx, avg, dim, pack);
+    duk_put_prop_string(ctx, -2, "avgVec");
+    duk_push_number(ctx, (double)coh);
+    duk_put_prop_string(ctx, -2, "coherence");
+    duk_push_array(ctx);
+    for (size_t i = 0; i < k; i++) {
+        duk_push_object(ctx);
+        duk_push_number(ctx, (double)spans[i].start);
+        duk_put_prop_string(ctx, -2, "start");
+        duk_push_number(ctx, (double)spans[i].end);
+        duk_put_prop_string(ctx, -2, "end");
+        duk_push_number(ctx, (double)spans[i].n_tokens);
+        duk_put_prop_string(ctx, -2, "tokens");
+        duk_push_lstring(ctx, text + spans[i].start,
+                         (duk_size_t)(spans[i].end - spans[i].start));
+        duk_put_prop_string(ctx, -2, "text");
+        /* oversized: one of several token windows over a span that exceeded
+         * the model window (sub-windows share their span) */
+        if ((i > 0 && spans[i-1].start == spans[i].start
+                   && spans[i-1].end   == spans[i].end)
+            || (i + 1 < k && spans[i+1].start == spans[i].start
+                          && spans[i+1].end   == spans[i].end)) {
+            duk_push_true(ctx);
+            duk_put_prop_string(ctx, -2, "oversized");
         }
+        duk_put_prop_index(ctx, -2, (duk_uarridx_t)i);
+    }
+    duk_put_prop_string(ctx, -2, "chunks");
+    free(vecs);
+    free(avg);
+    free(spans);
+    return 1;
+}
 
-        float inv = norm2 > 0.0 ? (float)(1.0 / (sqrt(norm2))) : 1;
+/* embedTextsToNumbers(texts[, isQuery]) -> [ { avgVec:[...] }, ... ]
+ * Return-shape parity with rampart-onnx's embedTextsToNumbers.  Each text gets
+ * the full structure-aware chunked embed's avgVec (llamacpp has no cross-text
+ * batching; texts run sequentially on this thread's context).  isQuery is
+ * accepted for signature parity and ignored (no prefix support here). */
+static duk_ret_t embed_texts_to_numbers(duk_context *ctx)
+{
+    REQUIRE_ARRAY(ctx, 0, "rampart-llama-cpp:embedTextsToNumbers - argument must be an Array of Strings");
 
-        if (pack == PACK16)
-        {
-            uint16_t *out = (uint16_t *)duk_push_fixed_buffer(ctx, (duk_size_t)(2 * vec_dim));
+    int vec_dim = 0, split = 0, minTok = 0, packPara = 0, sentSpl = 0;
+    struct llama_model *lmodel = NULL;
+    struct llama_context *lctx = emb_resolve(ctx, "embedTextsToNumbers", &lmodel,
+                                             &vec_dim, &split, &minTok, &packPara, &sentSpl);
+    const struct llama_vocab *vocab = llama_model_get_vocab(lmodel);
 
-            for (int i = 0; i < vec_dim; ++i)
-            {
-                avgvec[i] *= inv;
-            }
-            rpvec_f32_to_f16(avgvec, out, vec_dim);
-        }
-        else if (pack == PACK32)
-        {
-            float *out = (float *)duk_push_fixed_buffer(ctx, (duk_size_t)(4 * vec_dim));
-            for (int i = 0; i < vec_dim; ++i)
-            {
-                out[i] = avgvec[i] * inv;
-            }
-        }
-        else
-        {
-            duk_push_array(ctx);
-            for (int i = 0; i < vec_dim; ++i)
-            {
-                double v = (double)avgvec[i] * (double)inv;
-                duk_push_number(ctx, v);
-                duk_put_prop_index(ctx, -2, (duk_uarridx_t)i);
-            }
+    duk_uarridx_t n = (duk_uarridx_t)duk_get_length(ctx, 0);
+    duk_push_array(ctx);   /* result */
+    for (duk_uarridx_t i = 0; i < n; i++) {
+        duk_get_prop_index(ctx, 0, i);
+        duk_size_t tlen = 0;
+        const char *text = duk_get_lstring(ctx, -1, &tlen);
+        if (!text)
+            RP_THROW(ctx, "rampart-llama-cpp:embedTextsToNumbers - texts[%lu] is not a String",
+                     (unsigned long)i);
+
+        char err[256] = {0};
+        float *avg = NULL;
+        int dim = ll_embed_doc(lctx, vocab, text, (size_t)tlen, NULL, 0, vec_dim,
+                               split, minTok, packPara, sentSpl, 0,
+                               NULL, NULL, NULL, &avg, NULL, err, sizeof err);
+        duk_pop(ctx);   /* text */
+        if (!dim && err[0])
+            RP_THROW(ctx, "rampart-llama-cpp:embedTextsToNumbers - %s (text %lu)",
+                     err, (unsigned long)i);
+
+        duk_push_object(ctx);
+        if (dim) {
+            ll_push_vec(ctx, avg, dim, NOPACK);
+            free(avg);
+        } else {
+            duk_push_array(ctx);   /* empty/whitespace text -> empty avgVec */
         }
         duk_put_prop_string(ctx, -2, "avgVec");
+        duk_put_prop_index(ctx, -2, i);
     }
-
-    free(toks);
-    free(avgvec);
-    free(f32tmp);
-
-    return 1; // -> [ ArrayBuffer(fp16), ArrayBuffer(fp16), ... ]
+    return 1;
 }
 
 static duk_ret_t embed_text_to_buf32(duk_context *ctx)
@@ -1558,6 +1998,9 @@ static duk_ret_t embed_text_to_numbers(duk_context *ctx)
  *   rp_embed_load(path)        → opaque rp_embed_handle*, refcounted
  *   rp_embed_text(h, ...)      → avgVec (L2-normalized mean of
  *                                 L2-normalized per-chunk vecs)
+ *   rp_embed_doc(h, ...)       → per-chunk vecs + {start,end,n_tokens}
+ *                                 spans + avgVec + coherence (mirrors
+ *                                 rampart-onnx's rp_onnx_embed_doc)
  *   rp_embed_dim(h)            → model embedding dim
  *   rp_embed_release(h)        → decrement; free if last ref
  *
@@ -1583,6 +2026,8 @@ static duk_ret_t embed_text_to_numbers(duk_context *ctx)
  * thread gets its own llama_context (no per-thread model load). */
 typedef struct {
     int                    thread_num;
+    int                    pid;        /* fork guard: a child must never decode
+                                        * on a context inherited from the parent */
     struct llama_context  *lctx;
 } rp_thread_ctx_t;
 
@@ -1597,6 +2042,11 @@ typedef struct rp_embed_handle_s {
     rp_thread_ctx_t            *thread_ctxs;
     int                         n_thread_ctxs;
     int                         cap_thread_ctxs;
+    int                         init_pid;    /* pid at load: post-fork GPU use is refused */
+    /* Doc-result cache (own mutex, not h->mtx): one model run of a text
+     * feeds chunkembed()/chunkavg()/chunkcoherence()/embed(), keyed on
+     * the text.  See rp-embed-cache.h. */
+    rp_doccache_t            doc_cache;
     struct rp_embed_handle_s   *next;       /* cache linked list */
 } rp_embed_handle_t;
 
@@ -1627,12 +2077,32 @@ static rp_embed_handle_t *rp_embed_cache_get(const char *path)
     return h;
 }
 
-static void rp_embed_cache_put(rp_embed_handle_t *h)
+/* Publish `h`, deduping under the lock: if another thread finished loading
+ * the same path while we were building, destroy ours and share the winner.
+ * Without this, threads racing the FIRST load each keep a private handle --
+ * and a private doc cache -- silently defeating cross-thread sharing.
+ * (llama.cpp dedups the underlying model internally, so freeing ours just
+ * drops a refcount.)  Returns the canonical handle. */
+static rp_embed_handle_t *rp_embed_cache_put(rp_embed_handle_t *h)
 {
     pthread_mutex_lock(&rp_embed_cache_lock);
+    for (rp_embed_handle_t *c = rp_embed_cache_head; c; c = c->next) {
+        if (strcmp(c->path, h->path) == 0) {
+            c->refcount++;
+            pthread_mutex_unlock(&rp_embed_cache_lock);
+            if (h->lctx)   llama_free(h->lctx);
+            if (h->lmodel) llama_model_free(h->lmodel);
+            rp_doccache_destroy(&h->doc_cache);
+            pthread_mutex_destroy(&h->mtx);
+            free(h->path);
+            free(h);
+            return c;
+        }
+    }
     h->next = rp_embed_cache_head;
     rp_embed_cache_head = h;
     pthread_mutex_unlock(&rp_embed_cache_lock);
+    return h;
 }
 
 /* CUDA graphs (ggml) are cached per shape in a per-context map that only evicts
@@ -1669,13 +2139,16 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
         return NULL;
     }
     h->path = strdup(path);
+    h->init_pid = (int)getpid();
     pthread_mutex_init(&h->mtx, NULL);
+    rp_doccache_init(&h->doc_cache, RP_DOCCACHE_DEFAULT_CAP);
 
     struct llama_model_params mp = llama_model_default_params();
 #if HAVE_CUDA
     {  /* GPU build: always check; lt_gpu_kernel_supported self-gates on has_gpu_backend */
         int dev = mp.main_gpu >= 0 ? mp.main_gpu : 0;
         if (!lt_gpu_kernel_supported(dev, err, errlen)) {
+            rp_doccache_destroy(&h->doc_cache);
             free(h->path);
             pthread_mutex_destroy(&h->mtx);
             free(h);
@@ -1688,6 +2161,7 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
         if (err && errlen)
             snprintf(err, errlen, "rp_embed_load: could not load '%s': %s",
                      path, strerror(errno));
+        rp_doccache_destroy(&h->doc_cache);
         free(h->path);
         pthread_mutex_destroy(&h->mtx);
         free(h);
@@ -1699,6 +2173,7 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
         if (err && errlen)
             snprintf(err, errlen, "rp_embed_load: bad vec dim %d", h->vec_dim);
         llama_model_free(h->lmodel);
+        rp_doccache_destroy(&h->doc_cache);
         free(h->path);
         pthread_mutex_destroy(&h->mtx);
         free(h);
@@ -1728,6 +2203,7 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
         if (err && errlen)
             snprintf(err, errlen, "rp_embed_load: llama_init_from_model failed");
         llama_model_free(h->lmodel);
+        rp_doccache_destroy(&h->doc_cache);
         free(h->path);
         pthread_mutex_destroy(&h->mtx);
         free(h);
@@ -1746,8 +2222,9 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
     }
 
     h->refcount = 1;
-    rp_embed_cache_put(h);
-    return h;
+    /* May return an equivalent handle that won a concurrent load race
+     * (ours is then destroyed) -- callers must use the return value. */
+    return rp_embed_cache_put(h);
 }
 
 int rp_embed_dim(void *handle)
@@ -1756,11 +2233,86 @@ int rp_embed_dim(void *handle)
     return ((rp_embed_handle_t *)handle)->vec_dim;
 }
 
-/* avgVec compute path, mirrors lines 1985-2207 of embed_text_to_
- * minus the duktape array building / NOPACK / PACK16 paths.
- * Always returns a freshly malloc'd L2-normalized f32 vec of dim.
- * Takes lctx explicitly so per-thread variants can pass their own;
- * lmodel comes from h (shared). */
+/* Resize this handle's doc-result cache (cap == 0 disables it).  Backs
+ * sql.set({llamaEmbed:..., likevCache:N}). */
+void rp_embed_set_cache_cap(void *handle, size_t cap)
+{
+    if (!handle) return;
+    rp_doccache_set_cap(&((rp_embed_handle_t *)handle)->doc_cache, cap);
+}
+
+/* Cached doc-embed core shared by rp_embed_doc (chunkembed/chunkavg/
+ * chunkcoherence) and rp_embed_compute_avgvec (embed()).  Checks the
+ * handle's doc-result cache first; on a miss runs ll_embed_doc once
+ * (forcing avg+coh so a later embed()/chunkavg() on the same text is
+ * served from cache), stores {vecs, avg, coh}, and hands out the pieces
+ * the caller asked for.  spans (out_chunks) are NOT cached; callers
+ * wanting them bypass the cache.  `lock_compute` wraps the model run in
+ * h->mtx (shared-ctx mode); the cache uses its own mutex, so a cache
+ * hit never contends with an in-flight embed of a different text.
+ * Takes lctx explicitly (per-thread or shared, resolved by the caller). */
+static int ll_embed_doc_cached(rp_embed_handle_t *h, struct llama_context *lctx,
+                               const char *text, size_t tlen,
+                               const char *prefix, size_t plen,
+                               int lock_compute,
+                               float **out_vecs, size_t *out_k,
+                               ll_chunk_span **out_chunks,
+                               float **out_avg, float *out_coh,
+                               char *err, size_t errlen)
+{
+    if (out_vecs) *out_vecs = NULL;
+    if (out_k) *out_k = 0;
+    if (out_chunks) *out_chunks = NULL;
+    if (out_avg) *out_avg = NULL;
+    if (out_coh) *out_coh = 0.0f;
+    if (!h || !lctx || !text || tlen == 0) return 0;
+    if (!prefix) plen = 0;
+
+    int cacheable = (out_chunks == NULL);
+    if (cacheable) {
+        float *cv = NULL, *ca = NULL, cc = 0.0f;
+        size_t ck = 0; int cd = 0;
+        if (rp_doccache_get(&h->doc_cache, text, tlen, prefix, plen,
+                               out_vecs ? &cv : NULL, &ck, &cd,
+                               out_avg  ? &ca : NULL, &cc)) {
+            if (out_vecs) *out_vecs = cv;
+            if (out_k)    *out_k    = ck;
+            if (out_avg)  *out_avg  = ca;
+            if (out_coh)  *out_coh  = cc;
+            return cd;
+        }
+    }
+
+    const struct llama_vocab *vocab = llama_model_get_vocab(h->lmodel);
+    /* On the cacheable path always compute vecs+avg+coh so the stored
+     * entry can serve any of the four scalars later, regardless of which
+     * one triggered this run. */
+    float *vecs = NULL, *avg = NULL, coh = 0.0f;
+    size_t k = 0;
+    int need_vecs = cacheable || (out_vecs != NULL);
+    int need_avg  = cacheable || (out_avg  != NULL) || (out_coh != NULL);
+
+    if (lock_compute) pthread_mutex_lock(&h->mtx);
+    int dim = ll_embed_doc(lctx, vocab, text, tlen, prefix, plen, h->vec_dim,
+                           RP_CHUNK_AUTO, 0, 0, 0, 0,
+                           need_vecs ? &vecs : NULL, &k, out_chunks,
+                           need_avg ? &avg : NULL, need_avg ? &coh : NULL,
+                           err, errlen);
+    if (lock_compute) pthread_mutex_unlock(&h->mtx);
+    if (!dim) { free(vecs); free(avg); return 0; }
+
+    if (cacheable)
+        rp_doccache_put(&h->doc_cache, text, tlen, prefix, plen, vecs, k, dim, avg, coh);
+
+    if (out_vecs) *out_vecs = vecs; else free(vecs);
+    if (out_k)    *out_k    = k;
+    if (out_avg)  *out_avg  = avg;  else free(avg);
+    if (out_coh)  *out_coh  = coh;
+    return dim;
+}
+
+/* avgVec compute path (embed()): the L2-normalized mean over a text's
+ * chunk vectors, via the cached core. */
 static size_t rp_embed_compute_avgvec(rp_embed_handle_t *h,
                                       struct llama_context *lctx,
                                       const char *text, size_t tlen,
@@ -1769,120 +2321,16 @@ static size_t rp_embed_compute_avgvec(rp_embed_handle_t *h,
 {
     *out_vec = NULL;
     if (!h || !lctx || !text || tlen == 0) return 0;
-
-    const struct llama_vocab *vocab = llama_model_get_vocab(h->lmodel);
-    int need = llama_tokenize(vocab, text, (int)tlen,
-                              NULL, 0, /*add_special*/true, /*parse_special*/true);
-    if (need <= 0) need = -need;
-    if (need <= 0) return 0;   /* empty/whitespace text */
-
-    llama_token *toks = (llama_token *)calloc((size_t)need, sizeof(*toks));
-    if (!toks) { if (err) snprintf(err, errlen, "oom tokens"); return 0; }
-
-    int nw = llama_tokenize(vocab, text, (int)tlen, toks, need,
-                            /*add_special*/true, /*parse_special*/true);
-    if (nw <= 0) nw = -nw;
-    if (nw > need) nw = need;
-
-    const int n_ctx     = llama_n_ctx(lctx);
-    int       n_ubatch  = llama_n_ubatch(lctx);
-    if (n_ubatch <= 0) n_ubatch = n_ctx;
-
-    int chunk_tokens = (n_ctx < n_ubatch ? n_ctx : n_ubatch);
-    int overlap      = chunk_tokens / 8;
-    if (chunk_tokens <= 0) {
-        free(toks);
-        if (err) snprintf(err, errlen, "invalid limits (n_ctx=%d ubatch=%d)",
-                          n_ctx, n_ubatch);
-        return 0;
-    }
-    if (overlap < 0) overlap = 0;
-    if (overlap >= chunk_tokens) overlap = chunk_tokens - 1;
-    int stride = chunk_tokens - overlap;
-
-    float *avgvec = (float *)calloc((size_t)h->vec_dim, sizeof(float));
-    if (!avgvec) { free(toks); if (err) snprintf(err, errlen, "oom avgvec"); return 0; }
-
-    int k = 0;
-    const enum llama_pooling_type p = llama_pooling_type(lctx);
-
-    llama_set_embeddings(lctx, true); // b9494: ensure embeddings output mode is on
-
-    for (int start = 0; start < nw; start += stride, ++k) {
-        llama_memory_clear(llama_get_memory(lctx), /*clear_kv=*/true);
-        int n = nw - start;
-        if (n > chunk_tokens) n = chunk_tokens;
-        if (n > n_ubatch) {
-            free(toks); free(avgvec);
-            if (err) snprintf(err, errlen, "chunk too large (n=%d > ubatch=%d)",
-                              n, n_ubatch);
-            return 0;
-        }
-
-        struct llama_batch batch =
-            llama_batch_init(/*capacity*/n, /*embd*/0, /*n_seq_max*/1);
-        if (!batch.token || !batch.pos || !batch.n_seq_id ||
-            !batch.seq_id || !batch.logits) {
-            llama_batch_free(batch);
-            free(toks); free(avgvec);
-            if (err) snprintf(err, errlen, "llama_batch_init failed");
-            return 0;
-        }
-        for (int i = 0; i < n; ++i) {
-            batch.token[i]    = toks[start + i];
-            batch.pos[i]      = i;
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]   = 1;
-        }
-        batch.n_tokens = n;
-
-        if (llama_decode(lctx, batch) != 0) {
-            llama_batch_free(batch);
-            free(toks); free(avgvec);
-            if (err) snprintf(err, errlen, "llama_decode failed on chunk %d", k);
-            return 0;
-        }
-
-        const float *emb = (p == LLAMA_POOLING_TYPE_NONE)
-                         ? llama_get_embeddings_ith(lctx, n - 1)
-                         : llama_get_embeddings_seq(lctx, 0);
-        llama_batch_free(batch);
-
-        if (!emb) {
-            free(toks); free(avgvec);
-            if (err) snprintf(err, errlen, "no embedding on chunk %d", k);
-            return 0;
-        }
-
-        /* L2-normalize this chunk and accumulate */
-        double norm2 = 0.0;
-        for (int i = 0; i < h->vec_dim; ++i)
-            norm2 += (double)emb[i] * (double)emb[i];
-        float inv = norm2 > 0.0 ? (float)(1.0 / sqrt(norm2)) : 1.0f;
-        for (int i = 0; i < h->vec_dim; ++i)
-            avgvec[i] += emb[i] * inv;
-    }
-    free(toks);
-
-    if (k == 0) {
-        free(avgvec);
-        return 0;
-    }
-
-    /* Mean across chunks, then L2-normalize.  For k==1 this is a
-     * no-op (avgvec is already a unit-norm vector) but the math
-     * comes out identical so no special case needed. */
-    double norm2 = 0.0;
-    for (int i = 0; i < h->vec_dim; ++i) {
-        avgvec[i] /= (float)k;
-        norm2 += (double)avgvec[i] * (double)avgvec[i];
-    }
-    float inv = norm2 > 0.0 ? (float)(1.0 / sqrt(norm2)) : 1.0f;
-    for (int i = 0; i < h->vec_dim; ++i) avgvec[i] *= inv;
-
-    *out_vec = avgvec;
-    return (size_t)h->vec_dim;
+    /* lock_compute = 0: callers hold the appropriate ctx discipline
+     * (per-thread lctx = no lock; shared = serialized path passes its
+     * own lctx and we run unlocked here because rp_embed_text already
+     * holds h->mtx in that mode -- see below). */
+    float *avg = NULL;
+    int dim = ll_embed_doc_cached(h, lctx, text, tlen, NULL, 0, /*lock_compute*/0,
+                                  NULL, NULL, NULL, &avg, NULL, err, errlen);
+    if (!dim) return 0;
+    *out_vec = avg;
+    return (size_t)dim;
 }
 
 /* Find or create the calling thread's llama_context (shared lmodel
@@ -1892,11 +2340,20 @@ static struct llama_context *
 get_per_thread_ctx(rp_embed_handle_t *h)
 {
     int thrno = (int)get_thread_num();
+    int pid   = (int)getpid();
     struct llama_context *lctx = NULL;
+
+    /* Post-fork refusal (see fork policy above): a child inheriting this
+     * handle may continue only on CPU. */
+    if (pid != h->init_pid && lt_gpu_in_use()) {
+        static int warned = 0;
+        if (!warned) { warned = 1; lt_warn("%s\n", LT_FORK_REFUSAL); }
+        return NULL;
+    }
 
     pthread_mutex_lock(&h->mtx);
     for (int i = 0; i < h->n_thread_ctxs; i++) {
-        if (h->thread_ctxs[i].thread_num == thrno) {
+        if (h->thread_ctxs[i].thread_num == thrno && h->thread_ctxs[i].pid == pid) {
             lctx = h->thread_ctxs[i].lctx;
             goto out;
         }
@@ -1912,6 +2369,7 @@ get_per_thread_ctx(rp_embed_handle_t *h)
     lctx = llama_init_from_model(h->lmodel, h->cp);
     if (lctx) {
         h->thread_ctxs[h->n_thread_ctxs].thread_num = thrno;
+        h->thread_ctxs[h->n_thread_ctxs].pid        = pid;
         h->thread_ctxs[h->n_thread_ctxs].lctx       = lctx;
         h->n_thread_ctxs++;
     }
@@ -1930,7 +2388,7 @@ size_t rp_embed_text(void *handle, const char *text, size_t tlen, float **out_ve
     if (g_embed_per_thread) {
         struct llama_context *lctx = get_per_thread_ctx(h);
         if (!lctx) {
-            fprintf(stderr, "rp_embed_text: failed to allocate per-thread context\n");
+            lt_warn("rp_embed_text: failed to allocate per-thread context\n");
             return 0;
         }
         /* No mutex around the embed — each thread owns its lctx.
@@ -1946,8 +2404,110 @@ size_t rp_embed_text(void *handle, const char *text, size_t tlen, float **out_ve
     }
 
     if (dim == 0 && err[0])
-        fprintf(stderr, "rp_embed_text: %s\n", err);
+        lt_warn("rp_embed_text: %s\n", err);
     return dim;
+}
+
+/* Chunk-level variant of rp_embed_text: also yields the per-chunk vectors,
+ * the coherence signal, and each chunk's BYTE span in the input text --
+ * mirrors rampart-onnx's rp_onnx_embed_doc so a host (rampart-sql) can treat
+ * either embedding backend identically.  Chunking is the same rp-chunker
+ * structure-aware split (auto mode: one vector per blank-line paragraph,
+ * 32-token fragment floor; window+overlap fallback).
+ * On success returns dim (>0) and fills (any out pointer may be NULL):
+ *   *out_vecs      = malloc'd float[k*dim]  unit chunk vectors, row-major
+ *   *out_k         = k
+ *   *out_avg       = malloc'd float[dim]    normalize(mean of unit chunk vecs)
+ *   *out_coherence = avg pairwise cosine between the unit chunk vectors,
+ *                    clamped to [0,1] (k-independent); 1.0 when k==1
+ *   *out_chunks    = malloc'd rp_embed_chunk_span[k]: {start,end,n_tokens};
+ *                    window sub-chunks of an unstructured region share its span
+ * Returns 0 on failure or empty/untokenizable text. */
+typedef struct { size_t start, end, n_tokens; } rp_embed_chunk_span;
+
+/* Interface marker: rampart-sql requires this symbol so a stale module
+ * (older rp_embed_doc signature, no per-doc prefix) fails loudly at
+ * sql.set instead of crashing on a signature mismatch.  Bump the name
+ * (v3 -> v4...) whenever an exported embed function signature changes. */
+int rp_embed_iface_v3(void) { return 3; }
+
+size_t rp_embed_doc(void *handle, const char *text, size_t tlen,
+                    const char *prefix, size_t plen,
+                    float **out_vecs, size_t *out_k,
+                    float **out_avg, float *out_coherence,
+                    rp_embed_chunk_span **out_chunks)
+{
+    if (out_vecs) *out_vecs = NULL;
+    if (out_k) *out_k = 0;
+    if (out_avg) *out_avg = NULL;
+    if (out_coherence) *out_coherence = 0.0f;
+    if (out_chunks) *out_chunks = NULL;
+    if (!handle) return 0;
+    rp_embed_handle_t *h = (rp_embed_handle_t *)handle;
+    char err[256] = {0};
+    int dim = 0;
+
+    /* rp_embed_chunk_span is layout-identical to the internal ll_chunk_span.
+     * Per-thread mode: each thread owns its lctx -> no compute lock.
+     * Shared-ctx mode: one lctx -> the cached core locks h->mtx around the
+     * model run (lock_compute=1). */
+    if (g_embed_per_thread) {
+        struct llama_context *lctx = get_per_thread_ctx(h);
+        if (!lctx) {
+            lt_warn("rp_embed_doc: failed to allocate per-thread context\n");
+            return 0;
+        }
+        dim = ll_embed_doc_cached(h, lctx, text, tlen, prefix, plen, /*lock_compute*/0,
+                                  out_vecs, out_k, (ll_chunk_span **)out_chunks,
+                                  out_avg, out_coherence, err, sizeof err);
+    } else {
+        dim = ll_embed_doc_cached(h, h->lctx, text, tlen, prefix, plen, /*lock_compute*/1,
+                                  out_vecs, out_k, (ll_chunk_span **)out_chunks,
+                                  out_avg, out_coherence, err, sizeof err);
+    }
+    if (dim == 0 && err[0])
+        lt_warn("rp_embed_doc: %s\n", err);
+    return (size_t)dim;
+}
+
+/* Spans-only variant of rp_embed_doc: the byte spans + window walk the
+ * doc embed would produce, WITHOUT decoding (tokenize + chunk only).
+ * Deterministic w.r.t. the handle's chunking params, so spans line up
+ * 1:1 with a chunkembed() of the same text.  Returns k (>= 1) and sets
+ * *out_spans (malloc'd, caller frees); 0 on failure. */
+size_t rp_embed_spans(void *handle, const char *text, size_t tlen,
+                      rp_embed_chunk_span **out_spans)
+{
+    if (out_spans) *out_spans = NULL;
+    if (!handle || !text || tlen == 0 || !out_spans) return 0;
+    rp_embed_handle_t *h = (rp_embed_handle_t *)handle;
+    const struct llama_vocab *vocab = llama_model_get_vocab(h->lmodel);
+    char err[256] = {0};
+    size_t k = 0;
+    int dim;
+
+    /* Still needs an lctx for the token-window size (n_ctx/n_ubatch);
+     * no decode happens. */
+    if (g_embed_per_thread) {
+        struct llama_context *lctx = get_per_thread_ctx(h);
+        if (!lctx) return 0;
+        dim = ll_embed_doc(lctx, vocab, text, tlen, NULL, 0, h->vec_dim,
+                           RP_CHUNK_AUTO, 0, 0, 0, 1 /* spans_only */,
+                           NULL, &k, (ll_chunk_span **)out_spans,
+                           NULL, NULL, err, sizeof err);
+    } else {
+        pthread_mutex_lock(&h->mtx);
+        dim = ll_embed_doc(h->lctx, vocab, text, tlen, NULL, 0, h->vec_dim,
+                           RP_CHUNK_AUTO, 0, 0, 0, 1 /* spans_only */,
+                           NULL, &k, (ll_chunk_span **)out_spans,
+                           NULL, NULL, err, sizeof err);
+        pthread_mutex_unlock(&h->mtx);
+    }
+    if (!dim) {
+        if (err[0]) lt_warn("rp_embed_spans: %s\n", err);
+        return 0;
+    }
+    return k;
 }
 
 void rp_embed_release(void *handle)
@@ -1991,6 +2551,7 @@ static long lt_meta_long(struct llama_model *m, const char *arch,
  * type, or "unspecified" if the GGUF doesn't set one. */
 static duk_ret_t llamacpp_model_info(duk_context *ctx)
 {
+    lt_errmsg_clear(ctx);   /* errMsg reflects THIS call */
     const char *path = REQUIRE_STRING(ctx, 0,
         "modelInfo: argument 1 must be a String (path to .gguf)");
 
@@ -2044,6 +2605,7 @@ static duk_ret_t llamacpp_model_info(duk_context *ctx)
 
 static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 {
+    lt_errmsg_clear(ctx);   /* errMsg reflects THIS call */
     lt_disable_cuda_graphs_for_batched();
     const char *model = REQUIRE_STRING(ctx, 0, "init: argument 1 must be a string");
     duk_idx_t obj_idx = -1;
@@ -2117,7 +2679,7 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
             ggml_backend_dev_t devs[2] = { cpu_dev, NULL };
             mp.n_gpu_layers = 0;       /* distinct model-cache key from the GPU load */
             mp.devices      = devs;    /* force CPU-only: no Metal/GPU backend */
-            fprintf(stderr, "rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
+            lt_warn("rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
             lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
             if (lmodel)
                 lctx = new_embed_context(ctx, lmodel, &cp);
@@ -2156,6 +2718,41 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     duk_push_int(ctx, vec_dim);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("vec_dim"));
 
+    /* structure-aware chunking options (rp-chunker; mirrors rampart-onnx):
+     * split:'auto'(default)|'window', minTokens (paragraph fragment
+     * floor, -1 disables merging), packParagraphs (pack to the window
+     * instead of one vector per paragraph) */
+    {
+        int split = RP_CHUNK_AUTO, minTok = 0, packPara = 0, sentSpl = 0;
+        if (obj_idx > -1) {
+            if (duk_get_prop_string(ctx, obj_idx, "split")) {
+                if (duk_is_function(ctx, -1)) {
+                    /* custom splitter: fn(text) -> [String,...]; replaces the
+                     * built-in chunker (see embed_text_to_) */
+                    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_splitfn"));
+                    duk_push_undefined(ctx);         /* keep the pop below balanced */
+                } else {
+                    const char *s = duk_to_string(ctx, -1);
+                    if (s && !strcmp(s, "window")) split = RP_CHUNK_WINDOW;
+                }
+            }
+            duk_pop(ctx);
+            if (duk_get_prop_string(ctx, obj_idx, "minTokens"))
+                minTok = duk_get_int(ctx, -1);
+            duk_pop(ctx);
+            if (duk_get_prop_string(ctx, obj_idx, "packParagraphs"))
+                packPara = duk_to_boolean(ctx, -1);
+            duk_pop(ctx);
+            if (duk_get_prop_string(ctx, obj_idx, "sentenceSplit"))
+                sentSpl = duk_to_boolean(ctx, -1);
+            duk_pop(ctx);
+        }
+        duk_push_int(ctx, split);    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_split"));
+        duk_push_int(ctx, minTok);   duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_min"));
+        duk_push_int(ctx, packPara); duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_pack"));
+        duk_push_int(ctx, sentSpl);  duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_sent"));
+    }
+
     duk_push_int(ctx, (int)get_thread_num());
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
 
@@ -2178,6 +2775,9 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     duk_push_c_function(ctx, embed_text_to_numbers, 1);
     duk_put_prop_string(ctx, -2, "embedTextToNumbers");
 
+    duk_push_c_function(ctx, embed_texts_to_numbers, 2);
+    duk_put_prop_string(ctx, -2, "embedTextsToNumbers");
+
     duk_push_c_function(ctx, emb_free, 0);
     duk_put_prop_string(ctx, -2, "destroy");
 
@@ -2193,12 +2793,42 @@ typedef struct rp_rerank_toks {
     const char *sep;
     const char *eos;
     size_t len;
+    int tmpl;      /* 1 = instruct-template reranker (qwen3-reranker style) */
 } rp_rerank_toks;
 
-static void get_rr_toks(const struct llama_vocab *vocab, rp_rerank_toks *toks)
+/* Qwen3-Reranker scores relevance as a yes/no judgement over an instruct
+ * chat prompt (the gguf conversion bakes the yes-vs-no logit into a RANK
+ * head, but the head only discriminates when the input follows the
+ * model's published template).  Without this, every pair scores a
+ * constant ~0.5.  The <Instruct> line is the model card's default. */
+static const char *Q3RR_PRE =
+    "<|im_start|>system\nJudge whether the Document meets the requirements based on "
+    "the Query and the Instruct provided. Note that the answer can only be \"yes\" "
+    "or \"no\".<|im_end|>\n<|im_start|>user\n<Instruct>: Given a web search query, "
+    "retrieve relevant passages that answer the query\n<Query>: ";
+static const char *Q3RR_MID  = "\n<Document>: ";
+static const char *Q3RR_POST = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+static void get_rr_toks(struct llama_model *lmodel, rp_rerank_toks *toks)
 {
+    const struct llama_vocab *vocab = llama_model_get_vocab(lmodel);
+
     if(!toks)
         return;
+
+    /* instruct-style rerankers (qwen3 arch) use the chat template, not
+     * the bert-style [bos]query[eos][sep]doc[eos] concatenation */
+    {
+        char arch[64] = {0};
+        toks->tmpl = (llama_model_meta_val_str(lmodel, "general.architecture",
+                                               arch, sizeof arch) >= 0 &&
+                      strcmp(arch, "qwen3") == 0);
+    }
+    if (toks->tmpl) {
+        toks->bos = toks->sep = toks->eos = "";
+        toks->len = strlen(Q3RR_PRE) + strlen(Q3RR_MID) + strlen(Q3RR_POST);
+        return;
+    }
 
     // Get SEP and EOS tokens from vocabulary
     llama_token bos_token = llama_vocab_bos(vocab);
@@ -2221,7 +2851,8 @@ static void get_rr_toks(const struct llama_vocab *vocab, rp_rerank_toks *toks)
 }
 
 // Build rerank input string using vocabulary's SEP and EOS tokens
-// Returns allocated string that caller must free()
+// (or the model's instruct template).  Returns allocated string that
+// caller must free()
 static char *build_rerank_input(rp_rerank_toks *toks, const char *query, const char *document)
 {
     // Calculate total length needed
@@ -2233,7 +2864,10 @@ static char *build_rerank_input(rp_rerank_toks *toks, const char *query, const c
     if (!input)
         return NULL;
 
-    snprintf(input, total_len, "%s%s%s%s%s%s", toks->bos, query, toks->eos, toks->sep, document, toks->eos);
+    if (toks->tmpl)
+        snprintf(input, total_len, "%s%s%s%s%s", Q3RR_PRE, query, Q3RR_MID, document, Q3RR_POST);
+    else
+        snprintf(input, total_len, "%s%s%s%s%s%s", toks->bos, query, toks->eos, toks->sep, document, toks->eos);
 
     return input;
 }
@@ -2260,8 +2894,7 @@ static llama_token *tokenize_for_rerank(duk_context *ctx, struct llama_context *
     if (n < 0)
     {
         free(tokens);
-        RP_THROW(ctx, "Failed to tokenize text for reranking");
-        return NULL;
+        return NULL;   /* caller frees its own buffers and throws */
     }
 
     *n_tokens = n;
@@ -2281,8 +2914,11 @@ float rerank_one(duk_context *ctx, struct llama_context *lctx, struct llama_mode
     int n_tokens = 0;
     int n_ubatch = llama_n_ubatch(lctx);
 
-    llama_token *tokens = tokenize_for_rerank(ctx, lctx, vocab, input, &n_tokens, true, true);
-    free(input);
+    /* template mode carries ALL its special tokens in the text (and the
+     * vocab may auto-add a bos that doesn't belong mid-template) */
+    llama_token *tokens = tokenize_for_rerank(ctx, lctx, vocab, input, &n_tokens,
+                                              toks->tmpl ? false : true, true);
+    free(input);   /* freed before any throw below */
 
     if (!tokens)
         RP_THROW(ctx, "Failed to tokenize input for reranking");
@@ -2307,9 +2943,18 @@ float rerank_one(duk_context *ctx, struct llama_context *lctx, struct llama_mode
         return 0;
     }
 
-    //clamp to max batch size
+    //clamp to max batch size, preserving the closing tokens: the final
+    //special (eos/sep) for bert-style rerankers, or the whole assistant
+    //tail of the instruct template -- a RANK head scored without its
+    //closing tokens degrades unpredictably
     if(n_tokens > n_ubatch)
+    {
+        int keep = toks->tmpl ? 16 : 1;
+        if (keep > n_ubatch) keep = n_ubatch;
+        memmove(tokens + n_ubatch - keep, tokens + n_tokens - keep,
+                (size_t)keep * sizeof(llama_token));
         n_tokens = n_ubatch;
+    }
 
     // Fill the batch
     for (int i = 0; i < n_tokens; i++)
@@ -2390,23 +3035,36 @@ static duk_ret_t rerank_text(duk_context *ctx)
     // get a new context if in a new thread.  Model stays the same.
     if (curthr != thrno || pidno != curpid )
     {
-#ifdef HAVE_CUDA
-        // forking after is bad, mkay
-        if(pidno != curpid && has_gpu_backend() )
-        {
-            RP_THROW(ctx, "llama.cpp - cannot fork llama.cpp with CUDA initialized");
-        }
-#endif
+        // Post-fork refusal: GPU runtimes don't survive fork (CPU continues).
+        if (pidno != curpid && lt_gpu_in_use())
+            RP_THROW(ctx, LT_FORK_REFUSAL);
         duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("cp_buf"));
         struct llama_context_params *cp_buf = duk_get_buffer_data(ctx, -1, NULL);
         duk_pop(ctx);
+
+        // checked refcount FIRST: if the origin copy was destroyed (its ref was
+        // the last), the model is freed -- fail cleanly, no use-after-free.
+        if (!lgen_model_addref_checked(lmodel))
+            RP_THROW(ctx, "rerank - model was destroyed (the originating handle "
+                          "was destroy()ed); create a new handle");
         lctx = llama_init_from_model(lmodel, *cp_buf);
 
-        if (!lctx)
+        if (!lctx) {
+            lgen_model_release(lmodel);
             RP_THROW(ctx, "rerank - failed to create llama context on this thread");
+        }
 
-        // model refcount for this copy's own context (released in emb_free)
-        lgen_model_addref(lmodel);
+        // Per-copy rerank_toks: the ORIGIN copy frees its own struct in emb_free,
+        // so this copy takes a private one (its strings live in the shared model,
+        // which this copy's refcount above now keeps alive).
+        {
+            rp_rerank_toks *mytoks = NULL;
+            REMALLOC(mytoks, sizeof(rp_rerank_toks));
+            get_rr_toks(lmodel, mytoks);
+            toks = mytoks;
+            duk_push_pointer(ctx, mytoks);
+            duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rerank_toks"));
+        }
 
         duk_push_pointer(ctx, lctx);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
@@ -2425,6 +3083,11 @@ static duk_ret_t rerank_text(duk_context *ctx)
     if (!vocab)
         RP_THROW(ctx, "rerank: Failed to get vocab from model");
 
+    int sigmoid = 1;
+    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rr_sigmoid")))
+        sigmoid = duk_get_int_default(ctx, -1, 1);
+    duk_pop(ctx);
+
     duk_pop(ctx); // pop 'this'
 
     // Get query and text arguments
@@ -2432,6 +3095,7 @@ static duk_ret_t rerank_text(duk_context *ctx)
     if( duk_is_string(ctx, 1) )
     {
         double score = (double)rerank_one(ctx, lctx, lmodel, vocab, toks, query, duk_get_string(ctx, 1));
+        if (sigmoid) score = 1.0 / (1.0 + exp(-score));
         duk_push_number(ctx, score);
         return 1;
     }
@@ -2447,39 +3111,70 @@ static duk_ret_t rerank_text(duk_context *ctx)
     duk_uarridx_t i=0, len = (duk_uarridx_t) duk_get_length(ctx, 1);
     double score;
 
-    duk_push_array(ctx); //return scores
+    /* score all docs (document order) first */
+    double *scores = NULL;
+    REMALLOC(scores, (len ? len : 1) * sizeof(double));
+    for(;i<len;i++)
+    {
+        duk_get_prop_index(ctx, 1, i);
+        text = duk_get_string(ctx, -1);   /* no throw while holding scores[] */
+        if (!text) {
+            duk_pop(ctx);
+            free(scores);
+            RP_THROW(ctx, "rerank: argument 2 (documents) must be a String or Array of Strings");
+        }
+        score = (double) rerank_one(ctx, lctx, lmodel, vocab, toks, query, text);
+        duk_pop(ctx);
+        scores[i] = sigmoid ? 1.0 / (1.0 + exp(-score)) : score;
+    }
+
+    duk_push_array(ctx); //return value
     if(scores_only)
     {
-        for(;i<len;i++)
+        /* scoresOnly: scores in DOCUMENT order (matches rampart-onnx) */
+        for(i=0;i<len;i++)
         {
-            duk_get_prop_index(ctx, 1, i);
-            text = REQUIRE_STRING(ctx, -1, "rerank: argument 2 (documents) must be a String or Array of Strings");
-            duk_pop(ctx);
-            score = (double) rerank_one(ctx, lctx, lmodel, vocab, toks, query, text);
-            duk_push_number(ctx, score);
-            duk_put_prop_index(ctx, -2, i); //score into return scores array
+            duk_push_number(ctx, scores[i]);
+            duk_put_prop_index(ctx, -2, i);
         }
+        free(scores);
+        return 1;
     }
-    else
+
+    /* object form: sorted by score desc, with the original index -- matches
+     * rampart-onnx's initRerank().rerank() */
     {
-        for(;i<len;i++)
-        {
-            duk_push_object(ctx); //entry of {document:text, score: score}
-            duk_get_prop_index(ctx, 1, i);
-            text = REQUIRE_STRING(ctx, -1, "rerank: argument 2 (documents) must be a String or Array of Strings");
-            duk_put_prop_string(ctx, -2, "document");
-            score = (double) rerank_one(ctx, lctx, lmodel, vocab, toks, query, text);
-            duk_push_number(ctx, score);
-            duk_put_prop_string(ctx, -2, "score");
-            duk_put_prop_index(ctx, -2, i); //entry into return scores array
+        duk_uarridx_t *order = NULL;
+        REMALLOC(order, (len ? len : 1) * sizeof(duk_uarridx_t));
+        for (i = 0; i < len; i++) order[i] = i;
+        /* insertion sort (doc lists are small; stable) */
+        for (i = 1; i < len; i++) {
+            duk_uarridx_t oi = order[i];
+            duk_uarridx_t j = i;
+            while (j > 0 && scores[order[j-1]] < scores[oi]) { order[j] = order[j-1]; j--; }
+            order[j] = oi;
         }
+        for (i = 0; i < len; i++)
+        {
+            duk_push_object(ctx);
+            duk_get_prop_index(ctx, 1, order[i]);
+            duk_put_prop_string(ctx, -2, "document");
+            duk_push_number(ctx, scores[order[i]]);
+            duk_put_prop_string(ctx, -2, "score");
+            duk_push_number(ctx, (double)order[i]);
+            duk_put_prop_string(ctx, -2, "index");
+            duk_put_prop_index(ctx, -2, i);
+        }
+        free(order);
     }
+    free(scores);
     return 1;
 }
 
 // Initialize a reranking model
 static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 {
+    lt_errmsg_clear(ctx);   /* errMsg reflects THIS call */
     lt_disable_cuda_graphs_for_batched();
     const char *model = REQUIRE_STRING(ctx, 0, "init: argument 1 must be a string");
     duk_idx_t obj_idx = -1;
@@ -2563,7 +3258,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
             ggml_backend_dev_t devs[2] = { cpu_dev, NULL };
             mp.n_gpu_layers = 0;
             mp.devices      = devs;
-            fprintf(stderr, "rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
+            lt_warn("rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
             lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
             if (lmodel)
                 lctx = llama_init_from_model(lmodel, cp);
@@ -2602,11 +3297,21 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("cp_buf"));
     memcpy(cp_buf, &cp, sizeof(struct llama_context_params));
 
+    /* sigmoid: onnx-parity default ON (1/(1+e^-x)); { sigmoid:false } for the
+     * raw RANK-head score */
+    {
+        int sig = 1;
+        if (obj_idx >= 0)
+            lt_opt_bool2(ctx, obj_idx, "sigmoid", NULL, "sigmoid must be boolean", &sig);
+        duk_push_int(ctx, sig);
+        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rr_sigmoid"));
+    }
+
     //get bos, sep, eos tokens
     rp_rerank_toks *toks = NULL;
     REMALLOC(toks, sizeof(rp_rerank_toks));
 
-    get_rr_toks(llama_model_get_vocab(lmodel), toks);
+    get_rr_toks(lmodel, toks);
 
     duk_push_pointer(ctx, toks);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rerank_toks"));
@@ -2787,8 +3492,18 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     duk_push_c_function(ctx, resetlog, 0);
     duk_put_prop_string(ctx, -2, "resetLog");
+    duk_push_c_function(ctx, resetlog, 0);
+    duk_put_prop_string(ctx, -2, "clearLog");   /* alias: rampart-onnx naming parity */
 
     add_exit_func(close_llama_on_exit, NULL);
+
+    /* Remember the module object (per-ctx, so each rampart thread keeps its own):
+     * it is where a warning goes when there is no `this` -- see
+     * lt_push_errmsg_target(). */
+    duk_push_global_stash(ctx);
+    duk_dup(ctx, -2);                       /* the module object */
+    duk_put_prop_string(ctx, -2, LT_MODULE_STASH);
+    duk_pop(ctx);                           /* stash */
 
     return 1;
 }

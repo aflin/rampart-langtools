@@ -21,6 +21,25 @@
 #      -d <dir>                            # install into <dir>; if <dir> isn't the
 #                                          #   build's home tier, copy it in (graft)
 #
+#   Environment knobs (export, or prefix the command; forwarded into the oven):
+#      LT_BUILD_PARALLEL    main compile -j                        (default: nproc)
+#      ONNX_CUDA_PARALLEL   ORT CUDA-EP build parallelism          (default: 1)
+#                           RAM ~= PARALLEL x 4 x ~2GB.  The full cu12/cu13 arch
+#                           fleet tops out around 3 (safe) / 4 (watched) on 64GB;
+#                           more just swaps and gets SLOWER (memory-bound).
+#      ONNX_NVCC_THREADS    per-nvcc arch-compile threads          (ORT default ~4)
+#      ONNX_FLASH_NVCC_THREADS  same, for flash-attn files ONLY (the RAM monsters)
+#                           Set these =1 on a RAM-tight builder: the default runs 4
+#                           arch-compiles of one .cu at once (~4GB each) -> OOM even
+#                           at PARALLEL=1.  FLASH-only recompiles just the flash files.
+#      ONNX_CPU_PARALLEL    ORT CPU-EP build parallelism           (default: 8)
+#      ONNX_CUDA_ARCH       override ORT CUDA arch list, e.g. "89-real;89-virtual"
+#                           (fewer arches -> far less RAM -> raise PARALLEL)
+#      ONNX_CUDA_MINIMAL    1 = cuBLAS-only CUDA EP, no cuDNN (smaller; fewer GPU ops)
+#      LT_TARGET            build ONE cmake target, e.g. onnxruntime_ep
+#
+#   e.g.  ONNX_CUDA_PARALLEL=3 ./build.sh build cu12
+#
 # What it touches:
 #   build      -> build/oven[-variant]/
 #   install    -> adds the module(s) to <prefix>/modules (+ test/llamacpp-test.js).
@@ -46,6 +65,7 @@ BASE2_28=rampart-langtools-oven-2_28      # manylinux_2_28, glibc 2.28 (cu12/cu1
 
 # cuda_cfg <variant> -> sets CU_IMG CU_BASE CU_BASEDF CU_DISTRO CU_PKGS (returns 1 if not a cuda variant)
 cuda_cfg() {
+    CU_CUDNN=""   # cuDNN packages (CUDA-12+ only; for rampart-onnx's full CUDA EP)
     case "$1" in
         cu11) if [ "$ARCH" = x86_64 ]; then
                   CU_BASE=$BASE2014; CU_BASEDF=Dockerfile;      CU_DISTRO=rhel7   # x86: keep glibc 2.17
@@ -60,9 +80,11 @@ cuda_cfg() {
               CU_BASE=$BASE2_28; CU_BASEDF=Dockerfile.2_28; CU_DISTRO=rhel8
               CU_PKGS="cuda-toolkit-11-8 cuda-driver-devel-11-8" ;;
         cu12) CU_BASE=$BASE2_28; CU_BASEDF=Dockerfile.2_28; CU_DISTRO=rhel8
-              CU_PKGS="cuda-toolkit-12-8 cuda-driver-devel-12-8" ;;
+              CU_PKGS="cuda-toolkit-12-8 cuda-driver-devel-12-8"
+              CU_CUDNN="libcudnn9-cuda-12 libcudnn9-devel-cuda-12" ;;
         cu13) CU_BASE=$BASE2_28; CU_BASEDF=Dockerfile.2_28; CU_DISTRO=rhel8
-              CU_PKGS="cuda-toolkit-13-0 cuda-driver-devel-13-0" ;;
+              CU_PKGS="cuda-toolkit-13-0 cuda-driver-devel-13-0"
+              CU_CUDNN="libcudnn9-cuda-13 libcudnn9-devel-cuda-13" ;;
         *)    return 1 ;;
     esac
     CU_IMG="rampart-langtools-oven-$1"
@@ -103,6 +125,7 @@ build_cuda() {  # $1 variant
         --build-arg CUDA_DISTRO="$CU_DISTRO" \
         --build-arg CUDA_ARCHDIR="$CUDA_ARCHDIR" \
         --build-arg CUDA_PKGS="$CU_PKGS" \
+        --build-arg CUDNN_PKGS="$CU_CUDNN" \
         -t "$CU_IMG" -f "$HERE/Dockerfile.cuda" "$HERE"
 }
 ensure_cuda() {  # $1 variant
@@ -150,6 +173,11 @@ do_build() {
     docker run --rm \
         --user "$(id -u):$(id -g)" \
         -e HOME=/tmp -e RAMPART_PREFIX="$PREFIX_DIR" -e LT_ARM_ARCH="$arm_arch" \
+        -e ONNX_CUDA_PARALLEL="${ONNX_CUDA_PARALLEL:-}" -e ONNX_CUDA_ARCH="${ONNX_CUDA_ARCH:-}" \
+        -e ONNX_CUDA_MINIMAL="${ONNX_CUDA_MINIMAL:-}" \
+        -e ONNX_NVCC_THREADS="${ONNX_NVCC_THREADS:-}" -e ONNX_FLASH_NVCC_THREADS="${ONNX_FLASH_NVCC_THREADS:-}" \
+        -e ONNX_CPU_PARALLEL="${ONNX_CPU_PARALLEL:-}" -e LT_TARGET="${LT_TARGET:-}" \
+        -e LT_BUILD_PARALLEL="${LT_BUILD_PARALLEL:-}" \
         -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
         -v "$REPO:/lt" -w /lt \
         -v "$PREFIX_DIR":"$PREFIX_DIR":ro \

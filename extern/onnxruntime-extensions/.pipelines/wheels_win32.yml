@@ -1,0 +1,25 @@
+parameters:
+- name: ExtraEnv
+  displayName: 'Extra env variable set to CIBW_ENVIRONMENT'
+  type: string
+  default: 'ExampleEnvVar=ON'
+
+jobs:
+- job: windows
+  timeoutInMinutes: 120
+  pool: {name: 'onnxruntime-Win-CPU-2022'}
+  variables:
+    CIBW_BUILD: "cp3{8,9,10,11,12}-*amd64"
+    CIBW_ENVIRONMENT: "${{ parameters.ExtraEnv }}"
+
+  steps:
+    - task: UsePythonVersion@0
+    - script: |
+        python -m pip install --upgrade pip
+        pip install cibuildwheel
+      displayName: Install dependencies
+    - script: |
+        cibuildwheel --platform windows --output-dir wheelhouse .
+      displayName: Build wheels
+    - task: PublishBuildArtifacts@1
+      inputs: {pathtoPublish: 'wheelhouse'}

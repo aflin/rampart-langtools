@@ -1,0 +1,7 @@
+{
+global:
+    RegisterCustomOps;
+    AddExternalCustomOp;
+    GetActiveOrtAPIVersion;
+local: *;
+};

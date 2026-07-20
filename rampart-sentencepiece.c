@@ -234,6 +234,35 @@ static duk_ret_t sp_free_(duk_context *ctx)
     return 0;
 }
 
+/* encodeIds(text) -> Array of integer token ids (vs encode() which returns
+ * pieces). Needed by consumers that feed an ONNX/transformer model expecting
+ * input_ids (e.g. rampart-onnx initEmbed). */
+static duk_ret_t sp_encode_ids(duk_context *ctx)
+{
+    const char *text = REQUIRE_STRING(ctx, 0, "sentencepiece.encodeIds - argument must be a String (text to encode)");
+
+    const int32_t *ids = NULL;
+    size_t n_ids = 0;
+
+    duk_push_this(ctx);
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("spmProcessor"));
+    spm_processor_t *sp = duk_get_pointer(ctx, -1);
+    if (!sp)
+        RP_THROW(ctx, "sentencepiece.encodeIds - Internal error getting sentencepiece processor");
+
+    if (spm_encode_as_ids(sp, text, &ids, &n_ids) != 0)
+        RP_THROW(ctx, "sentencepiece.encodeIds - Encode failed");
+
+    duk_push_array(ctx);
+    for (size_t i = 0; i < n_ids; i++)
+    {
+        duk_push_int(ctx, (int)ids[i]);
+        duk_put_prop_index(ctx, -2, (duk_uarridx_t)i);
+    }
+    spm_free_array(ids);
+    return 1;
+}
+
 static duk_ret_t sp_init(duk_context *ctx)
 {
     const char *model =
@@ -260,6 +289,8 @@ static duk_ret_t sp_init(duk_context *ctx)
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("spOriginPid"));
     duk_push_c_function(ctx, sp_encode, 2);
     duk_put_prop_string(ctx, -2, "encode");
+    duk_push_c_function(ctx, sp_encode_ids, 1);
+    duk_put_prop_string(ctx, -2, "encodeIds");
     duk_push_c_function(ctx, sp_free_, 1);
     duk_set_finalizer(ctx, -2);
     return 1;

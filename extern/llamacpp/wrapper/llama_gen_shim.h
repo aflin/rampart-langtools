@@ -9,8 +9,9 @@
  * rampart thread's libevent loop (a llama_context + Metal command queue is
  * pinned to its creating thread, exactly like the embedding path). The decode
  * runs on that thread; lgen_engine_step() is pumped via a recurring 0-delay
- * timeout, and on_piece/on_done fire there (where duktape is valid). A thread or
- * fork/pid change is handled by lgen_engine_rebind() before the next submit.
+ * timeout, and on_piece/on_done fire there (where duktape is valid). On a thread
+ * or fork/pid change the caller creates a fresh per-thread engine from its stored
+ * params (lg_get_info in rampart-llamacpp.c) rather than reusing this one.
  */
 #ifndef LLAMA_GEN_SHIM_H
 #define LLAMA_GEN_SHIM_H
@@ -25,6 +26,13 @@
 extern "C" {
 #endif
 
+/* Warnings + non-fatal errors.  Defined in rampart-llamacpp.c; declared here so
+ * this shim can report a problem WITHOUT writing to stderr.  It appends straight
+ * to `this.errMsg` using the calling rampart thread's duk context
+ * (get_current_thread()->ctx), so no ctx argument has to be threaded down here.
+ * Informational chatter goes to getLog() instead. */
+void lt_warn(const char *fmt, ...);
+
 /* ---- shared, refcounted model cache (also used by the embedding/rerank paths)
  * Load a model once and free it once even when a handle is copied across threads.
  * Invariant: ONE refcount per live llama_context that uses the model — call
@@ -33,6 +41,10 @@ extern "C" {
 struct llama_model *lgen_model_acquire(const char *path, const struct llama_model_params *mp,
                                        char *errbuf, size_t errlen);
 void                lgen_model_addref(struct llama_model *m);
+/* like addref, but returns 0 (no-op) if m is no longer in the cache -- i.e.
+ * its last refcount was released and the model was freed.  Lets a stale
+ * handle copy fail with a clear error instead of using freed memory. */
+int                 lgen_model_addref_checked(struct llama_model *m);
 void                lgen_model_release(struct llama_model *m);
 
 /* ---- opaque handles ---- */
@@ -105,13 +117,9 @@ typedef struct {
  * lgen_engine_create loads the model AND builds the context + slots on the
  * CALLING thread (the rampart thread that will drive the engine). The model is
  * shared read-only (mmap weights); the context is pinned to this thread. Call
- * create/step/submit/free all from the SAME thread (or rebind after a change). */
+ * create/step/submit/free all from the SAME thread. */
 lgen_engine *lgen_engine_create(const lgen_engine_params *p, char *errbuf, size_t errlen);
 void         lgen_engine_free(lgen_engine *e);   /* frees context + model (call on owner thread) */
-
-/* rebuild the context on the current thread after a thread/fork(pid) change.
- * Returns 0 on success, -1 on failure (errbuf filled). */
-int          lgen_engine_rebind(lgen_engine *e, char *errbuf, size_t errlen);
 
 /* informational */
 uint32_t     lgen_engine_n_ctx(lgen_engine *e);

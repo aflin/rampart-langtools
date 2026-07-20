@@ -49,6 +49,7 @@
 #include <c_api/gpu/GpuResources_c.h>
 #include <c_api/gpu/StandardGpuResources_c.h>
 #include <c_api/gpu/GpuAutoTune_c.h>
+#include <c_api/gpu/DeviceUtils_c.h>   /* faiss_get_num_gpus (rp_fgpu_*) */
 #endif
 
 
@@ -587,12 +588,44 @@ int close_and_unlink(FILE *fh, const char *path, const char **err)
         (void)duk_throw(ctx);                                                                                          \
     } while (0)
 
+/* this.errMsg: warnings + non-fatal errors, mirroring rampart-sql's
+ * rp_log_copy_to_errMsg (and rampart-onnx / rampart-llamacpp).  Failures throw;
+ * warnings land here; nothing is written to stdout/stderr. */
+static void faiss_errmsg_append(duk_context *ctx, const char *msg)
+{
+    duk_push_this(ctx);
+    if (!duk_is_object(ctx, -1)) { duk_pop(ctx); return; }
+    if (duk_get_prop_string(ctx, -1, "errMsg"))
+    {
+        const char *s = duk_get_string(ctx, -1);
+        if (s && *s) duk_push_sprintf(ctx, "%s\n%s", s, msg);
+        else         duk_push_string(ctx, msg);
+        duk_remove(ctx, -2);
+    }
+    else
+    {
+        duk_pop(ctx);
+        duk_push_string(ctx, msg);
+    }
+    duk_put_prop_string(ctx, -2, "errMsg");
+    duk_pop(ctx);
+}
+
+static void faiss_errmsg_clear(duk_context *ctx)
+{
+    duk_push_this(ctx);
+    if (duk_is_object(ctx, -1)) duk_del_prop_string(ctx, -1, "errMsg");
+    duk_pop(ctx);
+}
+
 static duk_ret_t dotrain(duk_context *ctx)
 {
     duk_size_t dim;
     idx_t nrows;
     int fd;
     FILE *fh;
+
+    faiss_errmsg_clear(ctx);   /* errMsg reflects THIS call */
 
     //const char *filename;
 
@@ -668,7 +701,13 @@ static duk_ret_t dotrain(duk_context *ctx)
 
     if (munmap(addr, st.st_size) != 0)
     {
-        fprintf(stderr, "faiss.train - training completed, but internal error in munmap: %s\n", strerror(errno));
+        /* training SUCCEEDED -- this is a warning, not a failure, so it must not
+         * throw; it goes to this.errMsg rather than stderr. */
+        char wbuf[512];
+        snprintf(wbuf, sizeof wbuf,
+                 "faiss.train - training completed, but internal error in munmap: %s",
+                 strerror(errno));
+        faiss_errmsg_append(ctx, wbuf);
         return 0;
     }
 
@@ -1221,6 +1260,161 @@ static duk_ret_t faiss_openidx_fromfile(duk_context *ctx)
     push_faiss_obj(ctx, idx, mtype, dim, rows);
 
     return 1;
+}
+
+/* ==================================================================
+ * rp_fgpu_* — GPU coarse-assignment C API (no duktape involved).
+ *
+ * dlsym'd by rampart-sql's IVFPQ index build (vecindex_ivfpq.cpp) to
+ * run the encode stage's nearest-centroid assignment on the GPU: the
+ * coarse centroids are uploaded once into a GpuIndexFlat, then each
+ * batch is a k=1 search whose labels feed IndexIVF::add_core()'s
+ * precomputed_idx — the CPU keeps the (cheap) PQ encode and the
+ * on-disk list appends.
+ *
+ * Exported from EVERY flavor: on CPU builds rp_fgpu_available()
+ * returns 0 and create() fails with a message, so the caller's
+ * module-probe loop just moves on.  Errors are copied into the
+ * caller's buffer (faiss_get_last_error() or a static string).
+ * ================================================================== */
+
+typedef struct {
+#ifdef FAISS_GPU_AVAILABLE
+    FaissStandardGpuResources *res;
+    FaissGpuIndex             *gpu;   /* GpuIndexFlat over the centroids */
+#endif
+    size_t dim;
+} rp_fgpu_assigner_t;
+
+static void rp_fgpu_err(char *err, size_t errlen, const char *fallback)
+{
+    if (!err || !errlen) return;
+#ifdef FAISS_GPU_AVAILABLE
+    {
+        const char *fe = faiss_get_last_error();
+        snprintf(err, errlen, "%s", (fe && *fe) ? fe : fallback);
+        return;
+    }
+#endif
+    snprintf(err, errlen, "%s", fallback);
+}
+
+/* number of usable CUDA devices; 0 on CPU builds or driver problems */
+int rp_fgpu_available(void)
+{
+#ifdef FAISS_GPU_AVAILABLE
+    int n = 0;
+    if (faiss_get_num_gpus(&n) != 0) return 0;
+    return n > 0 ? n : 0;
+#else
+    return 0;
+#endif
+}
+
+/* Upload `nlist` x `dim` centroids; returns an opaque assigner handle
+ * or NULL (err filled).  metric_inner_product selects IP vs L2 — MUST
+ * match the coarse quantizer's metric or assignments will differ from
+ * the CPU path's. */
+void *rp_fgpu_assigner_create(const float *centroids, size_t nlist,
+                              size_t dim, int metric_inner_product,
+                              char *err, size_t errlen)
+{
+#ifdef FAISS_GPU_AVAILABLE
+    rp_fgpu_assigner_t *a = NULL;
+    FaissIndexFlat *flat = NULL;
+
+    if (!centroids || nlist == 0 || dim == 0) {
+        rp_fgpu_err(err, errlen, "rp_fgpu_assigner_create: bad args");
+        return NULL;
+    }
+    if (rp_fgpu_available() <= 0) {
+        rp_fgpu_err(err, errlen, "rp_fgpu_assigner_create: no usable GPU");
+        return NULL;
+    }
+    a = calloc(1, sizeof(*a));
+    if (!a) {
+        rp_fgpu_err(err, errlen, "rp_fgpu_assigner_create: oom");
+        return NULL;
+    }
+    a->dim = dim;
+    if (faiss_IndexFlat_new_with(&flat, (idx_t)dim,
+                                 metric_inner_product
+                                     ? METRIC_INNER_PRODUCT
+                                     : METRIC_L2) != 0 ||
+        faiss_Index_add((FaissIndex *)flat, (idx_t)nlist, centroids) != 0) {
+        rp_fgpu_err(err, errlen, "rp_fgpu_assigner_create: centroid index");
+        goto fail;
+    }
+    if (faiss_StandardGpuResources_new(&a->res) != 0) {
+        rp_fgpu_err(err, errlen, "rp_fgpu_assigner_create: gpu resources");
+        goto fail;
+    }
+    if (faiss_index_cpu_to_gpu((FaissGpuResourcesProvider *)a->res,
+                               /*device*/0, (FaissIndex *)flat,
+                               &a->gpu) != 0) {
+        rp_fgpu_err(err, errlen, "rp_fgpu_assigner_create: cpu_to_gpu");
+        goto fail;
+    }
+    faiss_Index_free((FaissIndex *)flat);   /* GPU clone owns a copy */
+    return a;
+fail:
+    if (flat) faiss_Index_free((FaissIndex *)flat);
+    if (a && a->res) faiss_StandardGpuResources_free(a->res);
+    free(a);
+    return NULL;
+#else
+    (void)centroids; (void)nlist; (void)dim; (void)metric_inner_product;
+    rp_fgpu_err(err, errlen, "rp_fgpu_assigner_create: not a GPU build");
+    return NULL;
+#endif
+}
+
+/* Assign each of the n vectors to its nearest centroid; out_labels
+ * receives n int64 list numbers.  0 on success, -1 on error (err
+ * filled) — the caller falls back to CPU assignment. */
+int rp_fgpu_assign(void *vh, size_t n, const float *vecs,
+                   int64_t *out_labels, char *err, size_t errlen)
+{
+#ifdef FAISS_GPU_AVAILABLE
+    rp_fgpu_assigner_t *a = (rp_fgpu_assigner_t *)vh;
+    float *dist;
+    int rc;
+
+    if (!a || !a->gpu || !vecs || !out_labels || n == 0) {
+        rp_fgpu_err(err, errlen, "rp_fgpu_assign: bad args");
+        return -1;
+    }
+    dist = malloc(n * sizeof(float));
+    if (!dist) {
+        rp_fgpu_err(err, errlen, "rp_fgpu_assign: oom");
+        return -1;
+    }
+    rc = faiss_Index_search((FaissIndex *)a->gpu, (idx_t)n, vecs, 1,
+                            dist, (idx_t *)out_labels);
+    free(dist);
+    if (rc != 0) {
+        rp_fgpu_err(err, errlen, "rp_fgpu_assign: search failed");
+        return -1;
+    }
+    return 0;
+#else
+    (void)vh; (void)n; (void)vecs; (void)out_labels;
+    rp_fgpu_err(err, errlen, "rp_fgpu_assign: not a GPU build");
+    return -1;
+#endif
+}
+
+void rp_fgpu_assigner_destroy(void *vh)
+{
+#ifdef FAISS_GPU_AVAILABLE
+    rp_fgpu_assigner_t *a = (rp_fgpu_assigner_t *)vh;
+    if (!a) return;
+    if (a->gpu) faiss_Index_free((FaissIndex *)a->gpu);
+    if (a->res) faiss_StandardGpuResources_free(a->res);
+    free(a);
+#else
+    (void)vh;
+#endif
 }
 
 #ifdef LANGTOOLS_MAIN_INCLUDE
