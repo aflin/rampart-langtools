@@ -155,7 +155,7 @@ case "$STAGE" in
         # the 2_17-built cu11 into the 2_28 tree.  The modules are relocatable (they
         # resolve rampart's libs via $ORIGIN/../lib at load time), so COPY them into
         # $PREFIX instead of rebuilding/re-baking.  Mirrors the normal install's files:
-        # the module .so (stripped) + llamacpp-test.js.
+        # the module .so's (stripped) + the langtools test scripts + rampart-models.js.
         echo "==> grafting ${VARIANT:-default} build (configured for '${cfg:-?}') into $PREFIX"
         mkdir -p "$PREFIX/modules"
         # exclude rampart-langtools*.so -- it's built but intentionally not shipped
@@ -165,7 +165,14 @@ case "$STAGE" in
             install -m 755 "$so" "$PREFIX/modules/"
             strip -S "$PREFIX/modules/$(basename "$so")" 2>/dev/null || true
         done
-        [ -f "$LT/llamacpp-test.js" ] && { mkdir -p "$PREFIX/test"; install -m 644 "$LT/llamacpp-test.js" "$PREFIX/test/"; }
+        # test scripts (mirror the CMake install(FILES ... test) list, so a graft
+        # install matches a home-tier `cmake --install`)
+        mkdir -p "$PREFIX/test"
+        for t in llamacpp-test.js faiss-test.js clip-test.js; do
+            [ -f "$LT/$t" ] && install -m 644 "$LT/$t" "$PREFIX/test/"
+        done
+        # clip-test.js's photos (mirror the CMake install(DIRECTORY test_images ...))
+        [ -d "$LT/test_images" ] && { rm -rf "$PREFIX/test/test_images"; cp -R "$LT/test_images" "$PREFIX/test/"; }
         [ -f "$LT/rampart-models.js" ] && install -m 644 "$LT/rampart-models.js" "$PREFIX/modules/"
         # unified rampart-onnx: the module is UNSUFFIXED (one .so for cpu+gpu)...
         if [ -f "$BUILD/rampart-onnx.so" ]; then

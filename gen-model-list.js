@@ -100,6 +100,18 @@ var OVERRIDES = {
     "deepseek-r1-qwen-7b":     { category: "gen", gguf: "bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF" },
     "granite-3.3-8b-instruct": { category: "gen", gguf: "ibm-granite/granite-3.3-8b-instruct-GGUF" },
     "tinyllama-1.1b-chat":     { category: "gen", gguf: "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF" },
+    /* --- CLIP (image+text shared space, for rampart-clip): the monatis/clip.cpp
+     * two-tower GGUFs.  Discovery can't surface these -- they carry no
+     * sentence-similarity / text-ranking / text-generation pipeline tag -- so they
+     * are pinned by hand.  gguf-only (onnx:null); dim is the shared embedding size.
+     * Each repo ALSO ships _ggml-text-model- / _ggml-vision-model- single-tower
+     * files; ggufQuants() filters those out so only the two-tower _ggml-model-
+     * quants are kept (rampart-clip needs both towers for cross-modal search). --- */
+    "clip-vit-b-32-laion": { category: "clip", gguf: "mys/ggml_CLIP-ViT-B-32-laion2B-s34B-b79K", onnx: null, dim: 512 },
+    "clip-vit-b-32":       { category: "clip", gguf: "mys/ggml_clip-vit-base-patch32",           onnx: null, dim: 512 },
+    "clip-vit-l-14-laion": { category: "clip", gguf: "mys/ggml_CLIP-ViT-L-14-laion2B-s32B-b82K", onnx: null, dim: 768 },
+    "clip-vit-l-14":       { category: "clip", gguf: "mys/ggml_clip-vit-large-patch14",          onnx: null, dim: 768 },
+    "clip-vit-h-14-laion": { category: "clip", gguf: "mys/ggml_CLIP-ViT-H-14-laion2B-s32B-b79K", onnx: null, dim: 1024 },
     /* --- junk / non-text models the sweeps surface --- */
     "w2v-bert-2.0": "skip",                    /* speech embedder, not text */
     "stories15m_moe": "skip",                  /* ggml-org test model */
@@ -281,6 +293,9 @@ function ggufQuants(tree) {
         if (!/\.gguf$/i.test(p)) continue;
         if (/-\d{5}-of-\d{5}\.gguf$/i.test(p)) continue;   /* split models */
         if (/mmproj/i.test(p)) continue;                    /* vision projectors */
+        if (/[-_.](text|vision)-model[-_.]/i.test(p)) continue;  /* CLIP single-tower
+             variants: keep only the two-tower _ggml-model- files (else the smaller
+             text-only file would win a quant slot).  No-op for non-CLIP repos. */
         var m = QUANT_RE.exec(p);
         var q = m ? m[1].toUpperCase() : "DEFAULT";
         if (!quants[q] || tree[i].size < quants[q].size)
@@ -529,6 +544,7 @@ if (PIN_IX !== -1) {
             if (po) pentry.onnx = po;
             else failures.push(pname + ": pinned onnx repo unusable: " + pov.onnx);
         }
+        if (pov.dim) pentry.dim = pov.dim;    /* static dim for a gguf-only model (CLIP) */
         attachPrompts(pname, pentry);
         printf("gguf:%s onnx:%s\n",
                pentry.gguf ? pentry.gguf.repo : "-",
@@ -572,6 +588,7 @@ for (var name in OVERRIDES) {
     var entry = { category: ov.category };
     if (ov.onnx) { var o = resolveOnnx(name, ov.onnx, null); if (o) entry.onnx = o; }
     if (ov.gguf) { var g = resolveGguf(name, ov.gguf, repoTree(ov.gguf), false); if (g) entry.gguf = g; }
+    if (ov.dim) entry.dim = ov.dim;    /* static dim for a gguf-only model (e.g. CLIP) */
     if (entry.onnx || entry.gguf) { attachPrompts(name, entry); catalog[name] = entry; printf("ok\n"); }
     else { printf("FAILED\n"); failures.push(name + ": override repos unusable"); }
 }

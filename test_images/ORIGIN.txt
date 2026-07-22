@@ -1,0 +1,4 @@
+Test images for clip-test.js -- Public Domain, from https://free-images.com/
+Used to verify rampart-clip cross-modal (text<->image) retrieval:
+a text query for horses should rank the horse images above the flowers, and
+vice-versa.  Small (~256px) on purpose; CLIP resizes to its input anyway.

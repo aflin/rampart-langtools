@@ -233,10 +233,23 @@ add_library(rampart-sentencepiece SHARED
     rampart-sentencepiece.c
 )
 
+# clip (CLIP image+text embedding in a shared space).  Its ggml-facing shim links
+# the SAME ggml rampart-llamacpp builds -- one ggml in the tree, no second copy.
+add_library(rampart-clip SHARED
+    rampart-clip.c
+    extern/clip/clip_shim.cpp
+)
+target_include_directories(rampart-clip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extern/clip)
+add_dependencies(rampart-clip ggml ggml-cpu ggml-base)
+# clip's per-platform link options (soname/install_name, -Bsymbolic-functions,
+# and --exclude-libs to hide the vendored ggml) live in the Apple / Linux
+# target_link_options blocks below, alongside the other modules'.
+
 if(LT_ENABLE_GPU)
     target_compile_definitions(rampart-langtools PRIVATE LT_ENABLE_GPU=1)
     target_compile_definitions(rampart-llamacpp PRIVATE LT_ENABLE_GPU=1)
     target_compile_definitions(rampart-faiss PRIVATE LT_ENABLE_GPU=1)
+    target_compile_definitions(rampart-clip PRIVATE LT_ENABLE_GPU=1)
 
     # A manual CUDA toolkit install (e.g. /usr/local/cuda on Debian 11, drivers
     # from NVIDIA rather than apt) doesn't put cublas_v2.h and friends on the
@@ -246,6 +259,7 @@ if(LT_ENABLE_GPU)
         target_include_directories(rampart-langtools PRIVATE /usr/local/cuda/include)
         target_include_directories(rampart-llamacpp PRIVATE /usr/local/cuda/include)
         target_include_directories(rampart-faiss PRIVATE /usr/local/cuda/include)
+        target_include_directories(rampart-clip PRIVATE /usr/local/cuda/include)
     endif()
 endif()
 
@@ -266,6 +280,8 @@ if(LT_ENABLE_GPU AND NOT APPLE)
     string(STRIP "${_lt_sm}" _lt_sm)
     message(STATUS "rampart-langtools: GPU-arch guard sm list = ${_lt_sm}")
     target_compile_definitions(rampart-llamacpp PRIVATE "LT_CUDA_SM_LIST=\"${_lt_sm}\"")
+    # rampart-clip uses the SAME ggml (real-arch SASS) -> same guard, same list.
+    target_compile_definitions(rampart-clip PRIVATE "LT_CUDA_SM_LIST=\"${_lt_sm}\"")
 endif()
 
 
@@ -364,6 +380,15 @@ if(APPLE)
     "-Wl,-headerpad_max_install_names"
     "-Wl,-undefined,dynamic_lookup"
     "-Wl,-install_name,@rpath/rampart-sentencepiece.so"
+  )
+
+  target_link_options(rampart-clip PRIVATE
+    "-Wl,-headerpad_max_install_names"
+    "-Wl,-undefined,dynamic_lookup"
+    "-Wl,-install_name,@rpath/rampart-clip${LT_NAME_SUFFIX}.so"
+    # macOS symbol hiding (the -Wl,--exclude-libs equivalent -- -hidden-l / an
+    # -exported_symbols_list of just _duk_open_module) is deferred with the macOS
+    # port; a two-level namespace already binds each module to its own ggml.
   )
 
   # Frameworks
@@ -482,6 +507,19 @@ else()
     "-Wl,-Bsymbolic-functions"
   )
 
+  # clip: same as the others (own libstdc++/ggml statics need local binding), PLUS
+  # --exclude-libs,ALL to fully hide the vendored ggml/gguf/stb symbols.  rampart
+  # dlopens modules RTLD_GLOBAL, and rampart-llamacpp.so also statically links ggml;
+  # -Bsymbolic-functions binds clip's own ggml *function* calls locally, and
+  # --exclude-libs stops clip exporting those symbols at all -- so the two modules'
+  # ggml never interpose, even when they differ (a CUDA llamacpp vs a CPU clip).
+  # Only duk_open_module (clip's own object) stays exported.
+  target_link_options(rampart-clip PRIVATE
+    "-Wl,-soname,@rpath/rampart-clip${LT_NAME_SUFFIX}.so"
+    "-Wl,-Bsymbolic-functions"
+    "-Wl,--exclude-libs,ALL"
+  )
+
   ## OLD LINUX
   include(CheckCXXSourceCompiles)
 
@@ -547,6 +585,15 @@ set_target_properties(
     PROPERTIES SUFFIX ".so"
     PREFIX ""
     OUTPUT_NAME "rampart-llamacpp${LT_NAME_SUFFIX}"
+    INSTALL_RPATH "${LT_RPATH}"
+    BUILD_RPATH   "${LT_RPATH}"
+)
+
+set_target_properties(
+    rampart-clip
+    PROPERTIES SUFFIX ".so"
+    PREFIX ""
+    OUTPUT_NAME "rampart-clip${LT_NAME_SUFFIX}"
     INSTALL_RPATH "${LT_RPATH}"
     BUILD_RPATH   "${LT_RPATH}"
 )
@@ -671,8 +718,16 @@ target_link_libraries(rampart-llamacpp PRIVATE
 # Link with selected libs
 target_link_libraries(rampart-faiss PRIVATE ${FAISS_LIBS})
 
-target_link_libraries(rampart-sentencepiece PRIVATE  
+target_link_libraries(rampart-sentencepiece PRIVATE
     ${SP_LIBS}
+)
+
+# clip needs only ggml (+ its deps).  Linking the full LLAMA_LIBS is safe: static
+# archives contribute only referenced objects, so libllama/-common add nothing,
+# while clip rides the exact same ggml set (CPU, or GPU cuda/metal) llama resolved.
+target_link_libraries(rampart-clip PRIVATE
+    ${LLAMA_LIBS}
+    stdc++
 )
 
 # rampart-langtools.so is the legacy combined module; its functionality is now
@@ -687,10 +742,14 @@ install(TARGETS rampart-faiss
 install(TARGETS rampart-sentencepiece
   DESTINATION "${RP_PATH}/modules"
 )
+install(TARGETS rampart-clip
+  DESTINATION "${RP_PATH}/modules"
+)
 
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-llamacpp${LT_NAME_SUFFIX}.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-faiss${LT_NAME_SUFFIX}.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-sentencepiece.so\")")
+install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-clip${LT_NAME_SUFFIX}.so\")")
 
 # rampart-models: pure-JS model downloader/locator (single file, embedded
 # catalog).  Installed into modules/ so `require('rampart-models')` works.
@@ -703,6 +762,13 @@ install(FILES
 install(FILES
   "${CMAKE_CURRENT_SOURCE_DIR}/llamacpp-test.js"
   "${CMAKE_CURRENT_SOURCE_DIR}/faiss-test.js"
+  "${CMAKE_CURRENT_SOURCE_DIR}/clip-test.js"
+  DESTINATION "${RP_PATH}/test"
+)
+# clip-test.js's cross-modal retrieval check reads these Public-Domain photos
+# from <prefix>/test/test_images/{horses,flowers}/.
+install(DIRECTORY
+  "${CMAKE_CURRENT_SOURCE_DIR}/test_images"
   DESTINATION "${RP_PATH}/test"
 )
 
