@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 #pragma once
 #include "ocos.h"
+#include <unordered_map>   // clang-13/libc++ (macOS 11/12): not pulled in transitively
 #include "narrow.h"
 
 #include <vector>

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <sstream>
+#include <unordered_map>   // clang-13/libc++ (macOS 11/12): not pulled in transitively
 #include <string_view>
 #include "file_sys.h"
 #include "nlohmann/json.hpp"

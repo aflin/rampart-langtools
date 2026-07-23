@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include <regex>
+#include <unordered_set>   // clang-13/libc++ (macOS 11/12): not pulled in transitively
 #include <algorithm>
 
 #include "c_api_utils.hpp"

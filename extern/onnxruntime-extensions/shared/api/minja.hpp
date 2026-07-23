@@ -13,6 +13,7 @@
 #pragma once
 
 #include <algorithm>
+#include <unordered_map>   // clang-13/libc++ (macOS 11/12): not pulled in transitively
 #include <iostream>
 #include <string>
 #include <vector>

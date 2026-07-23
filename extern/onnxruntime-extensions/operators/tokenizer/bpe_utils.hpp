@@ -4,6 +4,7 @@
 #pragma once
 
 #include <regex>
+#include <unordered_map>   // clang-13/libc++ (macOS 11/12): not pulled in transitively
 #include <cassert>
 #include <algorithm>
 

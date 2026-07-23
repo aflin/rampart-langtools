@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include <limits>
+#include <unordered_map>   // clang-13/libc++ (macOS 11/12): not pulled in transitively
 #include <optional>
 #include <chrono>
 #include <atomic>

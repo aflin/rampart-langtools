@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "tokenizer_impl.h"
+#include <unordered_map>   // clang-13/libc++ (macOS 11/12): not pulled in transitively
 namespace ort_extensions {
 
 OrtxStatus TokenizerImpl::LoadChatTemplate() {

@@ -51,14 +51,16 @@ if [ "$(uname)" = "FreeBSD" ]; then
   [ -n "$GP" ] && EXTRA_DEFINES="--cmake_extra_defines Patch_EXECUTABLE=$GP"
 fi
 
-# macOS: build the CoreML execution provider (GPU / Neural Engine) into the
-# static archives. It adds libonnxruntime_providers_coreml.a (+ its coreml
-# proto dep), which the archive merge below picks up automatically; the
-# rampart-onnx link adds "-framework CoreML" on APPLE (extern.cmake). Sessions
-# still default to the CPU EP -- CoreML engages per session via use_coreml.
-if [ "$(uname)" = "Darwin" ]; then
-  EXTRA_DEFINES="$EXTRA_DEFINES --use_coreml"
-fi
+# macOS: the CoreML execution provider is deliberately NOT built. onnx gets no
+# worthwhile acceleration from it on macOS for our models -- the MPSGraph (GPU)
+# path aborts on this transformer class, the ANE path re-specializes per input
+# shape and loses on the ragged batches the embed path feeds, and Apple Silicon's
+# CPU EP (AMX via Accelerate) is already fast; it was opt-in + off by default for
+# exactly that reason. Dropping it also keeps the module buildable against older
+# macOS SDKs -- ORT 1.27's CoreML EP uses macOS-13 APIs (MLComputeUnitsCPUAnd-
+# NeuralEngine, getBytesWithHandler:) absent from the macOS 11/12 SDK -- so the
+# low-floor x86 build works. (llama.cpp still uses Metal where it helps; onnx on
+# macOS is CPU-only either way.)
 
 # ONNX_CPU_PARALLEL: build parallelism (default 8).  Lower it on small-RAM
 # hosts (e.g. 6 on a 7 GB aarch64 VM) -- some ORT translation units are
@@ -69,6 +71,7 @@ fi
   --skip_tests --skip_submodule_sync \
   --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
   --cmake_extra_defines onnxruntime_USE_XNNPACK=OFF \
+  --cmake_extra_defines onnxruntime_USE_COREML=OFF \
   --cmake_extra_defines CMAKE_POSITION_INDEPENDENT_CODE=ON \
   --cmake_extra_defines "CMAKE_CXX_FLAGS=-Wno-psabi" \
   $EXTRA_DEFINES \

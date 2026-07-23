@@ -5,6 +5,8 @@
 #include <vector>
 #include <fstream>
 #include <variant>
+#include <unordered_map>   // std::unordered_map (AttrDict below): not pulled in
+                           // transitively by libc++ on Apple clang 13 (macOS 11/12)
 
 #include "ortx_utils.h"
 #include "file_sys.h"

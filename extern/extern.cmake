@@ -443,8 +443,11 @@ else()
   # (top-level) keeps ORT's bundled protobuf/abseil from clashing with other modules'.
   if(APPLE)
     # Apple ld: -force_load,<archive> == --whole-archive for one archive; no librt.
-    # CoreML + Foundation: the statically-linked CoreML EP (rampart-build-cpu.sh
-    # passes --use_coreml on Darwin) is Objective-C++ against those frameworks.
+    # CoreML is NOT built (rampart-build-cpu.sh no longer passes --use_coreml -- it
+    # buys nothing on macOS and blocks the older-SDK x86 build; see the note there).
+    # The framework links are kept but inert: linking an unused framework is just a
+    # harmless load command, and it avoids a mac-only relink surprise if any Foundation
+    # symbol is pulled in. Drop them once a mac build confirms nothing references them.
     set(ONNX_LIBS
         "-Wl,-force_load,${ONNX_CORE_A}"
         ${ONNX_DEPS_A}

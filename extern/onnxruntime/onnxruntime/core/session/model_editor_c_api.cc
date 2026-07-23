@@ -344,8 +344,12 @@ ORT_API_STATUS_IMPL(OrtModelEditorAPI::AddInitializerToGraph, _Inout_ OrtGraph* 
   }
   ORT_CATCH(const std::exception& e) {
     OrtStatus* status = nullptr;
+    // clang < 16 cannot capture a structured binding (ptr_it) in a lambda; copy it
+    // into a plain local first. Behaviour-neutral (a set-iterator copy). Lets ORT
+    // build with the Apple clang 13 on macOS 11/12 (rampart-langtools low floor).
+    auto it = ptr_it;
     ORT_HANDLE_EXCEPTION([&]() {
-      graph->initializer_ptrs.erase(ptr_it);
+      graph->initializer_ptrs.erase(it);
       status = OrtApis::CreateStatus(ORT_FAIL, e.what());
     });
     return status;
@@ -395,8 +399,12 @@ ORT_API_STATUS_IMPL(OrtModelEditorAPI::AddNodeToGraph, _Inout_ OrtGraph* ort_gra
   }
   ORT_CATCH(const std::exception& e) {
     OrtStatus* status = nullptr;
+    // clang < 16 cannot capture a structured binding (ptr_it) in a lambda; copy it
+    // into a plain local first. Behaviour-neutral (a set-iterator copy). Lets ORT
+    // build with the Apple clang 13 on macOS 11/12 (rampart-langtools low floor).
+    auto it = ptr_it;
     ORT_HANDLE_EXCEPTION([&]() {
-      graph->node_ptrs.erase(ptr_it);
+      graph->node_ptrs.erase(it);
       status = OrtApis::CreateStatus(ORT_FAIL, e.what());
     });
     return status;

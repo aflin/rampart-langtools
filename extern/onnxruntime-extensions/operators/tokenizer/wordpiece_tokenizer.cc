@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "wordpiece_tokenizer.h"
+#include <unordered_map>   // clang-13/libc++ (macOS 11/12): not pulled in transitively
 #include "nlohmann/json.hpp"
 
 KernelWordpieceTokenizer::KernelWordpieceTokenizer(const OrtApi& api, const OrtKernelInfo& info)

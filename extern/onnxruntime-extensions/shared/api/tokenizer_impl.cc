@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "bpe_kernels.h"
+#include <unordered_map>   // clang-13/libc++ (macOS 11/12): not pulled in transitively
 #include "bpe_tokenizer_model.hpp"
 #include "bpe_decoder.hpp"
 #include "ugm_kernels.hpp"
