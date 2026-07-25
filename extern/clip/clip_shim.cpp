@@ -68,9 +68,26 @@ char *clip_log_dup(void) {
     return s;
 }
 void clip_log_clear(void) { std::lock_guard<std::mutex> lk(g_log_mtx); g_log.clear(); }
-static void clip_install_logger(void) {
+/* Process-once init: route ggml's log into our buffer, and (macOS) defuse the
+ * Metal residency-set assert.  Called before anything can create a ggml backend.
+ *
+ * macOS 15+ ggml-metal "residency sets" GGML_ASSERT([rsets->data count] == 0) in
+ * their static destructor at process exit if any Metal buffer is still alive --
+ * which is ALWAYS true here, because a loaded model's weights live in the
+ * process-lifetime refcounted cache and are deliberately never freed.  Disable
+ * the feature (a marginal perf optimization); RAMPART_METAL_RESIDENCY=1 keeps it.
+ * rampart-llamacpp does exactly the same for the same reason -- and clip needs its
+ * own copy because it links its OWN ggml (symbols are localized), so it creates
+ * its own Metal device and cannot rely on llamacpp having been loaded first. */
+static void clip_once_init(void) {
     static std::once_flag once;
-    std::call_once(once, []{ ggml_log_set(clip_ggml_logger, nullptr); });
+    std::call_once(once, []{
+        ggml_log_set(clip_ggml_logger, nullptr);
+#ifdef __APPLE__
+        if (!getenv("RAMPART_METAL_RESIDENCY"))
+            setenv("GGML_METAL_NO_RESIDENCY", "1", 1);
+#endif
+    });
 }
 
 /* rampart thread id (weak: a non-rampart host that dlopens the .so still links;
@@ -230,6 +247,7 @@ static int clip_cuda_supported(char * reason, size_t n) {
 // selects the GPU -- unless the arch/driver guard rules it out (-> CPU + warn once).
 // Sets *is_gpu to 1 iff a GPU backend was chosen.
 static ggml_backend_t clip_backend_init(int * is_gpu) {
+    clip_once_init();          /* must precede any ggml device creation */
     if (is_gpu) *is_gpu = 0;
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (dev) {
@@ -252,6 +270,7 @@ static ggml_backend_t clip_backend_init(int * is_gpu) {
 
 /* a compute backend of the load-chosen type (GPU weights need GPU compute). */
 static ggml_backend_t clip_backend_of_type(int use_gpu) {
+    clip_once_init();          /* must precede any ggml device creation */
     if (use_gpu) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
         if (dev) return ggml_backend_dev_init(dev, NULL);
@@ -300,7 +319,7 @@ static clip_handle * clip_build(const char * path, char * err, size_t errlen) {
         h = new clip_handle;
         h->path = path;
         h->init_pid = (int) getpid();
-        clip_install_logger();   /* capture ggml's CUDA-init banner off stderr */
+        clip_once_init();        /* log capture + macOS Metal residency guard */
         /* Allocate the weights on the SAME backend type the per-thread compute
          * uses: CPU in a CPU build, the GPU device in a cu* build (unless the
          * arch/driver guard rules the GPU out).  On GPU the weights land in VRAM,
@@ -475,9 +494,16 @@ int clip_has_text(clip_handle * h)   { return h->has_text ? 1 : 0; }
 int clip_has_vision(clip_handle * h) { return h->has_vision ? 1 : 0; }
 
 // ================= transformer layer (verbatim math; scaffolding modernized) =================
+/* kq_mask: NULL for the (bidirectional) vision tower; for the text tower it is an
+ * [seq, seq] F32 additive causal mask (0 keep / -INF mask) applied inside
+ * ggml_soft_max_ext.  This replaces ggml_diag_mask_inf, which the Metal backend
+ * does NOT implement at all (it aborts with "unsupported op") -- soft_max_ext with
+ * an explicit mask is the path llama.cpp itself uses for attention, so it is
+ * supported on CPU, CUDA and Metal alike, and is mathematically identical:
+ * diag_mask_inf(x,0) then soft_max == soft_max_ext(x, mask) with that mask. */
 static ggml_tensor * layer_forward(ggml_context * c, const clip_layer & L, ggml_tensor * embeddings,
                                    int hidden_size, int n_head, int d_head, int seq, int batch,
-                                   float eps, bool use_gelu, bool causal) {
+                                   float eps, bool use_gelu, ggml_tensor * kq_mask) {
     ggml_tensor * cur = ggml_norm(c, embeddings, eps);
     cur = ggml_add(c, ggml_mul(c, ggml_repeat(c, L.ln_1_w, cur), cur), ggml_repeat(c, L.ln_1_b, cur));
     {
@@ -495,8 +521,9 @@ static ggml_tensor * layer_forward(ggml_context * c, const clip_layer & L, ggml_
         V = ggml_cont(c, ggml_permute(c, V, 1, 2, 0, 3));
         V = ggml_reshape_3d(c, V, seq, d_head, n_head * batch);
         ggml_tensor * KQ = ggml_mul_mat(c, K, Q);
-        if (causal) KQ = ggml_diag_mask_inf_inplace(c, KQ, 0);
-        KQ = ggml_soft_max_inplace(c, KQ);
+        /* Q is already pre-scaled by 1/sqrt(d_head) above, hence scale = 1.0 here. */
+        KQ = kq_mask ? ggml_soft_max_ext(c, KQ, kq_mask, 1.0f, 0.0f)
+                     : ggml_soft_max_inplace(c, KQ);
         ggml_tensor * KQV = ggml_mul_mat(c, V, KQ);
         KQV = ggml_reshape_4d(c, KQV, d_head, seq, n_head, batch);
         KQV = ggml_cont(c, ggml_permute(c, KQV, 0, 2, 1, 3));
@@ -557,11 +584,13 @@ int clip_embed_text(clip_handle * h, const char * text, float * out, int normali
     ggml_tensor * input_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, N); ggml_set_input(input_ids);
     ggml_tensor * positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, N); ggml_set_input(positions);
     ggml_tensor * eot       = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1); ggml_set_input(eot);
+    /* additive causal mask, [key, query]: 0 where key <= query, -INF above */
+    ggml_tensor * kq_mask   = ggml_new_tensor_2d(c, GGML_TYPE_F32, N, N); ggml_set_input(kq_mask);
 
     ggml_tensor * emb = ggml_get_rows(c, m.token_embeddings, input_ids);
     emb = ggml_add(c, ggml_get_rows(c, m.position_embeddings, positions), emb);
     for (int il = 0; il < m.n_layer; il++)
-        emb = layer_forward(c, m.layers[il], emb, hidden_size, n_head, d_head, N, 1, m.eps, h->use_gelu, true);
+        emb = layer_forward(c, m.layers[il], emb, hidden_size, n_head, d_head, N, 1, m.eps, h->use_gelu, kq_mask);
     emb = ggml_norm(c, emb, m.eps);
     emb = ggml_add(c, ggml_mul(c, ggml_repeat(c, m.post_ln_w, emb), emb), ggml_repeat(c, m.post_ln_b, emb));
     emb = ggml_get_rows(c, emb, eot);
@@ -573,9 +602,16 @@ int clip_embed_text(clip_handle * h, const char * text, float * out, int normali
 
     std::vector<int32_t> pos(N); for (int i = 0; i < N; i++) pos[i] = i;
     int32_t e = N - 1;
+    /* ne[0] is the key index (fastest), ne[1] the query index -- mask a key that
+     * lies AFTER the query, matching ggml_diag_mask_inf(x, n_past=0). */
+    std::vector<float> maskbuf((size_t) N * N);
+    for (int q = 0; q < N; q++)
+        for (int k = 0; k < N; k++)
+            maskbuf[(size_t) q * N + k] = (k > q) ? -INFINITY : 0.0f;
     ggml_backend_tensor_set(input_ids, v.data(),   0, N * sizeof(int32_t));
     ggml_backend_tensor_set(positions, pos.data(), 0, N * sizeof(int32_t));
     ggml_backend_tensor_set(eot, &e, 0, sizeof(int32_t));
+    ggml_backend_tensor_set(kq_mask, maskbuf.data(), 0, maskbuf.size() * sizeof(float));
 
     if (ggml_backend_graph_compute(T->backend, gf) != GGML_STATUS_SUCCESS) { ggml_free(c); set_err(err, errlen, "compute failed"); return -1; }
     ggml_backend_tensor_get(emb, out, 0, m.projection_dim * sizeof(float));
@@ -673,7 +709,7 @@ static int embed_pixels(clip_handle * h, const uint8_t * raw, int nx, int ny,
     emb = ggml_norm(c, emb, m.eps);
     emb = ggml_add(c, ggml_mul(c, ggml_repeat(c, m.pre_ln_w, emb), emb), ggml_repeat(c, m.pre_ln_b, emb));
     for (int il = 0; il < m.n_layer; il++)
-        emb = layer_forward(c, m.layers[il], emb, hidden_size, n_head, d_head, num_positions, batch, m.eps, h->use_gelu, false);
+        emb = layer_forward(c, m.layers[il], emb, hidden_size, n_head, d_head, num_positions, batch, m.eps, h->use_gelu, /*kq_mask*/ NULL);
     emb = ggml_reshape_2d(c, emb, hidden_size, num_positions * batch);
     emb = ggml_get_rows(c, emb, cls);
     emb = ggml_norm(c, emb, m.eps);
