@@ -62,9 +62,20 @@ fi
 # low-floor x86 build works. (llama.cpp still uses Metal where it helps; onnx on
 # macOS is CPU-only either way.)
 
+# ELF targets: assemble the MLAS .S files with an explicit (non-exec)
+# .note.GNU-stack section; without it ld warns "missing .note.GNU-stack
+# section implies executable stack" when the static archives are linked
+# into rampart-onnx.so. Mach-O has no such note, so skip on macOS.
+ASM_DEFINES=""
+if [ "$(uname)" != "Darwin" ]; then
+  ASM_DEFINES="--cmake_extra_defines CMAKE_ASM_FLAGS=-Wa,--noexecstack"
+fi
+
 # ONNX_CPU_PARALLEL: build parallelism (default 8).  Lower it on small-RAM
 # hosts (e.g. 6 on a 7 GB aarch64 VM) -- some ORT translation units are
 # memory-hungry and 8 concurrent gcc's can OOM.
+# -w: vendored code -- silence its warnings (noise at our -Wall, not ours
+# to fix); -Wno-psabi kept for compilers where -w doesn't cover the note.
 ./build.sh \
   --build_dir "$BUILD_DIR" \
   --config Release --parallel "${ONNX_CPU_PARALLEL:-8}" --compile_no_warning_as_error \
@@ -73,7 +84,9 @@ fi
   --cmake_extra_defines onnxruntime_USE_XNNPACK=OFF \
   --cmake_extra_defines onnxruntime_USE_COREML=OFF \
   --cmake_extra_defines CMAKE_POSITION_INDEPENDENT_CODE=ON \
-  --cmake_extra_defines "CMAKE_CXX_FLAGS=-Wno-psabi" \
+  --cmake_extra_defines "CMAKE_CXX_FLAGS=-Wno-psabi -w" \
+  --cmake_extra_defines "CMAKE_C_FLAGS=-w" \
+  $ASM_DEFINES \
   $EXTRA_DEFINES \
   --update --build
 

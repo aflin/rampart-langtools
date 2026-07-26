@@ -1823,6 +1823,13 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
                 RP_THROW(ctx, "rampart-llama-cpp:embedTextToBuf - %s (chunk %lu)",
                          err2[0] ? err2 : "embed failed", (unsigned long)i);
             }
+            /* gcc can't see that RP_THROW longjmps and never returns, so it
+               flags the lines below as using all/ntok after the frees above
+               (-Wuse-after-free, gcc-only flag — hence the guard). */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuse-after-free"
+#endif
             /* the combined vector: == the exact vector when the string fits
              * one window (kk == 1), the normalized mean of its sub-chunk
              * vectors otherwise */
@@ -1833,6 +1840,9 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
                 for (j = 0; j < kk; j++) ntok[i] += (size_t)spans[j].n_tokens;
             }
             free(v); free(avg1); free(spans);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         }
         float coh = 0.0f;
         float *avg = ll_avg_coh(all, k, dim, &coh);

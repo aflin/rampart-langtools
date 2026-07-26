@@ -25,6 +25,13 @@ static OrtEnv           *g_env  = nullptr;
 static char              g_runtime_desc[512] = "uninitialized";
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
+/* Deliberately-ignored OrtStatus*: best-effort setters/getters whose failure
+ * has no useful handling here.  A non-null status must still be released or
+ * it leaks (and the OrtApi fns are declared warn_unused_result). */
+static inline void ort_discard(const OrtApi *o, OrtStatus *st) {
+    if (st) o->ReleaseStatus(st);
+}
+
 /* ---- captured log buffer -------------------------------------------------- */
 /* ORT's default logger prints warnings/non-fatal errors straight to stderr (the
  * "[W:onnxruntime:...]" / "[E:onnxruntime:...]" lines -- node-placement notices,
@@ -186,7 +193,8 @@ static int rp_cuda_device_cc(void) {
 /* does dir/sm.list exist and contain cc exactly?  1 yes, 0 no, -1 no list */
 static int rp_smlist_has(const char *dir, int cc) {
     char p[PATH_MAX];
-    snprintf(p, sizeof p, "%s/sm.list", dir);
+    if (snprintf(p, sizeof p, "%s/sm.list", dir) >= (int)sizeof p)
+        return -1; /* path too long — treat as no list */
     FILE *f = fopen(p, "r");
     if (!f) return -1;
     int found = 0, v;
@@ -463,7 +471,7 @@ static int read_io(OrtSession *sess, int is_input,
                       : o->SessionGetOutputName(sess, i, alloc, &nm);
         if (st) { failed = 1; break; }
         list[i].name = strdup(nm ? nm : "");
-        o->AllocatorFree(alloc, nm);
+        ort_discard(o, o->AllocatorFree(alloc, nm));
 
         OrtTypeInfo *ti = nullptr;
         st = is_input ? o->SessionGetInputTypeInfo(sess, i, &ti)
@@ -480,16 +488,16 @@ static int read_io(OrtSession *sess, int is_input,
             continue;
         }
         ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
-        o->GetTensorElementType(tsi, &et);
+        ort_discard(o, o->GetTensorElementType(tsi, &et));
         list[i].dtype = ort_to_dtype(et);
 
         size_t nd = 0;
-        o->GetDimensionsCount(tsi, &nd);
+        ort_discard(o, o->GetDimensionsCount(tsi, &nd));
         list[i].n_dims = nd;
         if (nd) {
             list[i].shape = (int64_t *)malloc(nd * sizeof(int64_t));
             if (!list[i].shape) { o->ReleaseTypeInfo(ti); oom = 1; failed = 1; break; }
-            o->GetDimensions(tsi, list[i].shape, nd);
+            ort_discard(o, o->GetDimensions(tsi, list[i].shape, nd));
         }
         o->ReleaseTypeInfo(ti);
     }
@@ -531,13 +539,13 @@ static OrtSessionOptions *make_opts(const onnx_session_opts *so, char *err, size
     if (st) { fail_status(st, err, errlen); return nullptr; }
 
     if (so) {
-        if (so->intra_threads > 0) o->SetIntraOpNumThreads(opts, so->intra_threads);
-        if (so->inter_threads > 0) o->SetInterOpNumThreads(opts, so->inter_threads);
+        if (so->intra_threads > 0) ort_discard(o, o->SetIntraOpNumThreads(opts, so->intra_threads));
+        if (so->inter_threads > 0) ort_discard(o, o->SetInterOpNumThreads(opts, so->inter_threads));
         /* Execution mode: SEQUENTIAL avoids the inter-op threadpool entirely.
          * Combined with intra_threads==1 this means ORT spawns NO background
          * threads -> the session survives fork(). (Parallel/multi-thread is
          * opt-in and is NOT fork-safe; create such sessions post-fork.) */
-        o->SetSessionExecutionMode(opts, so->execution_mode == 1 ? ORT_PARALLEL : ORT_SEQUENTIAL);
+        ort_discard(o, o->SetSessionExecutionMode(opts, so->execution_mode == 1 ? ORT_PARALLEL : ORT_SEQUENTIAL));
         GraphOptimizationLevel lvl = ORT_ENABLE_ALL;
         switch (so->graph_opt) {
             case 0: lvl = ORT_DISABLE_ALL;    break;
@@ -546,7 +554,7 @@ static OrtSessionOptions *make_opts(const onnx_session_opts *so, char *err, size
             case 3: lvl = ORT_ENABLE_ALL;     break;
             default: lvl = ORT_ENABLE_ALL;    break; /* <0 => default */
         }
-        o->SetSessionGraphOptimizationLevel(opts, lvl);
+        ort_discard(o, o->SetSessionGraphOptimizationLevel(opts, lvl));
 
         /* CUDA execution provider. These OrtApi entry points exist in every ORT
          * build (CPU included) -- on a CPU-only build the append below returns an
@@ -560,7 +568,7 @@ static OrtSessionOptions *make_opts(const onnx_session_opts *so, char *err, size
             snprintf(devbuf, sizeof devbuf, "%d", so->cuda_device_id < 0 ? 0 : so->cuda_device_id);
             const char *keys[] = { "device_id" };
             const char *vals[] = { devbuf };
-            o->UpdateCUDAProviderOptions(cu, keys, vals, 1);
+            ort_discard(o, o->UpdateCUDAProviderOptions(cu, keys, vals, 1));
             OrtStatus *ast = o->SessionOptionsAppendExecutionProvider_CUDA_V2(opts, cu);
             o->ReleaseCUDAProviderOptions(cu);
             if (ast) { o->ReleaseSessionOptions(opts); fail_status(ast, err, errlen); return nullptr; }
@@ -642,7 +650,7 @@ static int ep_available(const char *name) {
     int have = 0;
     for (int i = 0; i < n; i++)
         if (provs[i] && !strcmp(provs[i], name)) { have = 1; break; }
-    o->ReleaseAvailableProviders(provs, n);
+    ort_discard(o, o->ReleaseAvailableProviders(provs, n));
     return have;
 }
 
@@ -759,11 +767,11 @@ int onnx_session_metadata(onnx_session *s,
     if (o->SessionGetModelMetadata(s->sess, &md) || !md) return 0;
 
     char *tmp = nullptr;
-    if (!o->ModelMetadataGetProducerName(md, alloc, &tmp) && tmp) { *producer = strdup(tmp); o->AllocatorFree(alloc, tmp); tmp = nullptr; }
-    if (!o->ModelMetadataGetGraphName(md, alloc, &tmp) && tmp)    { *graph_name = strdup(tmp); o->AllocatorFree(alloc, tmp); tmp = nullptr; }
-    if (!o->ModelMetadataGetDomain(md, alloc, &tmp) && tmp)       { *domain = strdup(tmp); o->AllocatorFree(alloc, tmp); tmp = nullptr; }
-    if (!o->ModelMetadataGetDescription(md, alloc, &tmp) && tmp)  { *description = strdup(tmp); o->AllocatorFree(alloc, tmp); tmp = nullptr; }
-    o->ModelMetadataGetVersion(md, version);
+    if (!o->ModelMetadataGetProducerName(md, alloc, &tmp) && tmp) { *producer = strdup(tmp); ort_discard(o, o->AllocatorFree(alloc, tmp)); tmp = nullptr; }
+    if (!o->ModelMetadataGetGraphName(md, alloc, &tmp) && tmp)    { *graph_name = strdup(tmp); ort_discard(o, o->AllocatorFree(alloc, tmp)); tmp = nullptr; }
+    if (!o->ModelMetadataGetDomain(md, alloc, &tmp) && tmp)       { *domain = strdup(tmp); ort_discard(o, o->AllocatorFree(alloc, tmp)); tmp = nullptr; }
+    if (!o->ModelMetadataGetDescription(md, alloc, &tmp) && tmp)  { *description = strdup(tmp); ort_discard(o, o->AllocatorFree(alloc, tmp)); tmp = nullptr; }
+    ort_discard(o, o->ModelMetadataGetVersion(md, version));
     o->ReleaseModelMetadata(md);
     return 0;
 }
@@ -892,9 +900,9 @@ int onnx_session_run(onnx_session *s,
         if (arena_cadence > 0 &&
             (arena_run_ctr.fetch_add(1) + 1) % (unsigned)arena_cadence == 0) {
             if (!o->CreateRunOptions(&shrink_ro)) {
-                o->AddRunConfigEntry(shrink_ro,
+                ort_discard(o, o->AddRunConfigEntry(shrink_ro,
                     "memory.enable_memory_arena_shrinkage",
-                    (s->flags & ONNX_F_USES_GPU) ? "gpu:0;cpu:0" : "cpu:0");
+                    (s->flags & ONNX_F_USES_GPU) ? "gpu:0;cpu:0" : "cpu:0"));
             }
         }
 
@@ -915,7 +923,7 @@ int onnx_session_run(onnx_session *s,
             st = nullptr;
             OrtRunOptions *ro = nullptr;
             if (!o->CreateRunOptions(&ro)) {
-                o->AddRunConfigEntry(ro, "memory.enable_memory_arena_shrinkage", "gpu:0");
+                ort_discard(o, o->AddRunConfigEntry(ro, "memory.enable_memory_arena_shrinkage", "gpu:0"));
                 st = o->Run(s->sess, ro, in_names, (const OrtValue *const *)in_vals, n_ins,
                             onames, n_out, out_vals);
                 o->ReleaseRunOptions(ro);
@@ -948,18 +956,18 @@ int onnx_session_run(onnx_session *s,
             if (st) { copy_rc = fail_status(st, err, errlen); break; }
 
             ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
-            o->GetTensorElementType(tsi, &et);
+            ort_discard(o, o->GetTensorElementType(tsi, &et));
             results[i].dtype = ort_to_dtype(et);
 
-            size_t nd = 0; o->GetDimensionsCount(tsi, &nd);
+            size_t nd = 0; ort_discard(o, o->GetDimensionsCount(tsi, &nd));
             results[i].n_dims = nd;
             if (nd) {
                 results[i].shape = (int64_t *)malloc(nd * sizeof(int64_t));
                 if (!results[i].shape) { o->ReleaseTensorTypeAndShapeInfo(tsi);
                                          copy_rc = fail_msg("oom", err, errlen); break; }
-                o->GetDimensions(tsi, results[i].shape, nd);
+                ort_discard(o, o->GetDimensions(tsi, results[i].shape, nd));
             }
-            size_t nelem = 0; o->GetTensorShapeElementCount(tsi, &nelem);
+            size_t nelem = 0; ort_discard(o, o->GetTensorShapeElementCount(tsi, &nelem));
             o->ReleaseTensorTypeAndShapeInfo(tsi);
             results[i].n_elems = nelem;
 

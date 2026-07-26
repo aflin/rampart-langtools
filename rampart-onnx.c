@@ -1096,7 +1096,10 @@ void *rp_onnx_embed_load(const char *model_path,
         return NULL;
     }
     /* --- discover the model + tokenizer + pooling + window from the directory --- */
-    char onnx_file[1024] = {0}, vocab_file[1024] = {0}, tok_dir[1024] = {0};
+    /* 1536: must exceed the cand/od[1100] staging buffers plus a dirent
+       name, or gcc's -Wformat-truncation flags the copies (and a long
+       model path would truncate into a confusing open failure). */
+    char onnx_file[1536] = {0}, vocab_file[1536] = {0}, tok_dir[1536] = {0};
     int  is_wp = 0, disc_pooling = 0, disc_win = 0;  /* pooling: 0 none, 1 mean, 2 cls */
     int  dir_mode = rp_is_dir(model_path);
     /* the caller normally reached us from a JS call (sql.set / require), so the
@@ -2134,9 +2137,15 @@ static duk_ret_t onnx_wordpiece_js(duk_context *ctx) {
     const char *vocab = REQUIRE_STRING(ctx, 0, "wordPieceTokenizer: argument 1 must be a String (vocab.txt path)");
     int lower = 1, strip = 1, chinese = 1;
     if (duk_is_object(ctx, 1)) {
-        if (duk_get_prop_string(ctx, 1, "lowercase"))       lower   = duk_to_boolean(ctx, -1); duk_pop(ctx);
-        if (duk_get_prop_string(ctx, 1, "stripAccents"))    strip   = duk_to_boolean(ctx, -1); duk_pop(ctx);
-        if (duk_get_prop_string(ctx, 1, "tokenizeChinese")) chinese = duk_to_boolean(ctx, -1); duk_pop(ctx);
+        /* duk_get_prop_string pushes a value (undefined if absent) either
+           way, so each pop runs unconditionally — split onto its own line
+           to make that explicit (-Wmisleading-indentation). */
+        if (duk_get_prop_string(ctx, 1, "lowercase"))       lower   = duk_to_boolean(ctx, -1);
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, 1, "stripAccents"))    strip   = duk_to_boolean(ctx, -1);
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, 1, "tokenizeChinese")) chinese = duk_to_boolean(ctx, -1);
+        duk_pop(ctx);
     }
     char err[512] = {0};
     onnx_wp_tokenizer *t = onnx_wp_create(vocab, lower, strip, chinese, err, sizeof err);
@@ -2853,7 +2862,7 @@ static duk_ret_t onnx_discover_js(duk_context *ctx)
     duk_put_prop_string(ctx, -2, "isDir");
     if (!isdir) return 1;
 
-    char buf[1100], cand[1100];
+    char buf[1536], cand[1536]; /* > od[1100] + dirent name (see rp_find_suffix) */
     snprintf(cand, sizeof cand, "%s/onnx/model.onnx", path);
     if (!rp_is_file(cand)) {
         snprintf(cand, sizeof cand, "%s/model.onnx", path);

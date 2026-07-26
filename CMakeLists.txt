@@ -240,7 +240,11 @@ add_library(rampart-clip SHARED
     extern/clip/clip_shim.cpp
 )
 target_include_directories(rampart-clip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extern/clip)
-add_dependencies(rampart-clip ggml ggml-cpu ggml-base)
+# llama + llama-common included: rampart-clip links LLAMA_LIBS by file
+# path (libllama-common.a etc.); without the target-level edges a fresh
+# parallel build can reach the link step before those archives exist
+# ("No rule to make target ... libllama-common.a").
+add_dependencies(rampart-clip ggml ggml-cpu ggml-base llama llama-common)
 # clip's per-platform link options (soname/install_name, -Bsymbolic-functions,
 # and --exclude-libs to hide the vendored ggml) live in the Apple / Linux
 # target_link_options blocks below, alongside the other modules'.

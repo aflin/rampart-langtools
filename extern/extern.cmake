@@ -109,6 +109,17 @@ if(LT_ENABLE_GPU AND NOT APPLE)
   set(GGML_CUDA_NO_VMM ON CACHE BOOL "" FORCE)
 endif()
 
+# Silence compiler warnings in the vendored subprojects (llama.cpp,
+# sentencepiece, faiss — ~1400 lines of -Wsign-compare etc. at our -Wall
+# that we don't maintain; noise, not signal).  Scoped save/restore so -w
+# does not leak into rampart-langtools' own modules, which build with
+# full warnings.  Same pattern as texis' SILENCE_VENDORED_WARNINGS.
+# (-w is accepted by both gcc and clang.)
+set(_LT_TP_SAVED_C_FLAGS   "${CMAKE_C_FLAGS}")
+set(_LT_TP_SAVED_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -w")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
+
 add_subdirectory(${EXTERN_DIR}/llama.cpp ${CMAKE_BINARY_DIR}/extern/llama.cpp EXCLUDE_FROM_ALL)
 
 # SENTENCEPIECE
@@ -196,6 +207,10 @@ set(env{CMAKE_THREAD_LIBS_INIT} "")
 
 add_subdirectory(${EXTERN_DIR}/faiss EXCLUDE_FROM_ALL)
 
+# end of vendored subprojects — restore full warnings for our own code
+set(CMAKE_C_FLAGS   "${_LT_TP_SAVED_C_FLAGS}")
+set(CMAKE_CXX_FLAGS "${_LT_TP_SAVED_CXX_FLAGS}")
+
 # the tiny wrapper for sentencepiece
 add_library(spm_c_wrapper_obj OBJECT
     ${CMAKE_CURRENT_SOURCE_DIR}/extern/sentencepiece/wrapper/spm_c_wrapper.cc
@@ -226,6 +241,10 @@ target_include_directories(llama_gen_shim_obj PRIVATE
     ${EXTERN_DIR}/llama.cpp/ggml/include
 )
 add_dependencies(llama_gen_shim_obj llama-common llama ggml)
+# The shim includes llama.cpp's vendored jinja headers, whose unused static
+# helpers trip -Wunused-function in this TU (the shim builds with full
+# warnings, unlike the -w'd llama.cpp subdir). Flag accepted by gcc + clang.
+target_compile_options(llama_gen_shim_obj PRIVATE -Wno-unused-function)
 
 # ----------------------------------------------------------------------------
 # ONNX RUNTIME
