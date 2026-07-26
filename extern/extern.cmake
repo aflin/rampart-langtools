@@ -90,6 +90,23 @@ set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
 # Floor is Volta (7.0); add 60;61 for Pascal (GTX 10-series) reach, or drop 70;75 to shrink.
 if(LT_ENABLE_GPU AND NOT APPLE)
   set(CMAKE_CUDA_ARCHITECTURES "70-real;75-real;80-real;86-real;89-real;89-virtual" CACHE STRING "")
+  # Use ggml's plain-cudaMalloc pool (ggml_cuda_pool_leg) instead of its VMM pool.
+  # ggml_cuda_pool_vmm reserves CUDA_POOL_VMM_MAX_SIZE == 32GB of *virtual address
+  # space* per llama_context via cuMemAddressReserve (ggml-cuda.cu).  A discrete GPU
+  # never notices; Tegra's VA aperture for those reservations is far smaller -- on an
+  # Orin Nano exactly two fit (verified: a single 64GB PROT_NONE range in
+  # /proc/<pid>/maps), so loading a third model -- e.g. reranker + two per-language
+  # embed models -- aborted the process at ggml-cuda.cu:532 with
+  # "CUDA error: out of memory" from cuMemAddressReserve.  That is address space, not
+  # physical memory: the box had GBs free.
+  #
+  # The leg pool reserves no VA at all, and unlike the VMM pool it flushes its cached
+  # buffers and retries on a real OOM instead of aborting on first failure.  Cost is a
+  # slightly larger steady-state pool footprint (best-fit over up to 256 cached
+  # buffers, +5% round-up per new allocation, returned only on flush) -- noise on any
+  # GPU we deploy to.  FORCEd so an existing build cache can't silently keep the VMM
+  # pool; to experiment with VMM again, change it here and reconfigure.
+  set(GGML_CUDA_NO_VMM ON CACHE BOOL "" FORCE)
 endif()
 
 add_subdirectory(${EXTERN_DIR}/llama.cpp ${CMAKE_BINARY_DIR}/extern/llama.cpp EXCLUDE_FROM_ALL)

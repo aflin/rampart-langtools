@@ -3342,14 +3342,43 @@ struct llog_cap
     pthread_mutex_t mutex;
 };
 
+/* Most recent ERROR-level output, kept for llamacpp_on_abort() below.  A fatal
+ * ggml error logs its reason at ERROR level and then aborts, taking the capture
+ * buffer with it, so the abort hook needs the text somewhere it can still reach.
+ * Written only here, under cap->mutex.  GGML_LOG_LEVEL_CONT continues the
+ * previous line, so it joins whatever group that line belonged to; consecutive
+ * ERROR lines accumulate (ggml_cuda_error emits three), and the first ERROR
+ * after any other output starts a new group. */
+#define LT_LAST_ERR_SZ 2048
+static char   last_err[LT_LAST_ERR_SZ];
+static size_t last_err_len  = 0;
+static int    last_err_open = 0;
+
 static void llamacpp_logger(enum ggml_log_level level, const char *text, void *ud)
 {
-    (void)level; // or filter by level
     struct llog_cap *cap = (struct llog_cap *)ud;
 
     pthread_mutex_lock(&cap->mutex);
 
     size_t text_len = strlen(text);
+
+    if (level == GGML_LOG_LEVEL_ERROR ||
+        (level == GGML_LOG_LEVEL_CONT && last_err_open))
+    {
+        if (!last_err_open)
+        {
+            last_err_len = 0;
+            last_err_open = 1;
+        }
+        if (last_err_len + text_len < sizeof(last_err))
+        {
+            memcpy(last_err + last_err_len, text, text_len);
+            last_err_len += text_len;
+            last_err[last_err_len] = '\0';
+        }
+    }
+    else if (level != GGML_LOG_LEVEL_CONT)
+        last_err_open = 0;
 
     // Check if adding new text would exceed maximum (cap->len > 0 implies
     // cap->buf is allocated; skip the trim on a fresh/reset buffer)
@@ -3392,6 +3421,44 @@ static void llamacpp_logger(enum ggml_log_level level, const char *text, void *u
     cap->len += text_len;
 
     pthread_mutex_unlock(&cap->mutex);
+}
+
+/* The capture buffer above, for llamacpp_on_abort(); ggml's abort callback
+ * takes no user data. */
+static struct llog_cap *llog_cap_for_abort = NULL;
+
+/* ggml calls this immediately before abort() -- a failed CUDA/Metal call, a
+ * GGML_ASSERT.  Nothing else here writes to stderr: the ordinary log goes only
+ * to the capture buffer (.getLog()).  But that buffer dies with the process,
+ * and what it holds at this moment is the only statement of WHY.  A CUDA
+ * failure, for one, logs the driver's reason and the file:line of the call that
+ * failed at ERROR level, then aborts from a fixed line inside ggml_cuda_error
+ * that reads the same for every such failure -- so without this you get a core
+ * and no diagnosis.  Emit the last error group, then the abort message.
+ *
+ * Installing this callback replaces ggml's own fprintf of `message`, hence
+ * printing it here.  We run on the dying thread, so we must not block on a
+ * mutex another thread may hold: trylock, and read last_err regardless -- a
+ * torn line beats a hung crash. */
+static void llamacpp_on_abort(const char *message)
+{
+    struct llog_cap *cap = llog_cap_for_abort;
+    int locked = (cap && pthread_mutex_trylock(&cap->mutex) == 0);
+
+    fflush(stdout);
+
+    if (last_err_len)
+    {
+        fputs(last_err, stderr);
+        if (last_err[last_err_len - 1] != '\n')
+            fputc('\n', stderr);
+    }
+
+    if (locked)
+        pthread_mutex_unlock(&cap->mutex);
+
+    fprintf(stderr, "%s\n", message ? message : "ggml abort");
+    fflush(stderr);
 }
 
 static duk_ret_t getlog(duk_context *ctx)
@@ -3465,6 +3532,11 @@ duk_ret_t duk_open_module(duk_context *ctx)
         CALLOC(cap, sizeof(struct llog_cap));
         pthread_mutex_init(&cap->mutex, NULL);
         llama_log_set(llamacpp_logger, cap);
+
+        /* fatal ggml errors log their reason to `cap` and then abort; this
+         * hook flushes it to stderr so it is not lost.  See llamacpp_on_abort. */
+        llog_cap_for_abort = cap;
+        ggml_set_abort_callback(llamacpp_on_abort);
 
         duk_push_pointer(ctx, cap);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("caplog"));

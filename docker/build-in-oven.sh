@@ -83,8 +83,15 @@ case "$STAGE" in
         # -allow-unsupported-compiler: Debian/AlmaLinux host gcc can be newer than
         # the CUDA version officially allows; this lets the build proceed (drop it
         # if you want nvcc to enforce its gcc ceiling).
+        # -DGGML_CUDA_NO_VMM=ON: ggml's VMM pool reserves 32GB of virtual address
+        # space per llama_context (cuMemAddressReserve).  Tegra's VA aperture fits
+        # only two, so the third model load aborts with "CUDA error: out of memory"
+        # -- address space, not physical memory.  extern/extern.cmake sets this too
+        # (see the long note there); passed here as well so the oven's own flags
+        # record it.
         GPU_FLAGS="-DLT_ENABLE_GPU=1 -DCMAKE_CUDA_HOST_COMPILER=$CUDAHOSTCXX \
                    -DCMAKE_CUDA_ARCHITECTURES=$arches \
+                   -DGGML_CUDA_NO_VMM=ON \
                    -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
     fi
 
