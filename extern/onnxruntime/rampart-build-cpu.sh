@@ -16,6 +16,21 @@ cd "$(dirname "$0")"
 
 BUILD_DIR="${1:-$(cd ../.. && pwd)/build/extern/onnxruntime}"
 
+# Vendored FetchContent sources: extern/onnxruntime-deps/ort/<name> holds
+# the unpacked, PRE-PATCHED source tree for every dependency this build
+# would otherwise download (see extern/onnxruntime-deps/MANIFEST.txt).
+# FETCHCONTENT_SOURCE_DIR_<NAME> makes CMake use each tree directly (no
+# download, no extract; patch steps are skipped, hence pre-patched trees).
+# Build artifacts still land in the build dir as usual.
+DEPS_SRC="$(cd .. && pwd)/onnxruntime-deps/ort"
+DEPS_DEFINES=""
+for d in ABSEIL_CPP:abseil_cpp DATE:date EIGEN3:eigen3 FLATBUFFERS:flatbuffers \
+         GSL:gsl KLEIDIAI:kleidiai MP11:mp11 NLOHMANN_JSON:nlohmann_json \
+         ONNX:onnx PROTOBUF:protobuf PYTORCH_CPUINFO:pytorch_cpuinfo \
+         RE2:re2 SAFEINT:safeint; do
+  DEPS_DEFINES="$DEPS_DEFINES --cmake_extra_defines FETCHCONTENT_SOURCE_DIR_${d%%:*}=$DEPS_SRC/${d#*:}"
+done
+
 # macOS: pin the deployment target to rampart-langtools' floor (CMakeLists uses
 # -mmacosx-version-min=11.0). Without this, ORT's objects build at the HOST's
 # macOS version and the final rampart-onnx.so would not run on older systems.
@@ -62,6 +77,30 @@ fi
 # low-floor x86 build works. (llama.cpp still uses Metal where it helps; onnx on
 # macOS is CPU-only either way.)
 
+# macOS: ORT downloads a prebuilt universal protoc for ALL Apple hosts
+# (deps.txt protoc_mac_universal) via a deprecated FetchContent_Populate
+# (CMP0169 dev warning) — and it was the one network fetch left after
+# vendoring.  Build protoc from the vendored protobuf tree instead (same
+# v21.12, so generated code matches exactly) and pass it via
+# ONNX_CUSTOM_PROTOC_EXECUTABLE, which skips ORT's download block
+# entirely.  Host-arch build, one-time per build dir (~1 min).
+PROTOC_DEFINES=""
+if [ "$(uname)" = "Darwin" ]; then
+  PROTOC_BUILD="$BUILD_DIR/protoc-host"
+  if [ ! -x "$PROTOC_BUILD/protoc" ]; then
+    cmake -S "$DEPS_SRC/protobuf" -B "$PROTOC_BUILD" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -Dprotobuf_BUILD_TESTS=OFF \
+      -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+      -Dprotobuf_WITH_ZLIB=OFF \
+      -DCMAKE_C_FLAGS=-w -DCMAKE_CXX_FLAGS=-w
+    cmake --build "$PROTOC_BUILD" -j 8 --target protoc
+  fi
+  [ -x "$PROTOC_BUILD/protoc" ] || \
+    { echo "rampart-build-cpu.sh: vendored protoc build failed" >&2; exit 1; }
+  PROTOC_DEFINES="--cmake_extra_defines ONNX_CUSTOM_PROTOC_EXECUTABLE=$PROTOC_BUILD/protoc"
+fi
+
 # ELF targets: assemble the MLAS .S files with an explicit (non-exec)
 # .note.GNU-stack section; without it ld warns "missing .note.GNU-stack
 # section implies executable stack" when the static archives are linked
@@ -76,8 +115,30 @@ fi
 # memory-hungry and 8 concurrent gcc's can OOM.
 # -w: vendored code -- silence its warnings (noise at our -Wall, not ours
 # to fix); -Wno-psabi kept for compilers where -w doesn't cover the note.
+# CMP0169=OLD: ORT's own cmake still calls the deprecated
+# FetchContent_Populate() for mp11/safeint, which cmake >= 3.30 flags with
+# a dev warning on every configure; the policy default quiets exactly that
+# (no behavior change -- the vendored FETCHCONTENT_SOURCE_DIR trees are
+# used either way).
+# --allow_running_as_root: inert for normal builds; needed when uid==0
+# (containers, unshare -r offline verification) — build.py refuses
+# otherwise.  Linux-only: build.py registers the flag in
+# add_linux_specific_args(), macOS argparse rejects it.
+ROOT_FLAG=""
+if [ "$(uname)" = "Linux" ]; then
+  ROOT_FLAG="--allow_running_as_root"
+fi
+# Apple Silicon has no SVE; build.py defaults it ON for arm64 and ORT's
+# configure then warns "USE_SVE ... not supported ... will be disabled".
+# Pass --no_sve to state the truth up front (same result, no warning).
+SVE_FLAG=""
+if [ "$(uname)" = "Darwin" ]; then
+  SVE_FLAG="--no_sve"
+fi
 ./build.sh \
   --build_dir "$BUILD_DIR" \
+  $ROOT_FLAG \
+  $SVE_FLAG \
   --config Release --parallel "${ONNX_CPU_PARALLEL:-8}" --compile_no_warning_as_error \
   --skip_tests --skip_submodule_sync \
   --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF \
@@ -86,6 +147,9 @@ fi
   --cmake_extra_defines CMAKE_POSITION_INDEPENDENT_CODE=ON \
   --cmake_extra_defines "CMAKE_CXX_FLAGS=-Wno-psabi -w" \
   --cmake_extra_defines "CMAKE_C_FLAGS=-w" \
+  --cmake_extra_defines CMAKE_POLICY_DEFAULT_CMP0169=OLD \
+  $DEPS_DEFINES \
+  $PROTOC_DEFINES \
   $ASM_DEFINES \
   $EXTRA_DEFINES \
   --update --build
@@ -107,8 +171,15 @@ rm -f libonnxruntime_core.a libonnxruntime_deps.a
 if [ "$(uname)" = "Darwin" ]; then
   # BSD ar has no -M (MRI scripts); Apple libtool -static flattens archive
   # members into one archive, which is exactly what the MRI ADDLIBs do.
-  libtool -static -o libonnxruntime_core.a $ORT_LIBS
-  libtool -static -o libonnxruntime_deps.a $DEP_LIBS
+  # The "duplicate member name" warnings are benign — different TUs that
+  # share a basename (e.g. cpu/ and contrib_ops/ both have activations.cc);
+  # both members are kept and link fine — so filter exactly that message
+  # (via a temp file so libtool's own exit status is preserved under set -e).
+  libtool -static -o libonnxruntime_core.a $ORT_LIBS 2> libtool.err || { cat libtool.err >&2; exit 1; }
+  grep -v "warning duplicate member name" libtool.err >&2 || true
+  libtool -static -o libonnxruntime_deps.a $DEP_LIBS 2> libtool.err || { cat libtool.err >&2; exit 1; }
+  grep -v "warning duplicate member name" libtool.err >&2 || true
+  rm -f libtool.err
 else
   { echo "CREATE libonnxruntime_core.a"; for a in $ORT_LIBS; do echo "ADDLIB $a"; done; echo SAVE; echo END; } | ar -M
   { echo "CREATE libonnxruntime_deps.a"; for a in $DEP_LIBS; do echo "ADDLIB $a"; done; echo SAVE; echo END; } | ar -M

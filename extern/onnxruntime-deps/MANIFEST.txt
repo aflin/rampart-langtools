@@ -1,0 +1,58 @@
+Vendored ONNX Runtime / onnxruntime-extensions dependency sources
+==================================================================
+
+These are the FetchContent dependencies that the ONNX Runtime build
+(extern/onnxruntime, driven by rampart-build-cpu.sh) and the
+onnxruntime-extensions build (rampart-build-ext.sh) would otherwise
+download at build time.  They are vendored as UNPACKED, PRE-PATCHED
+source trees and handed to CMake via FETCHCONTENT_SOURCE_DIR_<NAME>
+(passed by the two rampart-build-*.sh wrappers), so the builds need no
+network and are byte-reproducible.
+
+IMPORTANT: with FETCHCONTENT_SOURCE_DIR overrides, CMake SKIPS both the
+URL/hash verification and the PATCH_COMMAND steps — the patches listed
+below are therefore ALREADY APPLIED to these trees.  When upgrading a
+dep: fetch the new pinned archive (URL scheme below), re-apply the
+corresponding patches from extern/onnxruntime/cmake/patches/<name>/ (or
+extern/onnxruntime-extensions/cmake/externals/*.patch), and update this
+file.
+
+The cpuinfo tree carries ORT's Linux-only sysfs-fallback patch; it only
+touches src/linux/processors.c, which non-Linux platforms never compile,
+so the same tree is safe on every platform.  (ORT's Windows-ARM64
+cpuinfo patches are NOT applied — we don't build there.)
+
+ort/  — used by the ONNX Runtime build (FetchContent names match dirs)
+----------------------------------------------------------------------
+name              origin (https://github.com/...)                                  archive sha1                              ORT patches applied
+abseil_cpp        abseil/abseil-cpp archive/refs/tags/20250814.0.zip                a9eb1d648cbca4d4d788737e971a6a7a63726b07  none
+date              HowardHinnant/date archive/refs/tags/v3.0.1.zip                   2dac0c81dc54ebdd8f8d073a75c053b04b56e159  date.patch
+eigen3            eigen-mirror/eigen archive 1d8b82b0740839c0de7f1242a3585e3390ff5f33 05b19b49e6fbb91246be711d801160528c135e34  none
+flatbuffers       google/flatbuffers archive/refs/tags/v23.5.26.zip                 59422c3b5e573dd192fead2834d25951f1c1670c  flatbuffers.patch
+gsl               microsoft/GSL archive/refs/tags/v4.2.1.zip                        1094e3bb7a8af763dcb136ccd676e6e75e614eec  1213.patch
+kleidiai          ARM-software/kleidiai archive/refs/tags/v1.20.0.tar.gz            6895e72b3d5cf1173358164cb3d64c9d7d33cc84  none (arm64 only)
+mp11              boostorg/mp11 archive/refs/tags/boost-1.82.0.zip                  9bc9e01dffb64d9e0773b2e44d2f22c51aace063  none
+nlohmann_json     nlohmann/json archive/refs/tags/v3.11.3.zip                       5e88795165cc8590138d1f47ce94ee567b85b4d6  none (also used by ext)
+onnx              onnx/onnx archive/refs/tags/v1.21.0.zip                           321d4acc807c8e0fb0bbcc0424a143dffde1e846  onnx.patch
+protobuf          protocolbuffers/protobuf archive/refs/tags/v21.12.zip             7cf2733949036c7d52fda017badcab093fe73bfa  protobuf_cmake/_android_log/_s390x.patch
+pytorch_cpuinfo   pytorch/cpuinfo archive 403d652dca4c1046e8145950b1c0997a9f748b57  30b2a07fe4bae8574f89176e56274cacdd6d135b  fix_missing_sysfs_fallback.patch (Linux-only file)
+re2               google/re2 archive/refs/tags/2024-07-02.zip                       646e1728269cde7fcef990bf4a8e87b047882e88  none
+safeint           dcleblanc/SafeInt archive/refs/tags/3.0.28.zip                    23f252040ff6cb9f1fd18575b32fa8fb5928daac  none
+
+ext/  — used by the onnxruntime-extensions build
+----------------------------------------------------------------------
+name        origin (https://github.com/...)                          archive sha1                              ext patches applied
+googlere2   google/re2 tag 2021-06-01                                505877c135800260ef0f8536578afe1c26e7c1d2  none
+gsl         microsoft/GSL archive/refs/tags/v4.0.0.zip               cf368104cd22a87b4dd0c80228919bb2df3e2a14  none
+protobuf    protocolbuffers/protobuf tag v21.12                      7cf2733949036c7d52fda017badcab093fe73bfa  protobuf_cmake.patch (ext's — differs from ORT's)
+spm         google/sentencepiece tag v0.1.96                         d72ede3ea2fed6e03859119b05284de6dd0d58de  sentencepieceproject_cmake.patch + _pb.patch
+(nlohmann_json: ext shares ort/nlohmann_json — same version, unpatched)
+
+Licenses: every tree retains its own LICENSE/LICENSE.txt/LICENSE.TXT
+file.  All are permissive: Apache-2.0 (abseil, onnx, kleidiai,
+sentencepiece), MIT (date, gsl, nlohmann_json, safeint), BSD-3-Clause
+(protobuf, re2), BSD-2-Clause (cpuinfo), BSL-1.0 (mp11), MPL-2.0
+(eigen — file-level weak copyleft, satisfied by shipping this unmodified
+source).  Copies of licenses not already covered by
+rampart/licenses/onnxruntime-third-party-notices.txt are in
+rampart/licenses/ (date, mp11, GSL).

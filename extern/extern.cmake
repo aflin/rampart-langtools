@@ -142,10 +142,57 @@ if(APPLE)
   set(LAPACK_LIBRARIES "/System/Library/Frameworks/Accelerate.framework" CACHE STRING "LAPACK_LIBRARIES" FORCE)
 
 
-  set(OpenMP_omp_LIBRARY "${OMP_PREFIX}/lib/libomp.a" CACHE STRING "OpenMP_omp_LIBRARY" FORCE)
-  set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp -I${OMP_PREFIX}/include" CACHE STRING "OpenMP_C_FLAGS" FORCE)
+  # ---- vendored libomp (LLVM 21.1.0; Apache-2.0 WITH LLVM-exception) ------
+  # brew's prebuilt libomp.a is stamped at the HOST macOS version, so every
+  # module linking it drew ld "built for newer macOS version than being
+  # linked (11.0)" warnings — and could in principle pull in newer-than-11.0
+  # symbols.  Build our own static libomp at the same 11.0 floor the modules
+  # use.  Built AT CONFIGURE TIME (execute_process, cached by the EXISTS
+  # check): faiss's find_package(OpenMP) runs during THIS configure and its
+  # try_compiles need omp.h to already exist, so an ExternalProject would be
+  # too late.  Standalone configure — openmp's CMake only supports
+  # LLVM-embedded or top-level builds, not add_subdirectory; the sibling
+  # extern/llvm-openmp/cmake dir is the LLVM common-cmake-utils tree the
+  # standalone build expects at ../cmake.
+  set(LT_LIBOMP_PREFIX  ${CMAKE_BINARY_DIR}/extern/libomp)
+  set(LT_LIBOMP_A       ${LT_LIBOMP_PREFIX}/lib/libomp.a)
+  set(LT_LIBOMP_INCLUDE ${LT_LIBOMP_PREFIX}/include)
+  if(NOT EXISTS ${LT_LIBOMP_A})
+    message(STATUS "rampart-langtools: building vendored libomp at the 11.0 floor (one-time)")
+    execute_process(COMMAND ${CMAKE_COMMAND}
+        -S ${EXTERN_DIR}/llvm-openmp/openmp
+        -B ${CMAKE_BINARY_DIR}/extern/libomp-build
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_INSTALL_PREFIX=${LT_LIBOMP_PREFIX}
+        -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+        -DCMAKE_OSX_ARCHITECTURES=${CMAKE_SYSTEM_PROCESSOR}
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+        -DLIBOMP_ENABLE_SHARED=OFF
+        -DLIBOMP_INSTALL_ALIASES=OFF
+        -DLIBOMP_OMPD_SUPPORT=OFF
+        -DOPENMP_ENABLE_OMPT_TOOLS=OFF
+        -DCMAKE_C_FLAGS=-w
+        -DCMAKE_CXX_FLAGS=-w
+        OUTPUT_FILE ${CMAKE_BINARY_DIR}/libomp-configure.log
+        ERROR_FILE  ${CMAKE_BINARY_DIR}/libomp-configure.log
+        RESULT_VARIABLE _lt_omp_rc)
+    if(NOT _lt_omp_rc EQUAL 0)
+      message(FATAL_ERROR "vendored libomp configure failed — see ${CMAKE_BINARY_DIR}/libomp-configure.log")
+    endif()
+    execute_process(COMMAND ${CMAKE_COMMAND}
+        --build ${CMAKE_BINARY_DIR}/extern/libomp-build -j 8 --target install
+        OUTPUT_FILE ${CMAKE_BINARY_DIR}/libomp-build.log
+        ERROR_FILE  ${CMAKE_BINARY_DIR}/libomp-build.log
+        RESULT_VARIABLE _lt_omp_rc)
+    if(NOT _lt_omp_rc EQUAL 0 OR NOT EXISTS ${LT_LIBOMP_A})
+      message(FATAL_ERROR "vendored libomp build failed — see ${CMAKE_BINARY_DIR}/libomp-build.log")
+    endif()
+  endif()
+
+  set(OpenMP_omp_LIBRARY "${LT_LIBOMP_A}" CACHE STRING "OpenMP_omp_LIBRARY" FORCE)
+  set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp -I${LT_LIBOMP_INCLUDE}" CACHE STRING "OpenMP_C_FLAGS" FORCE)
   set(OpenMP_C_LIB_NAMES "omp" CACHE STRING "OpenMP_C_LIB_NAMES" FORCE)
-  set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${OMP_PREFIX}/include" CACHE STRING "OpenMP_CXX_FLAGS" FORCE)
+  set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${LT_LIBOMP_INCLUDE}" CACHE STRING "OpenMP_CXX_FLAGS" FORCE)
   set(OpenMP_CXX_LIB_NAMES "omp" CACHE STRING "OpenMP_CXX_LIB_NAMES" FORCE)
 
 else()
@@ -524,5 +571,13 @@ target_include_directories(onnx_shim_obj PRIVATE
 # C API is backward-compatible and the BertTokenizer class layout is ORT-version
 # independent (no OrtApi types in its members).
 target_compile_definitions(onnx_shim_obj PRIVATE RAMPART_ONNX_EXT=1)
+# The shim includes onnxruntime-extensions' vendored headers (ustring.h,
+# custom_op_lite.h) which trip clang-only warnings in this full-warnings TU
+# (the ext build itself is -w'd). -Wunused-private-field is clang-only,
+# hence the guard.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(onnx_shim_obj PRIVATE
+        -Wno-pessimizing-move -Wno-unused-private-field)
+endif()
 endif()  # NOT ONNX_GPU: extensions + shim + module link libs (cpu flavors only)
 endif()  # LT_ONNX

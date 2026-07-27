@@ -5,7 +5,16 @@
 
 function(onnxruntime_fetchcontent_declare contentName)
     cmake_parse_arguments(PARSE_ARGV 1 ARG "" "URL;SOURCE_SUBDIR" "")
-    message(STATUS "Fetch ${contentName} from ${ARG_URL}")
+    # rampart: say what actually happens — when a FETCHCONTENT_SOURCE_DIR_
+    # override points at a vendored tree (extern/onnxruntime-deps), nothing
+    # is downloaded, and the upstream "Fetch <name> from <url>" wording is
+    # misleading.
+    string(TOUPPER ${contentName} contentNameUpper)
+    if(DEFINED FETCHCONTENT_SOURCE_DIR_${contentNameUpper})
+      message(STATUS "Using local ${contentName} from ${FETCHCONTENT_SOURCE_DIR_${contentNameUpper}} (no fetch)")
+    else()
+      message(STATUS "Fetch ${contentName} from ${ARG_URL}")
+    endif()
     FetchContent_Declare(${ARGV})
     string(TOLOWER ${contentName} contentNameLower)
     if(NOT "${ARG_SOURCE_SUBDIR}" STREQUAL "")

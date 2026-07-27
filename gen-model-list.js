@@ -89,6 +89,13 @@ var OVERRIDES = {
     "qwen3-reranker-0.6b":     { gguf: "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF", onnx: null },
     "qwen3-reranker-4b":       { gguf: null, onnx: null },
     "qwen3-reranker-8b":       { gguf: null, onnx: null },
+    /* gpt-oss ships natively in MXFP4 (the MoE expert weights); ggml-org's
+     * single-file MXFP4 ggufs ARE the original release.  Discovery ranks
+     * unsloth's requantized ladders first (more downloads/quants), but every
+     * rung below "F16" degrades the native weights, and the 120b entry it
+     * finds is F16-only.  Pin the canonical repos. */
+    "gpt-oss-20b":             { category: "gen", gguf: "ggml-org/gpt-oss-20b-GGUF" },
+    "gpt-oss-120b":            { category: "gen", gguf: "ggml-org/gpt-oss-120b-GGUF" },
     /* --- classics below the popularity window --- */
     "qwen2.5-7b-instruct":     { category: "gen", gguf: "Qwen/Qwen2.5-7B-Instruct-GGUF" },
     "gemma-3-1b-it":           { category: "gen", gguf: "ggml-org/gemma-3-1b-it-GGUF" },
@@ -284,7 +291,7 @@ function rankCandidates(alias, cands) {
     });
 }
 
-var QUANT_RE = /(?:^|[-_.])((?:i?q[0-9][a-z0-9_]*|f16|f32|bf16|fp16|fp32))\.gguf$/i;
+var QUANT_RE = /(?:^|[-_.])((?:i?q[0-9][a-z0-9_]*|mxfp[0-9][a-z0-9_]*|f16|f32|bf16|fp16|fp32))\.gguf$/i;
 
 function ggufQuants(tree) {
     var quants = {};

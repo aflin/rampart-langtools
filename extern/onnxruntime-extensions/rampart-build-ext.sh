@@ -26,11 +26,32 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 OUT="$BUILD/onnxext_all.o"
 CMAKE="${CMAKE:-cmake}"
 
+# Vendored FetchContent sources (see extern/onnxruntime-deps/MANIFEST.txt):
+# unpacked, pre-patched trees handed to CMake via
+# FETCHCONTENT_SOURCE_DIR_<NAME> — no download, no clone, patch steps
+# skipped (already applied). nlohmann_json is shared with the ORT set.
+DEPS_SRC="$(cd "$SRC/.." && pwd)/onnxruntime-deps"
+
+# ORT C/C++ API headers: stage them flat from the vendored ORT SOURCE tree
+# and hand them to ext via ONNXRUNTIME_PKG_DIR — otherwise ext downloads a
+# whole onnxruntime-1.19.2 release tarball just for the headers (and gets a
+# version older than the ORT we actually link against).
+ORT_HDR_SRC="$SRC/../onnxruntime/include/onnxruntime/core/session"
+ORT_PKG="$BUILD/ort-pkg"
+mkdir -p "$ORT_PKG/include" "$ORT_PKG/lib"
+cp "$ORT_HDR_SRC"/*.h "$ORT_PKG/include/"
+
 mkdir -p "$BUILD"
 "$CMAKE" -S "$SRC" -B "$BUILD" -G "Unix Makefiles" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DCMAKE_C_FLAGS=-w -DCMAKE_CXX_FLAGS=-w \
+    -DFETCHCONTENT_SOURCE_DIR_PROTOBUF="$DEPS_SRC/ext/protobuf" \
+    -DFETCHCONTENT_SOURCE_DIR_SPM="$DEPS_SRC/ext/spm" \
+    -DFETCHCONTENT_SOURCE_DIR_GOOGLERE2="$DEPS_SRC/ext/googlere2" \
+    -DFETCHCONTENT_SOURCE_DIR_GSL="$DEPS_SRC/ext/gsl" \
+    -DFETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON="$DEPS_SRC/ort/nlohmann_json" \
+    -DONNXRUNTIME_PKG_DIR="$ORT_PKG" \
     -DOCOS_ENABLE_C_API=ON \
     -DOCOS_ENABLE_BERT_TOKENIZER=ON \
     -DOCOS_ENABLE_WORDPIECE_TOKENIZER=ON \

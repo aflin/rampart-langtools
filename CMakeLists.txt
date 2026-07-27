@@ -24,16 +24,19 @@ if(APPLE)
     option(LT_ENABLE_GPU "Enable GPU acceleration" ON)
     SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mmacosx-version-min=11.0 -arch arm64")
     SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mmacosx-version-min=11.0 -arch arm64")
+    # ASM too: ggml-metal's embed .s (enable_language(ASM)) otherwise
+    # assembles at the HOST macOS version and ld warns "built for newer
+    # macOS version (15.0) than being linked (11.0)" on every consumer.
+    SET(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -mmacosx-version-min=11.0 -arch arm64")
   else()
     option(LT_ENABLE_GPU "Enable GPU acceleration" OFF)
   endif()
 
-  execute_process(
-    COMMAND brew --prefix libomp
-    OUTPUT_VARIABLE OMP_PREFIX
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-  )
+  # OpenMP: vendored libomp (extern/llvm-openmp), built at the 11.0 floor by
+  # extern/extern.cmake — brew's prebuilt libomp.a is stamped at the HOST
+  # macOS version and drew ld version-mismatch warnings on every module link
+  # (and could reference newer-than-11.0 symbols).  LT_LIBOMP_A /
+  # LT_LIBOMP_INCLUDE are set there.
 
 else()
   # LINUX
@@ -296,10 +299,6 @@ if(APPLE)
     message(FATAL_ERROR "Cannot build for GPU on Apple x86_64")
   endif()
 
-  if (NOT OMP_PREFIX)
-    message(FATAL_ERROR "OpenMP not found, try brew install libomp")
-  endif()
-
   execute_process(
     COMMAND brew --prefix
     OUTPUT_VARIABLE BREW_PREFIX
@@ -311,10 +310,11 @@ if(APPLE)
     message(FATAL_ERROR "brew package manager is required")
   endif()
 
-  # Extra includes on macOS
+  # Extra includes on macOS (LT_LIBOMP_INCLUDE: vendored libomp, built by
+  # extern/extern.cmake at configure time)
   include_directories(
    "${BREW_PREFIX}/include"
-   "${OMP_PREFIX}/include"
+   "${LT_LIBOMP_INCLUDE}"
   )
 
   # Extra compile flags
@@ -327,37 +327,34 @@ if(APPLE)
     /usr/local/lib
     /opt/homebrew/lib
     /opt/local/lib
-    "${OMP_PREFIX}/lib"
     /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib/
     /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib
   )
 
+  # libomp: always the vendored 11.0-floor build (LT_LIBOMP_A from
+  # extern/extern.cmake) — never a brew/system copy stamped at the host
+  # macOS version.
   set(LIB_FILES
-    libomp.a
     libcurl.tbd
   )
   find_libraries_in_dirs(FOUND_LIBS FILES ${LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
 
   set(LLAMA_LIB_FILES
     libcurl.tbd
-    libomp.a
   )
   find_libraries_in_dirs(LLAMA_FOUND_LIBS FILES ${LLAMA_LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
 
-  set(FAISS_LIB_FILES
-    libomp.a
-  )
-
-  find_libraries_in_dirs(FAISS_FOUND_LIBS FILES ${FAISS_LIB_FILES} DIRS ${LIB_DIRS} PREFIX LIB_)
-  list(APPEND FAISS_LIBS ${FAISS_FOUND_LIBS})
+  list(APPEND FAISS_LIBS ${LT_LIBOMP_A})
 
   list(APPEND LIBS
           ${FOUND_LIBS}
+          ${LT_LIBOMP_A}
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-metal/libggml-metal.a
   )
   list(APPEND LLAMA_LIBS
           ${LLAMA_FOUND_LIBS}
+          ${LT_LIBOMP_A}
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-blas/libggml-blas.a
           ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/ggml-metal/libggml-metal.a
   )
@@ -714,9 +711,11 @@ set(LT_ENABLE_GPU_LAST "${LT_ENABLE_GPU}" CACHE INTERNAL "Previous value of LT_E
 target_link_libraries(rampart-langtools PRIVATE ${LIBS})
 
 # Link with selected libs
+# (stdc++ skipped on Darwin: the CXX driver already links libc++ and the
+#  SDK aliases libstdc++ to it -> ld warns "ignoring duplicate libraries")
 target_link_libraries(rampart-llamacpp PRIVATE
     ${LLAMA_LIBS}
-    stdc++
+    $<$<NOT:$<PLATFORM_ID:Darwin>>:stdc++>
 )
 
 # Link with selected libs
@@ -731,7 +730,7 @@ target_link_libraries(rampart-sentencepiece PRIVATE
 # while clip rides the exact same ggml set (CPU, or GPU cuda/metal) llama resolved.
 target_link_libraries(rampart-clip PRIVATE
     ${LLAMA_LIBS}
-    stdc++
+    $<$<NOT:$<PLATFORM_ID:Darwin>>:stdc++>
 )
 
 # rampart-langtools.so is the legacy combined module; its functionality is now
@@ -844,7 +843,7 @@ if(ONNX_LIBS)
   endif()
   target_link_libraries(rampart-onnx PRIVATE
     ${ONNX_LIBS}
-    stdc++
+    $<$<NOT:$<PLATFORM_ID:Darwin>>:stdc++>
   )
   install(TARGETS rampart-onnx DESTINATION "${RP_PATH}/modules")
   install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-onnx.so\")")
