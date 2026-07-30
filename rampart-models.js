@@ -81,7 +81,13 @@ var HF = u.getenv("HF_ENDPOINT") || "https://huggingface.co";
  * only as rampart.utils.stdout/.stderr -- resolve whichever exists. */
 var STDOUT = (typeof stdout !== "undefined") ? stdout : u.stdout;
 var STDERR = (typeof stderr !== "undefined") ? stderr : (u.stderr || STDOUT);
-var MODELS_DIR = u.homedir() + "/.rampart/models";
+/* The model store lives under the CURRENT user's home.  Resolve it on
+ * every use, never at load time: a server started as root may require this
+ * module while still root and only then drop privileges (rampart-server
+ * repoints $HOME to the unprivileged user at the drop).  A value captured
+ * here would keep pointing at root's home and fail with EACCES on the
+ * first download. */
+function modelsDir() { return u.homedir() + "/.rampart/models"; }
 
 /* files copied for an onnx model directory, beyond the model itself */
 var ONNX_AUX = [
@@ -303,13 +309,13 @@ function writePromptSidecar(modelFile, entry) {
 }
 
 /* remembered live resolutions: name -> {category, onnx?, gguf?} (catalog shape) */
-var RESOLVED_PATH = MODELS_DIR + "/.resolved.json";
+function resolvedPath() { return modelsDir() + "/.resolved.json"; }
 function loadResolved() {
-    try { return JSON.parse(u.readFile(RESOLVED_PATH, true)); } catch (e) { return {}; }
+    try { return JSON.parse(u.readFile(resolvedPath(), true)); } catch (e) { return {}; }
 }
 function saveResolved(map) {
-    u.mkDir(MODELS_DIR);
-    u.writeFile(RESOLVED_PATH, u.sprintf("%4J", map));
+    u.mkDir(modelsDir());
+    u.writeFile(resolvedPath(), u.sprintf("%4J", map));
 }
 
 /* ------------------------------------------------------------------ *
@@ -487,7 +493,7 @@ function getGguf(name, entry, o) {
     var q = pickQuant(g.quants, o.quant);
     var qi = g.quants[q];
     var cat = o.category || entry.category || "embed";
-    var dest = o.dest || (MODELS_DIR + "/" + cat + "/" + qi.file.split("/").pop());
+    var dest = o.dest || (modelsDir() + "/" + cat + "/" + qi.file.split("/").pop());
     if (!o.force && isFile(dest) && (qi.size <= 0 || fsize(dest) === qi.size)) {
         writePromptSidecar(dest, entry);           /* backfill for older downloads */
         return dest;
@@ -507,7 +513,7 @@ function getOnnx(name, entry, o) {
     if (!x) throwErr("'%s' has no onnx source (formats: %s)", name,
                      entry.gguf ? "gguf (add :quant or format:'gguf')" : "none");
     var cat = o.category || entry.category || "embed";
-    var dir = o.dest || (MODELS_DIR + "/" + cat + "/" + name);
+    var dir = o.dest || (modelsDir() + "/" + cat + "/" + name);
     var rev = o.revision || x.revision;
 
     /* which precision variant to fetch (default fp16) */
@@ -720,7 +726,7 @@ function urlGet(theUrl, o) {
     o = o || {};
     var base = theUrl.split("?")[0].split("/").pop() || "download";
     var dest = o.dest ||
-        (MODELS_DIR + "/" + (o.category || "other") + "/" + base);
+        (modelsDir() + "/" + (o.category || "other") + "/" + base);
     return fetchFile(theUrl, dest, {
         progress: o.progress, token: o.token, force: o.force,
         sha256: o.sha256, size: o.size
@@ -786,7 +792,7 @@ function list() {
 function installedVariants(name, entry) {
     var cat = entry.category || "embed", parts = [];
     if (entry.onnx) {
-        var odir = MODELS_DIR + "/" + cat + "/" + name, src = odir + "/.source.json";
+        var odir = modelsDir() + "/" + cat + "/" + name, src = odir + "/.source.json";
         if (isFile(src)) {
             var prec = null;
             try { prec = JSON.parse(u.readFile(src, true)).precision; } catch (e) {}
@@ -798,7 +804,7 @@ function installedVariants(name, entry) {
     if (entry.gguf) {
         var q, found = [];
         for (q in entry.gguf.quants)
-            if (isFile(MODELS_DIR + "/" + cat + "/" + entry.gguf.quants[q].file.split("/").pop()))
+            if (isFile(modelsDir() + "/" + cat + "/" + entry.gguf.quants[q].file.split("/").pop()))
                 found.push(q);
         if (found.length) parts.push("gguf " + found.join("/"));
     }
@@ -834,7 +840,9 @@ if (module && module.exports) {
         resolve: resolve,
         list: list,
         catalog: CATALOG,
-        modelsDir: MODELS_DIR
+        modelsDir: modelsDir()  /* snapshot taken at require(); the paths this
+                                   module builds internally resolve per call,
+                                   so they follow a later $HOME change */
     };
 } else {
     /* ------------------------------ CLI ------------------------------ */
