@@ -57,6 +57,39 @@
            FAISS
    ************************************************** */
 
+/* faiss_get_last_error() hands back the raw C++ exception text, e.g.
+
+     Error in virtual void faiss::Index::add_with_ids(faiss::idx_t, const
+     float*, const faiss::idx_t*) at /path/to/faiss/Index.cpp:45:
+     add_with_ids not implemented for this type of index
+
+   -- a mangled signature and a build-machine path, neither of which helps a
+   script author or is stable across faiss versions.  Translate the two cases
+   a caller can actually provoke into advice, and otherwise strip the
+   "Error in <signature> at <file>:<line>: " prefix. */
+static const char *_faiss_add_err(const char *raw)
+{
+    const char *p;
+
+    if (!raw || !*raw)
+        return "faiss_Index_add failed";
+
+    if (strstr(raw, "add_with_ids not implemented"))
+        return "this index type has no id map, so an explicit id cannot be "
+               "used.  Pass -1 to have a sequential id assigned, or create "
+               "the index with an \"IDMap,\" or \"IDMap2,\" factory prefix";
+
+    if (strstr(raw, "add does not make sense with IndexIDMap"))
+        return "this index has an id map and so requires an explicit id.  "
+               "Pass an id rather than -1";
+
+    p = strstr(raw, ".cpp:");
+    if (p && (p = strstr(p, ": ")) != NULL)
+        return p + 2;
+
+    return raw;
+}
+
 static idx_t _add_one(FaissIndex *idx, idx_t id, float *v, size_t sz, const char **err)
 {
     int rc;
@@ -88,11 +121,7 @@ static idx_t _add_one(FaissIndex *idx, idx_t id, float *v, size_t sz, const char
     if (rc != 0)
     {
         if (err)
-        {
-            *err = faiss_get_last_error();
-            if (!*err)
-                *err = "faiss_Index_add failed";
-        }
+            *err = _faiss_add_err(faiss_get_last_error());
         return -1;
     }
 
