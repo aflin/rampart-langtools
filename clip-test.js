@@ -129,6 +129,12 @@ function runMechanics() {
     });
     if (!model) return;
     testFeature("dimension is a positive number", function() { dim = model.dimension; return dim > 0; });
+    /* onGpu just reports where this model landed -- both values are correct answers
+     * (a CPU build, or a GPU the arch/driver guard or op probe ruled out, gives false
+     * and explains itself in clip.errMsg), so only the type is a pass/fail matter. */
+    testFeature("onGpu is a boolean", function() { return typeof model.onGpu === 'boolean'; });
+    printf("- running on the %s%s\n", model.onGpu ? "GPU" : "CPU",
+           clip.errMsg ? " (" + clip.errMsg + ")" : "");
 
     var iv16, iv32, ivn;
     testFeature("embedImageToFp16Buf -> dim*2 bytes", function() {
@@ -217,7 +223,7 @@ function runThreadCopy() {
         try {
             var v = a.m.embedImageToNumbers(a.img);        // SAME shared handle
             var tv = a.m.embedTextToNumbers("a photo");
-            rampart.thread.put('r', { v0: v[0], dim: v.length, tdim: tv.length });
+            rampart.thread.put('r', { v0: v[0], dim: v.length, tdim: tv.length, onGpu: a.m.onGpu });
         } catch(e) { rampart.thread.put('r', { err: e.message }); }
     }, { m: model, img: img });
     var r = rampart.thread.get('r', 120000);
@@ -227,6 +233,9 @@ function runThreadCopy() {
     });
     testFeature("worker image vector matches main", function() {
         return r && Math.abs(r.v0 - vmain[0]) < 1e-4;
+    });
+    testFeature("worker sees the same onGpu as main", function() {
+        return r && r.onGpu === model.onGpu;
     });
     testFeature("main still works after worker", function() {
         return model.embedImageToNumbers(img).length === model.dimension;

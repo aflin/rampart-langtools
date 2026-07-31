@@ -43,6 +43,10 @@ void clip_release(clip_handle *h);
 int clip_dim(clip_handle *h);         /* shared-space embedding dim (512 / 768 / ...) */
 int clip_has_text(clip_handle *h);
 int clip_has_vision(clip_handle *h);
+/* 1 if this model's weights and compute live on a GPU (CUDA, or macOS Metal), 0 if
+ * it runs on the CPU -- either a CPU-only build, no usable device, or a GPU the
+ * arch/driver guard or the op probe ruled out (which also warns via clip_warn). */
+int clip_on_gpu(clip_handle *h);
 
 /* Embed an image FILE (load + preprocess + encode) into out[clip_dim], on the
  * CALLING thread's own compute context.  normalize!=0 => L2-normalized.

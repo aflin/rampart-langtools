@@ -6,6 +6,7 @@
  *   var tv = model.embedTextToFp16Buf("a photo of a cat");
  *   var s  = model.similarity(iv, tv);               // cosine, -1..1
  *   var d  = model.dimension;                        // 512 / 768 / ...
+ *   var g  = model.onGpu;                            // true if running on a GPU
  *   model.destroy();
  *
  * Wraps a modern-ggml two-tower CLIP (extern/clip/clip_shim) that links the SAME
@@ -276,6 +277,9 @@ static duk_ret_t clip_load_method(duk_context *ctx) {
     duk_push_pointer(ctx, h);        duk_put_prop_string(ctx, -2, CLIP_PTR);
     duk_push_int(ctx, dim);          duk_put_prop_string(ctx, -2, CLIP_DIM);
     duk_push_int(ctx, dim);          duk_rp_put_prop_string_ro(ctx, -2, "dimension");
+    /* where this model actually runs.  Fixed at load: every thread copy computes on
+     * the same backend type the weights were placed in, so this cannot go stale. */
+    duk_push_boolean(ctx, clip_on_gpu(h)); duk_rp_put_prop_string_ro(ctx, -2, "onGpu");
 
     duk_push_c_function(ctx, embed_image_to_buf16, 1);   duk_put_prop_string(ctx, -2, "embedImageToFp16Buf");
     duk_push_c_function(ctx, embed_image_to_buf32, 1);   duk_put_prop_string(ctx, -2, "embedImageToFp32Buf");

@@ -242,11 +242,77 @@ static int clip_cuda_supported(char * reason, size_t n) {
 }
 #endif
 
+/* Does this GPU device actually implement every op our graphs are built from?
+ *
+ * clip computes a graph on ONE backend -- there is no ggml_backend_sched here to
+ * split a graph across devices -- so a single missing op is fatal: the backend calls
+ * GGML_ABORT("unsupported op") and takes the whole process down mid-graph.  That is
+ * not hypothetical: ggml's Metal backend gates MUL_MAT, NORM and SOFT_MAX behind
+ * MTLGPUFamilyApple7 / MTLGPUFamilyMetal3 (i.e. Apple Silicon, or macOS 13+), so on an
+ * Intel Mac running Big Sur *every matmul* is unsupported and the first embed aborts.
+ *
+ * So probe before committing: build a small graph from the same ops (and the model's
+ * own weight type) the real vision/text graphs use, and ask the backend about every
+ * node.  ggml_backend_supports_op only inspects tensor metadata, so a no_alloc context
+ * with unallocated tensors is enough -- nothing is computed and nothing is uploaded.
+ * Keep this in step with layer_forward() / clip_embed_text() / embed_pixels(). */
+static bool clip_backend_runs_our_graphs(ggml_backend_t b, ggml_type wtype, char * missing, size_t nmiss) {
+    const size_t bufsz = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
+    ggml_init_params ip = { bufsz, NULL, /*no_alloc*/ true };
+    ggml_context * c = ggml_init(ip);
+    if (!c) return true;                         /* can't probe -> don't block the GPU */
+    ggml_cgraph * gf = ggml_new_graph(c);
+
+    /* a quantized row must be a whole number of blocks (32 for q4_0/q8_0/..., 256 for
+     * the k-quants), so round the probe's hidden size up to the type's block size. */
+    const int64_t blk = ggml_blck_size(wtype);
+    const int D = (int) (blk * ((64 + blk - 1) / blk));
+    const int HEADS = 4, DH = D / HEADS, N = 8, S = 32, P = 16, NP = (S/P) * (S/P);
+    ggml_tensor * w    = ggml_new_tensor_2d(c, wtype, D, D);
+    ggml_tensor * bias = ggml_new_tensor_1d(c, GGML_TYPE_F32, D);
+    ggml_tensor * ids  = ggml_new_tensor_1d(c, GGML_TYPE_I32, N);
+    ggml_tensor * mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, N, N);
+    ggml_tensor * img  = ggml_new_tensor_4d(c, GGML_TYPE_F32, S, S, 3, 1);
+    ggml_tensor * kern = ggml_new_tensor_4d(c, GGML_TYPE_F16, P, P, 3, D);
+    ggml_tensor * cls  = ggml_new_tensor_3d(c, GGML_TYPE_F32, D, 1, 1);
+
+    /* text-tower head, then one attention block (the shape of layer_forward) */
+    ggml_tensor * t = ggml_add(c, ggml_get_rows(c, w, ids), ggml_get_rows(c, w, ids));
+    t = ggml_norm(c, t, 1e-5f);
+    t = ggml_add(c, ggml_mul(c, ggml_repeat(c, bias, t), t), ggml_repeat(c, bias, t));
+    ggml_tensor * Q = ggml_scale(c, ggml_add(c, ggml_repeat(c, bias, t), ggml_mul_mat(c, w, t)), 1.0f/8.0f);
+    Q = ggml_cont(c, ggml_permute(c, ggml_reshape_4d(c, Q, DH, HEADS, N, 1), 0, 2, 1, 3));
+    Q = ggml_reshape_3d(c, Q, DH, N, HEADS);
+    ggml_tensor * kq = ggml_mul_mat(c, Q, Q);
+    ggml_build_forward_expand(gf, ggml_soft_max_ext(c, kq, mask, 1.0f, 0.0f));   /* text: causal */
+    ggml_build_forward_expand(gf, ggml_soft_max_inplace(c, ggml_mul_mat(c, Q, Q)));  /* vision */
+    ggml_build_forward_expand(gf, ggml_gelu_inplace(c, ggml_mul_mat(c, w, t)));
+    ggml_build_forward_expand(gf, ggml_gelu_quick_inplace(c, ggml_mul_mat(c, w, t)));
+
+    /* vision-tower head: conv_2d patch embedding (expands to IM2COL + MUL_MAT) + concat */
+    ggml_tensor * v = ggml_conv_2d(c, kern, img, P, P, 0, 0, 1, 1);
+    v = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, v, NP, D, 1), 1, 0, 2, 3));
+    ggml_build_forward_expand(gf, ggml_concat(c, ggml_repeat(c, bias, cls), v, 1));
+
+    bool ok = true;
+    for (int i = 0, n = ggml_graph_n_nodes(gf); i < n && ok; i++) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (!ggml_backend_supports_op(b, node)) {
+            snprintf(missing, nmiss, "%s", ggml_op_desc(node));
+            ok = false;
+        }
+    }
+    ggml_free(c);
+    return ok;
+}
+
 // GPU-ready backend pick: prefer a GPU device, fall back to CPU.  In a CPU-only
 // build no GPU device is registered, so this yields CPU automatically; a cu* build
-// selects the GPU -- unless the arch/driver guard rules it out (-> CPU + warn once).
+// selects the GPU -- unless the arch/driver guard or the op probe rules it out
+// (-> CPU + warn once).  wtype is the model's matmul weight type, so the probe asks
+// about the quantization this model will really run.
 // Sets *is_gpu to 1 iff a GPU backend was chosen.
-static ggml_backend_t clip_backend_init(int * is_gpu) {
+static ggml_backend_t clip_backend_init(int * is_gpu, ggml_type wtype) {
     clip_once_init();          /* must precede any ggml device creation */
     if (is_gpu) *is_gpu = 0;
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -262,7 +328,22 @@ static ggml_backend_t clip_backend_init(int * is_gpu) {
 #endif
         if (ok) {
             ggml_backend_t b = ggml_backend_dev_init(dev, NULL);
-            if (b) { if (is_gpu) *is_gpu = 1; return b; }
+            if (b) {
+                char missing[64] = {0};
+                if (clip_backend_runs_our_graphs(b, wtype, missing, sizeof missing)) {
+                    if (is_gpu) *is_gpu = 1;
+                    return b;
+                }
+                static int warned = 0;
+                if (!warned) {
+                    warned = 1;
+                    clip_warn("rampart-clip: GPU '%s' does not implement '%s', which CLIP's graphs "
+                        "need, so it cannot run this model (on macOS this means a GPU/OS older than "
+                        "MTLGPUFamilyApple7 or Metal 3 -- e.g. an Intel Mac, or macOS before 13). "
+                        "Using CPU.\n", ggml_backend_dev_description(dev), missing);
+                }
+                ggml_backend_free(b);
+            }
         }
     }
     return ggml_backend_cpu_init();
@@ -325,8 +406,17 @@ static clip_handle * clip_build(const char * path, char * err, size_t errlen) {
          * arch/driver guard rules the GPU out).  On GPU the weights land in VRAM,
          * where the per-thread CUDA compute contexts read them -- a CPU weight
          * buffer would be unreadable by a GPU graph.  h->use_gpu records the choice
-         * so every per-thread context matches; the buffer outlives this handle. */
-        load_backend = clip_backend_init(&h->use_gpu);
+         * so every per-thread context matches; the buffer outlives this handle.
+         * The GPU is also probed for the ops these graphs need, using this model's own
+         * matmul weight type -- the biggest 2D tensor in the file is always one (an
+         * ffn/projection/embedding matrix), and they all share a quantization. */
+        {
+            ggml_type wtype = GGML_TYPE_F16;
+            size_t    best  = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t))
+                if (ggml_n_dims(t) == 2 && ggml_nbytes(t) > best) { best = ggml_nbytes(t); wtype = t->type; }
+            load_backend = clip_backend_init(&h->use_gpu, wtype);
+        }
 
         h->has_text   = gguf_get_val_bool(g, key_idx(g, KEY_HAS_TEXT_ENC));
         h->has_vision = gguf_get_val_bool(g, key_idx(g, KEY_HAS_VIS_ENC));
@@ -492,6 +582,7 @@ int clip_dim(clip_handle * h) {
 }
 int clip_has_text(clip_handle * h)   { return h->has_text ? 1 : 0; }
 int clip_has_vision(clip_handle * h) { return h->has_vision ? 1 : 0; }
+int clip_on_gpu(clip_handle * h)     { return h->use_gpu ? 1 : 0; }
 
 // ================= transformer layer (verbatim math; scaffolding modernized) =================
 /* kq_mask: NULL for the (bidirectional) vision tower; for the text tower it is an
