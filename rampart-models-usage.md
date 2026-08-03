@@ -1,14 +1,22 @@
 # Using rampart-models
 
-`rampart-models` downloads and locates GGUF and ONNX models, returning a path
-that feeds directly into `rampart-llamacpp` / `rampart-onnx`:
+`rampart-models` downloads and locates GGUF and ONNX models, returning the
+model **file** — which feeds `rampart-llamacpp` directly.  `rampart-onnx`
+wants the model's **directory** instead (that is where it finds the
+tokenizer, pooling and token window), so derive it from the returned path:
 
 ```js
 var models   = require('rampart-models');
 var onnx     = require('rampart-onnx');
 var llamacpp = require('rampart-llamacpp');
 
-var emb = onnx.initEmbed(     models.onnxGet('bge-m3') );           // onnx: a DIRECTORY
+/* .../embed/bge-m3/onnx/model_fp16.onnx  ->  .../embed/bge-m3 */
+function modelDir(f) {
+    var d = f.replace(/\/[^\/]*$/, '');
+    return /\/onnx$/.test(d) ? d.replace(/\/onnx$/, '') : d;
+}
+
+var emb = onnx.initEmbed( modelDir(models.onnxGet('bge-m3')) );      // onnx: a DIRECTORY
 var em2 = llamacpp.initEmbed( models.ggufGet('bge-m3') );           // gguf: a FILE
 var gen = llamacpp.initGen(   models.ggufGet('qwen3-4b:q4_k_m') );  // exact quant
 ```
@@ -27,11 +35,11 @@ catalog embedded; it needs only `rampart-curl`.
 
 | call | you get |
 |---|---|
-| `models.get('bge-m3')` | the onnx **directory** (default for embed/rerank models) |
+| `models.get('bge-m3')` | the onnx **model file**, fp16 (default for embed/rerank models); its directory is what `rampart-onnx` wants |
 | `models.get('bge-m3:q8_0')` | the Q8_0 **gguf file** (a `:quant` suffix always means gguf) |
 | `models.get('qwen3-4b')` | a gguf file (gen models only exist as gguf; default quant) |
 | `models.ggufGet('bge-m3')` | gguf file, default quant — **explicit**, use with llamacpp |
-| `models.onnxGet('bge-m3')` | onnx directory — **explicit**, use with rampart-onnx |
+| `models.onnxGet('bge-m3')` | onnx model file, fp16 — **explicit**; pass its directory to rampart-onnx |
 | `models.get('BAAI/bge-m3')` | exact HuggingFace repo (`org/repo`), no search |
 | `models.get('org/repo:q4_k_m')` | exact repo + quant |
 | `models.get('https://host/x.gguf')` | plain download of any URL, returns the file |

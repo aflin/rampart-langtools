@@ -822,8 +822,25 @@ function resolve(name, o) {
 /* format-explicit variants, so the call site reads as the engine it feeds:
  *   llamacpp.initEmbed( models.ggufGet('bge-m3') )        // file (default quant)
  *   llamacpp.initGen(   models.ggufGet('qwen3-4b:q4_k_m'))
- *   onnx.initEmbed(     models.onnxGet('bge-m3') )        // fp16 model file
- *   onnx.initRerank(    models.onnxGet('bge-reranker-v2-m3', {precision:'q4'}) )  // CPU
+ *
+ * onnxGet fetches the whole model directory but RETURNS THE .onnx FILE
+ * inside it (<store>/embed/bge-m3/onnx/model_fp16.onnx) -- the file, not
+ * the directory, is what names the precision that was fetched.
+ * rampart-onnx, though, wants the DIRECTORY: initEmbed()/initRerank()
+ * discover the tokenizer, pooling and token window from the directory's
+ * json files, while a bare .onnx puts them in file mode, where
+ * opts.tokenizer_path is mandatory and pooling is never discovered -- so
+ * a file path that does load embeds with the wrong pooling instead of
+ * failing.  Fetch with onnxGet(), hand the engine the directory it came
+ * from (same derivation as onnx-test.js's modelDir()):
+ *   var f   = models.onnxGet('bge-m3');                    // fetch -> file
+ *   var dir = f.replace(/[^\/]*$/, '').replace(/\/onnx\/?$/, '');
+ *   onnx.initEmbed(dir);
+ * CAVEAT: directory mode picks the model file itself -- onnx/model.onnx,
+ * else model.onnx, else the first *.onnx -- and nothing overrides that.
+ * So a directory holding several precisions (fp16 fetched once, q4
+ * fetched later) may not load the one this call asked for; keep one
+ * precision per alias, or point initEmbed at a dedicated {dest:} dir.
  */
 function ggufGet(name, o) { o = o ? Object.assign({}, o) : {}; o.format = "gguf"; return get(name, o); }
 function onnxGet(name, o) { o = o ? Object.assign({}, o) : {}; o.format = "onnx"; return get(name, o); }
