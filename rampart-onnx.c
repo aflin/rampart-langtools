@@ -1727,6 +1727,7 @@ static size_t onnx_enc_count(void *user, const char *t, size_t l)
 /* Per-vector chunk info returned to callers (byte span in the ORIGINAL text +
  * the actual token count of the embedded sequence, specials included). */
 typedef struct { size_t start, end, n_tokens; } rp_onnx_embed_span;
+RP_DOCCACHE_ASSERT_SPAN_LAYOUT(rp_onnx_embed_span);   /* cast to/from the doc cache */
 
 /* Everything embedTextTo* / rp_onnx_embed_doc need in one call:
  * structure-aware chunking (rp-chunker) -> per-chunk encode (+prefix) ->
@@ -1959,22 +1960,22 @@ size_t rp_onnx_embed_doc(void *handle, const char *text, size_t tlen,
     if (!prefix) plen = 0;
     rp_onnx_embed_handle_t *h = (rp_onnx_embed_handle_t *)handle;
 
-    /* The doc-result cache stores {vecs, avg, coh} but NOT spans (spans
-     * are cheap to recompute and served by rp_onnx_embed_spans).  So only
-     * the span-free callers (chunkembed/chunkavg/chunkcoherence/embed) use
-     * the cache; a caller that wants out_chunks bypasses it. */
-    int cacheable = (out_chunks == NULL);
-
-    if (cacheable) {
+    /* The doc-result cache stores the FULL result {vecs, avg, coh,
+     * chunks}, so every caller -- chunkembed (which wants the spans too)
+     * included -- shares one model run per text. */
+    {
         float *cv = NULL, *ca = NULL, cc = 0.0f;
+        rp_doccache_span *cs = NULL;
         size_t ck = 0; int cd = 0;
         if (rp_doccache_get(&h->doc_cache, text, tlen, prefix, plen,
                                out_vecs ? &cv : NULL, &ck, &cd,
-                               out_avg  ? &ca : NULL, &cc)) {
+                               out_avg  ? &ca : NULL, &cc,
+                               out_chunks ? &cs : NULL)) {
             if (out_vecs)      *out_vecs      = cv;
             if (out_k)         *out_k         = ck;
             if (out_avg)       *out_avg       = ca;
             if (out_coherence) *out_coherence = cc;
+            if (out_chunks)    *out_chunks    = (rp_onnx_embed_span *)cs;
             return (size_t)cd;
         }
     }
@@ -1993,9 +1994,8 @@ size_t rp_onnx_embed_doc(void *handle, const char *text, size_t tlen,
     E.sp = h->sp_tok;
     E.prefix = h->opts.passage_prefix;   /* SQL callers are passage-side */
 
-    /* Always compute avg+coh on the cacheable path so a later embed()/
-     * chunkavg()/chunkcoherence() on the same text is served from cache. */
-    int want_avg = cacheable ? 1 : ((out_avg || out_coherence) ? 1 : 0);
+    /* Always compute avg+coh so a later embed()/chunkavg()/
+     * chunkcoherence() on the same text is served from cache. */
     onnx_docres R;
     int dim = onnx_embed_doc_run(&cf, &E, text, tlen, prefix, plen,
                                  h->opts.bos_id, h->opts.eos_id, h->opts.id_offset,
@@ -2003,16 +2003,16 @@ size_t rp_onnx_embed_doc(void *handle, const char *text, size_t tlen,
                                  h->opts.split_mode, h->opts.min_split_tokens,
                                  h->opts.pack_paragraphs,
                                  h->opts.sentence_split,
-                                 want_avg,
+                                 1 /* want_avg */,
                                  h->opts.normalize, &R, err, sizeof err);
     if (!dim) {
         if (err[0]) onnx_warn("rp_onnx_embed_doc: %s\n", err);
         return 0;
     }
 
-    if (cacheable)
-        rp_doccache_put(&h->doc_cache, text, tlen, prefix, plen,
-                           R.vecs, R.k, dim, R.avg, R.coh);
+    rp_doccache_put(&h->doc_cache, text, tlen, prefix, plen,
+                       R.vecs, R.k, dim, R.avg, R.coh,
+                       (const rp_doccache_span *)R.chunks);
 
     if (out_vecs) *out_vecs = R.vecs; else free(R.vecs);
     if (out_k) *out_k = R.k;

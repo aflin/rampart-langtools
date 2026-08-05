@@ -201,13 +201,53 @@ plus:
 
 ```
 var emb = llamacpp.initEmbed('model.gguf', {
-    pooling,    // "none" | "mean" | "cls" | "last" | "rank"   (--pooling)
-    attention,  // "causal" | "non-causal"                     (--attention)
+    pooling,      // "none" | "mean" | "cls" | "last" | "rank" (--pooling)
+    attention,    // "causal" | "non-causal"                   (--attention)
+    batchChunks,  // EXPERIMENTAL -- see below
+    batchTokens,  // EXPERIMENTAL -- see below
 });
 ```
 
 The legacy names `nctx`, `ubatch`, `nthreads`, `nthreads_batch` are still accepted
 as aliases for `nCtx`, `nUBatch`, `threads`, `threadsBatch`.
+
+### Chunk batching (EXPERIMENTAL)
+
+A document's chunks are independent sequences, so they can be packed into ONE
+`llama_decode` instead of one decode each. This is **experimental**.
+
+```
+llamacpp.embedDefaults({
+    batchChunks,   // null = auto (on for a GPU backend, off for CPU),
+                   // false = one chunk per decode, true = as many as fit, N = cap
+    batchTokens,   // soft cap on TOKENS per packed decode (default 512)
+    threads,       // n_threads       for embedding contexts
+    threadsBatch,  // n_threads_batch for embedding contexts
+});
+llamacpp.embedDefaults()   // -> the settings in effect, plus gpuInUse
+```
+
+`embedDefaults()` sets process-wide defaults for `initEmbed` (an explicit option
+on the call still wins) and is the **only** way to configure the `rp_embed_*` C
+entry points that rampart-sql drives, since those take no options object. Set it
+before models are loaded; a handle captures the settings at load.
+
+Batching never changes chunk boundaries, `k`, or the byte spans — only how many
+already-formed chunks share a decode. It does shift vector values slightly
+(a larger batch selects different matmul kernels), on the order of 1e-3 with
+cosine ~0.9999, scaling with weight quantization.
+
+`batchTokens` matters more than `batchChunks`. Embedding models are typically
+no-KV encoders, so attention is computed over the whole packed batch as one NxN
+matrix with cross-sequence pairs merely masked — cost grows with batch tokens x
+model width while the per-decode overhead saved grows only linearly. Past a few
+hundred tokens the quadratic wins and batching starts LOSING. Measured on an
+RTX 4070 Ti, bge-m3 gained 1.15x at a 512-token cap but ran **0.65x (slower than
+unbatched)** with no cap. 512 is the largest value that did not regress on any
+model tested; the optimum falls as model width rises, so re-measure on new
+hardware. Wall-clock gains measured there: bge-small 2.2x, nomic 1.7x, bge-m3
+1.2x; on CPU, batching measured ~1.0x (no benefit), which is why `auto` leaves
+it off there.
 
 ### modelInfo (read model metadata without loading weights):
 

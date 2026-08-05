@@ -14,6 +14,7 @@ struct rp_doccache_entry_s {
     int       dim;
     float    *avg;          /* dim, malloc'd (may be NULL) */
     float     coh;
+    rp_doccache_span *chunks;  /* k spans, malloc'd (may be NULL) */
     rp_doccache_entry_t *lru_prev, *lru_next;
 };
 
@@ -65,6 +66,7 @@ static void entry_free(rp_doccache_entry_t *e)
     free(e->prefix);
     free(e->vecs);
     free(e->avg);
+    free(e->chunks);
     free(e);
 }
 
@@ -128,10 +130,12 @@ static rp_doccache_entry_t *find_locked(rp_doccache_t *c, uint64_t h,
 int rp_doccache_get(rp_doccache_t *c, const char *text, size_t tlen,
                        const char *prefix, size_t plen,
                        float **out_vecs, size_t *out_k, int *out_dim,
-                       float **out_avg, float *out_coh)
+                       float **out_avg, float *out_coh,
+                       rp_doccache_span **out_chunks)
 {
-    if (out_vecs) *out_vecs = NULL;
-    if (out_avg)  *out_avg  = NULL;
+    if (out_vecs)   *out_vecs   = NULL;
+    if (out_avg)    *out_avg    = NULL;
+    if (out_chunks) *out_chunks = NULL;
     if (!c || !c->initialized || c->cap == 0 || !text || tlen == 0) return 0;
     if (!prefix) plen = 0;
 
@@ -139,11 +143,13 @@ int rp_doccache_get(rp_doccache_t *c, const char *text, size_t tlen,
     pthread_mutex_lock(&c->mtx);
     rp_doccache_entry_t *e = find_locked(c, h, text, tlen, prefix, plen);
     if (!e) { pthread_mutex_unlock(&c->mtx); return 0; }
-    /* If the caller wants avg but this entry has none, treat as a miss so
-     * it recomputes with avg (shouldn't happen -- puts always store avg). */
+    /* If the caller wants a part this entry lacks, treat as a miss so it
+     * recomputes with it (shouldn't happen -- puts always store all). */
     if (out_avg && !e->avg) { pthread_mutex_unlock(&c->mtx); return 0; }
+    if (out_chunks && !e->chunks) { pthread_mutex_unlock(&c->mtx); return 0; }
 
     float  *vc = NULL, *av = NULL;
+    rp_doccache_span *ch = NULL;
     if (out_vecs) {
         size_t nfloat = e->k * (size_t)e->dim;
         vc = (float *)malloc(nfloat * sizeof(float));
@@ -155,11 +161,17 @@ int rp_doccache_get(rp_doccache_t *c, const char *text, size_t tlen,
         if (!av) { free(vc); pthread_mutex_unlock(&c->mtx); return 0; }
         memcpy(av, e->avg, (size_t)e->dim * sizeof(float));
     }
-    if (out_vecs) *out_vecs = vc;
-    if (out_k)    *out_k    = e->k;
-    if (out_dim)  *out_dim  = e->dim;
-    if (out_avg)  *out_avg  = av;
-    if (out_coh)  *out_coh  = e->coh;
+    if (out_chunks) {
+        ch = (rp_doccache_span *)malloc(e->k * sizeof(*ch));
+        if (!ch) { free(vc); free(av); pthread_mutex_unlock(&c->mtx); return 0; }
+        memcpy(ch, e->chunks, e->k * sizeof(*ch));
+    }
+    if (out_vecs)   *out_vecs   = vc;
+    if (out_k)      *out_k      = e->k;
+    if (out_dim)    *out_dim    = e->dim;
+    if (out_avg)    *out_avg    = av;
+    if (out_coh)    *out_coh    = e->coh;
+    if (out_chunks) *out_chunks = ch;
 
     /* Promote to MRU. */
     if (c->head != e) { entry_unlink(c, e); entry_push_front(c, e); }
@@ -170,7 +182,8 @@ int rp_doccache_get(rp_doccache_t *c, const char *text, size_t tlen,
 void rp_doccache_put(rp_doccache_t *c, const char *text, size_t tlen,
                         const char *prefix, size_t plen,
                         const float *vecs, size_t k, int dim,
-                        const float *avg, float coh)
+                        const float *avg, float coh,
+                        const rp_doccache_span *chunks)
 {
     if (!c || !c->initialized || c->cap == 0 || !text || tlen == 0) return;
     if (!vecs || k == 0 || dim <= 0) return;
@@ -185,38 +198,44 @@ void rp_doccache_put(rp_doccache_t *c, const char *text, size_t tlen,
     size_t nfloat = k * (size_t)dim;
     e->vecs = (float *)malloc(nfloat * sizeof(float));
     e->avg  = avg ? (float *)malloc((size_t)dim * sizeof(float)) : NULL;
+    e->chunks = chunks ? (rp_doccache_span *)malloc(k * sizeof(*e->chunks)) : NULL;
     if (plen) {
         e->prefix = (char *)malloc(plen + 1);
         if (!e->prefix) { entry_free(e); return; }
         memcpy(e->prefix, prefix, plen); e->prefix[plen] = '\0';
         e->plen = plen;
     }
-    if (!e->text || !e->vecs || (avg && !e->avg)) { entry_free(e); return; }
+    if (!e->text || !e->vecs || (avg && !e->avg) || (chunks && !e->chunks)) { entry_free(e); return; }
     memcpy(e->text, text, tlen); e->text[tlen] = '\0';
     e->tlen = tlen; e->hash = h;
     memcpy(e->vecs, vecs, nfloat * sizeof(float));
     if (avg) memcpy(e->avg, avg, (size_t)dim * sizeof(float));
+    if (chunks) memcpy(e->chunks, chunks, k * sizeof(*e->chunks));
     e->k = k; e->dim = dim; e->coh = coh;
 
     pthread_mutex_lock(&c->mtx);
     /* Dedup: another thread may have inserted the same text meanwhile.
-     * Exception: if the existing entry lacks avg and ours has it, replace
-     * it -- otherwise an avg-less entry would pin (get with out_avg treats
-     * it as a miss, and this dedup would discard every recompute's result,
-     * recomputing forever until eviction). */
+     * MERGE rather than replace -- adopt whichever parts the existing
+     * entry lacks and ours has.  Replacing would let two callers that
+     * each store a different subset (say avg-only and chunks-only) evict
+     * each other forever, so both miss every time and both run the model
+     * on every call.  Same text + same prefix on one handle is the same
+     * model, so k/dim must agree; if they somehow don't, the newer entry
+     * wins outright. */
     rp_doccache_entry_t *dup = find_locked(c, h, text, tlen, prefix, plen);
     if (dup) {
-        if (!dup->avg && e->avg) {
-            entry_unlink(c, dup);
-            c->n--;
-            entry_free(dup);
-            /* fall through: insert the richer entry */
-        } else {
+        if (dup->k == e->k && dup->dim == e->dim) {
+            if (!dup->avg && e->avg)       { dup->avg = e->avg;       e->avg = NULL;    dup->coh = e->coh; }
+            if (!dup->chunks && e->chunks) { dup->chunks = e->chunks; e->chunks = NULL; }
             if (c->head != dup) { entry_unlink(c, dup); entry_push_front(c, dup); }
             pthread_mutex_unlock(&c->mtx);
             entry_free(e);
             return;
         }
+        entry_unlink(c, dup);
+        c->n--;
+        entry_free(dup);
+        /* fall through: insert the newer entry */
     }
     entry_push_front(c, e);
     c->n++;

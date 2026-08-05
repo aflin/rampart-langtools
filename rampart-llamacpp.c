@@ -259,6 +259,43 @@ static int lt_gpu_in_use(void)
     return 0;
 }
 
+/* ---- embed defaults, settable from JS via llamacpp.embedDefaults() -------
+ * These are the defaults for initEmbed()'s options AND the only way to
+ * configure the rp_embed_* C entry points that rampart-sql drives, since
+ * those take no options object.  Process-global and deliberately simple:
+ * set them once at startup, before models are loaded.
+ *
+ *  batchChunks  -1 = auto: pack chunks into one decode on a GPU backend, one
+ *                  chunk per decode on CPU.  Measured on an RTX 4070 Ti:
+ *                  2.1x faster batched; on a 16-core CPU: 1.03x, i.e. nothing.
+ *                  Batching also perturbs vectors slightly (different matmul
+ *                  kernels for a larger batch), so it is not worth enabling
+ *                  where it does not pay.  1 = never batch, >1 = cap the
+ *                  sequences per decode.
+ *  threads      per-token thread count (n_threads).
+ *  threadsBatch multi-token/prompt thread count (n_threads_batch) -- the one
+ *               that matters for embedding, where every decode is multi-token.
+ *               -1 hands the choice to ggml, which uses GGML_DEFAULT_N_THREADS
+ *               (4) REGARDLESS of core count: llama.cpp passes the value
+ *               through unclamped (llama-context.cpp) and ggml-cpu.c falls
+ *               back to the constant.  Set it explicitly to use the machine. */
+static int g_embed_batch_chunks  = -1;
+static int g_embed_batch_tokens  = 512;
+static int g_embed_threads       = 1;
+static int g_embed_threads_batch = -1;
+
+/* Resolve a batchChunks setting against a live context: returns the max
+ * sequences per decode, where 1 means "one chunk per decode" (identical to
+ * the pre-batching code path). */
+static int ll_resolve_batch(struct llama_context *lctx, int setting)
+{
+    int cap = lctx ? (int)llama_n_seq_max(lctx) : 1;
+    if (cap < 1) cap = 1;
+    if (setting < 0) setting = lt_gpu_in_use() ? cap : 1;   /* auto */
+    if (setting <= 1) return 1;
+    return setting < cap ? setting : cap;
+}
+
 #define LT_FORK_REFUSAL "llama.cpp: this handle was created before a fork() and " \
     "a GPU backend (CUDA/Metal) is initialized -- using it in the child would " \
     "crash the GPU runtime. Fork before loading models (rampart-server daemon " \
@@ -1368,6 +1405,7 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
  * ============================================================ */
 
 typedef struct { size_t start, end, n_tokens; } ll_chunk_span;
+RP_DOCCACHE_ASSERT_SPAN_LAYOUT(ll_chunk_span);   /* cast to/from the doc cache */
 
 /* rp_chunk_count_fn over llama_tokenize (probe mode; includes specials) */
 static size_t ll_chunk_count(void *user, const char *t, size_t l)
@@ -1379,47 +1417,113 @@ static size_t ll_chunk_count(void *user, const char *t, size_t l)
     return (size_t)need;
 }
 
-/* Decode toks[0..n) as one independent sequence (positions 0..n-1, KV
- * cleared) and write the L2-normalized pooled embedding to dst[vec_dim]. */
-static int ll_decode_pooled(struct llama_context *lctx, enum llama_pooling_type p,
-                            const llama_token *toks, int n, int vec_dim,
-                            float *dst, char *err, size_t errlen)
+/* One chunk queued for the next batched decode: a slice of the flat pending
+ * token buffer, plus the ROW of `vecs` its pooled vector belongs in.  The
+ * destination is an index, not a pointer, because `vecs` is realloc'd as
+ * chunks accumulate -- a cached pointer would dangle across a growth. */
+typedef struct { int off, n; size_t row; } ll_pend;
+
+/* Tokens that may ride in ONE llama_decode on this context.
+ *   n_batch  -- hard cap; exceeding it is a GGML_ASSERT abort, not an error.
+ *   n_ubatch -- must also cover the WHOLE batch.  A pooled multi-sequence
+ *               decode that splits across ubatches has each sequence's pooled
+ *               output overwritten by the last ubatch containing it.  For
+ *               non-causal (BERT) models llama.cpp asserts this, but for
+ *               CAUSAL embedders (qwen3-embedding) the assert is skipped and
+ *               the result is silently wrong -- so we enforce it ourselves.
+ *   n_ctx    -- bounds the unified KV cells for KV-backed (causal) embedders.
+ *               BERT-style encoders allocate no KV at all, so there it simply
+ *               is not the binding constraint.
+ * On the embed path these are all equal (new_embed_context), so the min() is
+ * belt-and-braces against an explicit nCtx/nUBatch from initEmbed opts. */
+static int ll_batch_budget(struct llama_context *lctx)
 {
+    uint32_t b  = llama_n_batch(lctx);
+    uint32_t nu = llama_n_ubatch(lctx);
+    uint32_t nc = llama_n_ctx(lctx);
+    if (nu && nu < b) b = nu;
+    if (nc && nc < b) b = nc;
+    return (int)b;
+}
+
+/* Decode n_seq INDEPENDENT sequences in ONE llama_decode and write each one's
+ * L2-normalized pooled embedding to dst[seqs[j].row * vec_dim].
+ *
+ * Sequence j gets seq_id j and its OWN positions 0..len-1.  Positions must
+ * restart per sequence: BERT-style models index a learned table of
+ * n_ctx_train rows with the raw position (no clamping), and CLS/LAST pooling
+ * select the min/max position within a sequence.  Every token is flagged as
+ * an output because cparams.embeddings requires it (llama.cpp warns and
+ * overrides otherwise).  Sequence lengths may differ freely -- with a unified
+ * KV cache llama.cpp splits with split_simple, which has no equal-length
+ * requirement, so ragged chunks pack with no padding.
+ *
+ * n_seq == 1 produces a batch byte-identical to the pre-batching single-chunk
+ * path, so a one-chunk document is unaffected by this change.
+ *
+ * The caller guarantees sum(seqs[].n) <= ll_batch_budget(). */
+static int ll_decode_pooled_batch(struct llama_context *lctx,
+                                  enum llama_pooling_type p,
+                                  const llama_token *toks,
+                                  const ll_pend *seqs, int n_seq,
+                                  int vec_dim, float *dst,
+                                  char *err, size_t errlen)
+{
+    if (n_seq <= 0) return 0;
+
+    int total = 0;
+    for (int j = 0; j < n_seq; j++) total += seqs[j].n;
+    if (total <= 0) return 0;
+
     llama_memory_clear(llama_get_memory(lctx), /*clear_kv=*/true);
 
-    struct llama_batch batch = llama_batch_init(/*capacity*/n, /*embd*/0, /*n_seq_max*/1);
+    struct llama_batch batch = llama_batch_init(/*capacity*/total, /*embd*/0, /*n_seq_max*/1);
     if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
         llama_batch_free(batch);
         if (err) snprintf(err, errlen, "llama_batch_init failed");
         return -1;
     }
-    for (int i = 0; i < n; ++i) {
-        batch.token[i]     = toks[i];
-        batch.pos[i]       = i;
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = 1;
+    int t = 0;
+    for (int j = 0; j < n_seq; j++) {
+        for (int i = 0; i < seqs[j].n; i++, t++) {
+            batch.token[t]     = toks[seqs[j].off + i];
+            batch.pos[t]       = i;                    /* per-sequence, from 0 */
+            batch.n_seq_id[t]  = 1;
+            batch.seq_id[t][0] = (llama_seq_id)j;
+            batch.logits[t]    = 1;
+        }
     }
-    batch.n_tokens = n;
+    batch.n_tokens = total;
 
+    /* >0 = KV slot prepare failure, <0 = hard error; both are fatal here. */
     if (llama_decode(lctx, batch) != 0) {
         llama_batch_free(batch);
-        if (err) snprintf(err, errlen, "llama_decode failed");
+        if (err) snprintf(err, errlen, "llama_decode failed (%d seqs, %d tokens)",
+                          n_seq, total);
         return -1;
     }
-    const float *emb = (p == LLAMA_POOLING_TYPE_NONE)
-                     ? llama_get_embeddings_ith(lctx, n - 1)
-                     : llama_get_embeddings_seq(lctx, 0);
+
+    /* Copy EVERY sequence out before returning -- the context's per-sequence
+     * embedding map is cleared at the top of the next decode. */
+    int rc = 0, base = 0;
+    for (int j = 0; j < n_seq; j++) {
+        const float *emb = (p == LLAMA_POOLING_TYPE_NONE)
+                         ? llama_get_embeddings_ith(lctx, base + seqs[j].n - 1)
+                         : llama_get_embeddings_seq(lctx, (llama_seq_id)j);
+        base += seqs[j].n;
+        if (!emb) {
+            if (err) snprintf(err, errlen, "no embedding returned for sequence %d", j);
+            rc = -1;
+            break;
+        }
+        float *out = dst + seqs[j].row * (size_t)vec_dim;
+        double norm2 = 0.0;
+        for (int i = 0; i < vec_dim; ++i) norm2 += (double)emb[i] * (double)emb[i];
+        float inv = norm2 > 0.0 ? (float)(1.0 / sqrt(norm2)) : 1.0f;
+        for (int i = 0; i < vec_dim; ++i) out[i] = emb[i] * inv;
+    }
     llama_batch_free(batch);
-    if (!emb) {
-        if (err) snprintf(err, errlen, "no embedding returned");
-        return -1;
-    }
-    double norm2 = 0.0;
-    for (int i = 0; i < vec_dim; ++i) norm2 += (double)emb[i] * (double)emb[i];
-    float inv = norm2 > 0.0 ? (float)(1.0 / sqrt(norm2)) : 1.0f;
-    for (int i = 0; i < vec_dim; ++i) dst[i] = emb[i] * inv;
-    return 0;
+    return rc;
 }
 
 /* Chunk + decode a whole document.  On success returns vec_dim (>0) and fills
@@ -1438,6 +1542,8 @@ static int ll_embed_doc(struct llama_context *lctx, const struct llama_vocab *vo
                         int split_mode, int min_tokens, int pack_para,
                         int sentence_split,
                         int spans_only,   /* 1 = skip decode; spans/k only */
+                        int max_batch,    /* max chunks per decode; 1 = one each */
+                        int max_tokens,   /* soft token cap per decode; 0 = none */
                         float **out_vecs, size_t *out_k, ll_chunk_span **out_spans,
                         float **out_avg, float *out_coh,
                         char *err, size_t errlen)
@@ -1504,6 +1610,44 @@ static int ll_embed_doc(struct llama_context *lctx, const struct llama_vocab *vo
     size_t k = 0, cap = 0;
     int failed = 0;
 
+    /* Pending batch.  Chunks are independent sequences, so instead of one
+     * llama_decode each they accumulate here and go through the model
+     * together, flushing when the token budget or the sequence cap is
+     * reached.  Peak activation memory is unchanged: the context is already
+     * sized for a single chunk of `budget` tokens (n_ubatch), and a packed
+     * batch never exceeds that. */
+    llama_token *pend_toks = NULL;
+    ll_pend     *pend      = NULL;
+    int          pend_ntok = 0, pend_n = 0, budget = 0, max_seqs = 0, soft_cap = 0;
+
+    if (!spans_only) {
+        budget   = ll_batch_budget(lctx);
+        /* Caller-resolved (ll_resolve_batch): 1 = one chunk per decode, which
+         * builds a batch byte-identical to the pre-batching path. */
+        max_seqs = max_batch > 0 ? max_batch : 1;
+        /* Soft cap on tokens per decode.  These are no-KV encoders, so
+         * attention is computed over the WHOLE packed batch as one NxN matrix
+         * (cross-sequence pairs are only masked out) -- cost grows with batch
+         * tokens x model width, while the per-decode overhead saved grows
+         * only linearly.  Past a few hundred tokens the quadratic wins and
+         * batching starts LOSING: measured on an RTX 4070 Ti, bge-m3 went
+         * 1.07x at ~670 tok/decode but 0.73x at ~2300.  Never let this reject
+         * a lone oversized chunk -- `budget` remains the hard capacity. */
+        soft_cap = (max_tokens > 0 && max_tokens < budget) ? max_tokens : budget;
+        if (budget < 1) {
+            free(spans); free(dp_toks);
+            if (err) snprintf(err, errlen, "invalid batch budget");
+            return 0;
+        }
+        pend_toks = (llama_token *)malloc((size_t)budget * sizeof(*pend_toks));
+        pend      = (ll_pend *)malloc((size_t)max_seqs * sizeof(*pend));
+        if (!pend_toks || !pend) {
+            free(pend_toks); free(pend); free(spans); free(dp_toks);
+            if (err) snprintf(err, errlen, "oom pending batch");
+            return 0;
+        }
+    }
+
     for (size_t si = 0; si < nspan && !failed; si++) {
         const char *ct = text + spans[si].start;
         int clen = (int)(spans[si].end - spans[si].start);
@@ -1535,7 +1679,13 @@ static int ll_embed_doc(struct llama_context *lctx, const struct llama_vocab *vo
                 cap = nc;
             }
             if (!spans_only) {
-                int drc;
+                /* Compose this window's decode input, then QUEUE it -- the
+                 * decode happens in ll_decode_pooled_batch once the batch
+                 * fills.  The tokens are copied into pend_toks because
+                 * `toks` is freed at the end of each span iteration. */
+                const llama_token *src;
+                llama_token *tmp = NULL;
+                int m;
                 if (dp_n > 0) {
                     /* [BOS?] prefix window-tokens(trimmed) -- window walk
                      * and spans stay prefix-independent. */
@@ -1545,21 +1695,40 @@ static int ll_embed_doc(struct llama_context *lctx, const struct llama_vocab *vo
                     if (dp_n + keep + lead > chunk_tokens)
                         keep = chunk_tokens - dp_n - lead;
                     if (keep < 0) keep = 0;
-                    int m = 0;
-                    llama_token *dbuf = (llama_token *)malloc(
-                        (size_t)(lead + dp_n + keep) * sizeof(*dbuf));
-                    if (!dbuf) { failed = 1; if (err) snprintf(err, errlen, "oom prefix buf"); break; }
-                    if (lead) dbuf[m++] = toks[0];
-                    memcpy(dbuf + m, dp_toks, (size_t)dp_n * sizeof(*dbuf)); m += dp_n;
-                    memcpy(dbuf + m, toks + start + lead, (size_t)keep * sizeof(*dbuf)); m += keep;
-                    drc = ll_decode_pooled(lctx, p, dbuf, m, vec_dim,
-                                           vecs + k * (size_t)vec_dim, err, errlen);
-                    free(dbuf);
+                    int q = 0;
+                    m = lead + dp_n + keep;
+                    tmp = (llama_token *)malloc((size_t)m * sizeof(*tmp));
+                    if (!tmp) { failed = 1; if (err) snprintf(err, errlen, "oom prefix buf"); break; }
+                    if (lead) tmp[q++] = toks[0];
+                    memcpy(tmp + q, dp_toks, (size_t)dp_n * sizeof(*tmp)); q += dp_n;
+                    memcpy(tmp + q, toks + start + lead, (size_t)keep * sizeof(*tmp));
+                    src = tmp;
                 } else {
-                    drc = ll_decode_pooled(lctx, p, toks + start, n, vec_dim,
-                                           vecs + k * (size_t)vec_dim, err, errlen);
+                    src = toks + start;
+                    m   = n;
                 }
-                if (drc != 0) { failed = 1; break; }
+                /* Flush first if this window would overflow the batch. */
+                if (pend_n > 0 && (pend_ntok + m > soft_cap || pend_n >= max_seqs)) {
+                    int frc = ll_decode_pooled_batch(lctx, p, pend_toks, pend, pend_n,
+                                                     vec_dim, vecs, err, errlen);
+                    pend_n = 0; pend_ntok = 0;
+                    if (frc != 0) { free(tmp); failed = 1; break; }
+                }
+                /* m <= chunk_tokens <= budget by construction; guard anyway
+                 * rather than let llama.cpp's GGML_ASSERT abort the process. */
+                if (m > budget) {
+                    free(tmp); failed = 1;
+                    if (err) snprintf(err, errlen,
+                                      "chunk of %d tokens exceeds batch budget %d", m, budget);
+                    break;
+                }
+                memcpy(pend_toks + pend_ntok, src, (size_t)m * sizeof(*pend_toks));
+                pend[pend_n].off = pend_ntok;
+                pend[pend_n].n   = m;
+                pend[pend_n].row = k;
+                pend_n++;
+                pend_ntok += m;
+                free(tmp);
             }
             vspans[k] = (ll_chunk_span){ spans[si].start, spans[si].end, (size_t)n };
             k++;
@@ -1567,6 +1736,13 @@ static int ll_embed_doc(struct llama_context *lctx, const struct llama_vocab *vo
         }
         free(toks);
     }
+    /* Trailing partial batch. */
+    if (!failed && pend_n > 0 &&
+        ll_decode_pooled_batch(lctx, p, pend_toks, pend, pend_n,
+                               vec_dim, vecs, err, errlen) != 0)
+        failed = 1;
+    free(pend_toks);
+    free(pend);
     free(spans);
     free(dp_toks);
     if (failed || k == 0) {
@@ -1575,8 +1751,9 @@ static int ll_embed_doc(struct llama_context *lctx, const struct llama_vocab *vo
         return 0;
     }
 
-    /* avgVec + coherence over the unit chunk vectors */
-    if (out_avg || out_coh) {
+    /* avgVec + coherence over the unit chunk vectors.  Impossible in
+     * spans_only mode -- nothing was decoded, so `vecs' is NULL. */
+    if (!spans_only && (out_avg || out_coh)) {
         float *avg = (float *)malloc((size_t)vec_dim * sizeof(float));
         if (!avg) { free(vecs); free(vspans); if (err) snprintf(err, errlen, "oom avg"); return 0; }
         double coh = 1.0;
@@ -1635,7 +1812,7 @@ static struct llama_context *emb_resolve(duk_context *ctx, const char *what,
                                          struct llama_model **out_model,
                                          int *out_dim, int *out_split,
                                          int *out_min, int *out_pack,
-                                         int *out_sent)
+                                         int *out_sent, int *out_batch, int *out_btok)
 {
     struct llama_model *lmodel = NULL;
     struct llama_context *lctx = NULL;
@@ -1717,6 +1894,17 @@ static struct llama_context *emb_resolve(duk_context *ctx, const char *what,
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("chunk_sent"));
     if (duk_is_number(ctx, -1)) *out_sent = duk_get_int(ctx, -1);
     duk_pop(ctx);
+    /* Resolved at initEmbed (see llamacpp_init_embed); re-resolve here as a
+     * fallback so a thread-copy that predates the property still behaves. */
+    *out_batch = 0;
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("chunk_batch"));
+    if (duk_is_number(ctx, -1)) *out_batch = duk_get_int(ctx, -1);
+    duk_pop(ctx);
+    if (*out_batch < 1) *out_batch = ll_resolve_batch(lctx, g_embed_batch_chunks);
+    *out_btok = g_embed_batch_tokens;
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("chunk_batch_tok"));
+    if (duk_is_number(ctx, -1)) *out_btok = duk_get_int(ctx, -1);
+    duk_pop(ctx);
 
     *out_model = lmodel;
     return lctx;
@@ -1766,10 +1954,11 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     duk_size_t tlen = 0;
     const char *text = duk_get_lstring(ctx, 0, &tlen);   /* NUL-safe length */
 
-    int vec_dim = 0, split = 0, minTok = 0, packPara = 0, sentSpl = 0;
+    int vec_dim = 0, split = 0, minTok = 0, packPara = 0, sentSpl = 0, maxBatch = 1, maxBTok = 0;
     struct llama_model *lmodel = NULL;
     struct llama_context *lctx = emb_resolve(ctx, "embedTextToBuf", &lmodel,
-                                             &vec_dim, &split, &minTok, &packPara, &sentSpl);
+                                             &vec_dim, &split, &minTok, &packPara, &sentSpl,
+                                             &maxBatch, &maxBTok);
 
     const struct llama_vocab *vocab = llama_model_get_vocab(lmodel);
 
@@ -1815,7 +2004,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
             ll_chunk_span *spans = NULL;
             char err2[256] = {0};
             dim = ll_embed_doc(lctx, vocab, s, (size_t)slen, NULL, 0, vec_dim,
-                               RP_CHUNK_AUTO, 0, 0, 0, 0,
+                               RP_CHUNK_AUTO, 0, 0, 0, 0, maxBatch, maxBTok,
                                &v, &kk, &spans, &avg1, &coh1, err2, sizeof err2);
             duk_pop(ctx);                           /* the string */
             if (!dim || !kk || !avg1) {
@@ -1880,7 +2069,7 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
     size_t k = 0;
     ll_chunk_span *spans = NULL;
     int dim = ll_embed_doc(lctx, vocab, text, (size_t)tlen, NULL, 0, vec_dim,
-                           split, minTok, packPara, sentSpl, 0,
+                           split, minTok, packPara, sentSpl, 0, maxBatch, maxBTok,
                            &vecs, &k, &spans, &avg, &coh, err, sizeof err);
     if (!dim) {
         if (err[0])
@@ -1942,10 +2131,11 @@ static duk_ret_t embed_texts_to_numbers(duk_context *ctx)
 {
     REQUIRE_ARRAY(ctx, 0, "rampart-llama-cpp:embedTextsToNumbers - argument must be an Array of Strings");
 
-    int vec_dim = 0, split = 0, minTok = 0, packPara = 0, sentSpl = 0;
+    int vec_dim = 0, split = 0, minTok = 0, packPara = 0, sentSpl = 0, maxBatch = 1, maxBTok = 0;
     struct llama_model *lmodel = NULL;
     struct llama_context *lctx = emb_resolve(ctx, "embedTextsToNumbers", &lmodel,
-                                             &vec_dim, &split, &minTok, &packPara, &sentSpl);
+                                             &vec_dim, &split, &minTok, &packPara, &sentSpl,
+                                             &maxBatch, &maxBTok);
     const struct llama_vocab *vocab = llama_model_get_vocab(lmodel);
 
     duk_uarridx_t n = (duk_uarridx_t)duk_get_length(ctx, 0);
@@ -1961,7 +2151,7 @@ static duk_ret_t embed_texts_to_numbers(duk_context *ctx)
         char err[256] = {0};
         float *avg = NULL;
         int dim = ll_embed_doc(lctx, vocab, text, (size_t)tlen, NULL, 0, vec_dim,
-                               split, minTok, packPara, sentSpl, 0,
+                               split, minTok, packPara, sentSpl, 0, maxBatch, maxBTok,
                                NULL, NULL, NULL, &avg, NULL, err, sizeof err);
         duk_pop(ctx);   /* text */
         if (!dim && err[0])
@@ -2053,6 +2243,8 @@ typedef struct rp_embed_handle_s {
     int                         n_thread_ctxs;
     int                         cap_thread_ctxs;
     int                         init_pid;    /* pid at load: post-fork GPU use is refused */
+    int                         batch_chunks; /* raw setting; ll_resolve_batch()s per use */
+    int                         batch_tokens; /* soft token cap per packed decode */
     /* Doc-result cache (own mutex, not h->mtx): one model run of a text
      * feeds chunkembed()/chunkavg()/chunkcoherence()/embed(), keyed on
      * the text.  See rp-embed-cache.h. */
@@ -2198,8 +2390,12 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
        metadata); UNSPECIFIED lets llama.cpp resolve it. Falls back to MEAN below
        if the model declares none. Mirrors llamacpp_init_embed's default. */
     h->cp.pooling_type   = LLAMA_POOLING_TYPE_UNSPECIFIED;
-    h->cp.n_threads      = 1;
-    h->cp.n_threads_batch = -1;
+    /* This path takes no options object -- rampart-sql drives it -- so the
+     * only way to tune it is llamacpp.embedDefaults() before the load. */
+    h->cp.n_threads       = g_embed_threads;
+    h->cp.n_threads_batch = g_embed_threads_batch;
+    h->batch_chunks       = g_embed_batch_chunks;
+    h->batch_tokens       = g_embed_batch_tokens;
     int n_train = llama_model_n_ctx_train(h->lmodel);
     if (n_train > 8192) n_train = 8192;
     h->cp.n_ctx     = n_train > 0 ? n_train : 0;
@@ -2254,13 +2450,13 @@ void rp_embed_set_cache_cap(void *handle, size_t cap)
 /* Cached doc-embed core shared by rp_embed_doc (chunkembed/chunkavg/
  * chunkcoherence) and rp_embed_compute_avgvec (embed()).  Checks the
  * handle's doc-result cache first; on a miss runs ll_embed_doc once
- * (forcing avg+coh so a later embed()/chunkavg() on the same text is
- * served from cache), stores {vecs, avg, coh}, and hands out the pieces
- * the caller asked for.  spans (out_chunks) are NOT cached; callers
- * wanting them bypass the cache.  `lock_compute` wraps the model run in
- * h->mtx (shared-ctx mode); the cache uses its own mutex, so a cache
- * hit never contends with an in-flight embed of a different text.
- * Takes lctx explicitly (per-thread or shared, resolved by the caller). */
+ * (forcing vecs+avg+coh+spans so a later call for any other slice of
+ * the same text is served from cache), stores the full result, and
+ * hands out the pieces the caller asked for.  `lock_compute` wraps the
+ * model run in h->mtx (shared-ctx mode); the cache uses its own mutex,
+ * so a cache hit never contends with an in-flight embed of a different
+ * text.  Takes lctx explicitly (per-thread or shared, resolved by the
+ * caller). */
 static int ll_embed_doc_cached(rp_embed_handle_t *h, struct llama_context *lctx,
                                const char *text, size_t tlen,
                                const char *prefix, size_t plen,
@@ -2278,46 +2474,49 @@ static int ll_embed_doc_cached(rp_embed_handle_t *h, struct llama_context *lctx,
     if (!h || !lctx || !text || tlen == 0) return 0;
     if (!prefix) plen = 0;
 
-    int cacheable = (out_chunks == NULL);
-    if (cacheable) {
+    {
         float *cv = NULL, *ca = NULL, cc = 0.0f;
+        rp_doccache_span *cs = NULL;
         size_t ck = 0; int cd = 0;
         if (rp_doccache_get(&h->doc_cache, text, tlen, prefix, plen,
                                out_vecs ? &cv : NULL, &ck, &cd,
-                               out_avg  ? &ca : NULL, &cc)) {
-            if (out_vecs) *out_vecs = cv;
-            if (out_k)    *out_k    = ck;
-            if (out_avg)  *out_avg  = ca;
-            if (out_coh)  *out_coh  = cc;
+                               out_avg  ? &ca : NULL, &cc,
+                               out_chunks ? &cs : NULL)) {
+            if (out_vecs)   *out_vecs   = cv;
+            if (out_k)      *out_k      = ck;
+            if (out_avg)    *out_avg    = ca;
+            if (out_coh)    *out_coh    = cc;
+            if (out_chunks) *out_chunks = (ll_chunk_span *)cs;
             return cd;
         }
     }
 
     const struct llama_vocab *vocab = llama_model_get_vocab(h->lmodel);
-    /* On the cacheable path always compute vecs+avg+coh so the stored
-     * entry can serve any of the four scalars later, regardless of which
-     * one triggered this run. */
+    /* Always compute the full result (vecs+avg+coh+spans) so the stored
+     * entry can serve any of the scalars later, regardless of which one
+     * triggered this run.  The spans are a free byproduct of the chunk
+     * walk. */
     float *vecs = NULL, *avg = NULL, coh = 0.0f;
+    ll_chunk_span *chunks = NULL;
     size_t k = 0;
-    int need_vecs = cacheable || (out_vecs != NULL);
-    int need_avg  = cacheable || (out_avg  != NULL) || (out_coh != NULL);
 
     if (lock_compute) pthread_mutex_lock(&h->mtx);
     int dim = ll_embed_doc(lctx, vocab, text, tlen, prefix, plen, h->vec_dim,
-                           RP_CHUNK_AUTO, 0, 0, 0, 0,
-                           need_vecs ? &vecs : NULL, &k, out_chunks,
-                           need_avg ? &avg : NULL, need_avg ? &coh : NULL,
+                           RP_CHUNK_AUTO, 0, 0, 0, 0, ll_resolve_batch(lctx, h->batch_chunks), h->batch_tokens,
+                           &vecs, &k, &chunks,
+                           &avg, &coh,
                            err, errlen);
     if (lock_compute) pthread_mutex_unlock(&h->mtx);
-    if (!dim) { free(vecs); free(avg); return 0; }
+    if (!dim) { free(vecs); free(avg); free(chunks); return 0; }
 
-    if (cacheable)
-        rp_doccache_put(&h->doc_cache, text, tlen, prefix, plen, vecs, k, dim, avg, coh);
+    rp_doccache_put(&h->doc_cache, text, tlen, prefix, plen, vecs, k, dim,
+                    avg, coh, (const rp_doccache_span *)chunks);
 
-    if (out_vecs) *out_vecs = vecs; else free(vecs);
-    if (out_k)    *out_k    = k;
-    if (out_avg)  *out_avg  = avg;  else free(avg);
-    if (out_coh)  *out_coh  = coh;
+    if (out_vecs)   *out_vecs   = vecs;   else free(vecs);
+    if (out_k)      *out_k      = k;
+    if (out_avg)    *out_avg    = avg;    else free(avg);
+    if (out_coh)    *out_coh    = coh;
+    if (out_chunks) *out_chunks = chunks; else free(chunks);
     return dim;
 }
 
@@ -2434,6 +2633,9 @@ size_t rp_embed_text(void *handle, const char *text, size_t tlen, float **out_ve
  *                    window sub-chunks of an unstructured region share its span
  * Returns 0 on failure or empty/untokenizable text. */
 typedef struct { size_t start, end, n_tokens; } rp_embed_chunk_span;
+/* Cast to/from ll_chunk_span AND rp_doccache_span; rampart-sql.c keeps a
+ * matching copy (rp_embed_span_t) that only the iface marker below guards. */
+RP_DOCCACHE_ASSERT_SPAN_LAYOUT(rp_embed_chunk_span);
 
 /* Interface marker: rampart-sql requires this symbol so a stale module
  * (older rp_embed_doc signature, no per-doc prefix) fails loudly at
@@ -2502,13 +2704,13 @@ size_t rp_embed_spans(void *handle, const char *text, size_t tlen,
         struct llama_context *lctx = get_per_thread_ctx(h);
         if (!lctx) return 0;
         dim = ll_embed_doc(lctx, vocab, text, tlen, NULL, 0, h->vec_dim,
-                           RP_CHUNK_AUTO, 0, 0, 0, 1 /* spans_only */,
+                           RP_CHUNK_AUTO, 0, 0, 0, 1 /* spans_only */, 1, 0,
                            NULL, &k, (ll_chunk_span **)out_spans,
                            NULL, NULL, err, sizeof err);
     } else {
         pthread_mutex_lock(&h->mtx);
         dim = ll_embed_doc(h->lctx, vocab, text, tlen, NULL, 0, h->vec_dim,
-                           RP_CHUNK_AUTO, 0, 0, 0, 1 /* spans_only */,
+                           RP_CHUNK_AUTO, 0, 0, 0, 1 /* spans_only */, 1, 0,
                            NULL, &k, (ll_chunk_span **)out_spans,
                            NULL, NULL, err, sizeof err);
         pthread_mutex_unlock(&h->mtx);
@@ -2637,11 +2839,30 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
        pooling_type; if the model declares none we fall back to MEAN after the
        context is built (below). An explicit { pooling } option overrides this. */
     cp.pooling_type    = LLAMA_POOLING_TYPE_UNSPECIFIED;
-    cp.n_threads       = 1;
+    /* llamacpp.embedDefaults() supplies the defaults; explicit
+     * { threads / threadsBatch } options below still win. */
+    cp.n_threads       = g_embed_threads;
     cp.n_ctx           = 0;
     cp.n_ubatch        = 0;
-    cp.n_threads_batch = -1;
-    if (obj_idx > -1) { parse_common_opts(ctx, obj_idx, &mp, &cp); parse_embed_opts(ctx, obj_idx, &cp); }
+    cp.n_threads_batch = g_embed_threads_batch;
+    int batch_chunks   = g_embed_batch_chunks;
+    int batch_tokens   = g_embed_batch_tokens;
+    if (obj_idx > -1) {
+        parse_common_opts(ctx, obj_idx, &mp, &cp);
+        parse_embed_opts(ctx, obj_idx, &cp);
+        /* batchChunks: false = one chunk per decode, true = as many as the
+         * context allows, N = cap at N.  Absent = the embedDefaults() value
+         * (-1 = auto: on for GPU, off for CPU). */
+        if (duk_get_prop_string(ctx, obj_idx, "batchChunks")) {
+            if (duk_is_boolean(ctx, -1))     batch_chunks = duk_get_boolean(ctx, -1) ? 0x7fffffff : 1;
+            else if (duk_is_number(ctx, -1)) batch_chunks = duk_get_int(ctx, -1);
+            else RP_THROW(ctx, "initEmbed: batchChunks must be a Boolean or a Number");
+        }
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, obj_idx, "batchTokens"))
+            batch_tokens = REQUIRE_INT(ctx, -1, "initEmbed: batchTokens must be an integer");
+        duk_pop(ctx);
+    }
 
 #if HAVE_CUDA
     {  /* GPU build: always check; lt_gpu_kernel_supported self-gates on has_gpu_backend */
@@ -2757,6 +2978,13 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
                 sentSpl = duk_to_boolean(ctx, -1);
             duk_pop(ctx);
         }
+        /* Resolve batchChunks ONCE, here: lt_gpu_in_use() is only meaningful
+         * after a model load has registered the backends, which has happened
+         * by now.  A thread-copy inherits the resolved number. */
+        duk_push_int(ctx, ll_resolve_batch(lctx, batch_chunks));
+        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_batch"));
+        duk_push_int(ctx, batch_tokens);
+        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_batch_tok"));
         duk_push_int(ctx, split);    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_split"));
         duk_push_int(ctx, minTok);   duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_min"));
         duk_push_int(ctx, packPara); duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_pack"));
@@ -3514,6 +3742,70 @@ void close_llama_on_exit(void *arg)
 {
     llama_backend_free();
 }
+/* embedDefaults([{ batchChunks, threads, threadsBatch }]) -> current settings
+ *
+ * Process-global defaults for embedding.  They seed initEmbed()'s options (an
+ * explicit option on the call still wins) and are the ONLY way to configure
+ * the rp_embed_* C entry points that rampart-sql drives, which take no
+ * options object.  Set them before loading models -- an already-built context
+ * keeps the threads it was created with.
+ *
+ *   batchChunks  false | true | N  -- chunks packed into one llama_decode.
+ *                Default (unset/null) = auto: on for a GPU backend, off for
+ *                CPU, because batching measured 2.1x on an RTX 4070 Ti and
+ *                1.03x (nothing) on a 16-core CPU, while always perturbing
+ *                vectors slightly.
+ *   threads      n_threads      -- per-token decode.
+ *   threadsBatch n_threads_batch -- multi-token decode; the one embedding
+ *                uses.  -1 lets ggml pick, and ggml picks the CONSTANT 4
+ *                regardless of core count, so set this explicitly.
+ *
+ * Always returns the settings in effect after applying any changes. */
+static duk_ret_t llamacpp_embed_defaults(duk_context *ctx)
+{
+    if (duk_is_object(ctx, 0)) {
+        if (duk_get_prop_string(ctx, 0, "batchChunks")) {
+            if (duk_is_boolean(ctx, -1))     g_embed_batch_chunks = duk_get_boolean(ctx, -1) ? 0x7fffffff : 1;
+            else if (duk_is_null(ctx, -1))   g_embed_batch_chunks = -1;   /* back to auto */
+            else if (duk_is_number(ctx, -1)) g_embed_batch_chunks = duk_get_int(ctx, -1);
+            else RP_THROW(ctx, "embedDefaults: batchChunks must be a Boolean, a Number, or null");
+        }
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, 0, "batchTokens"))
+            g_embed_batch_tokens = REQUIRE_INT(ctx, -1, "embedDefaults: batchTokens must be an integer");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, 0, "threads"))
+            g_embed_threads = REQUIRE_INT(ctx, -1, "embedDefaults: threads must be an integer");
+        duk_pop(ctx);
+        if (duk_get_prop_string(ctx, 0, "threadsBatch"))
+            g_embed_threads_batch = REQUIRE_INT(ctx, -1, "embedDefaults: threadsBatch must be an integer");
+        duk_pop(ctx);
+    } else if (!duk_is_undefined(ctx, 0) && !duk_is_null(ctx, 0)) {
+        RP_THROW(ctx, "embedDefaults: argument must be an Object");
+    }
+
+    duk_push_object(ctx);
+    if (g_embed_batch_chunks < 0)            duk_push_null(ctx);   /* auto */
+    else if (g_embed_batch_chunks <= 1)      duk_push_false(ctx);
+    else if (g_embed_batch_chunks == 0x7fffffff) duk_push_true(ctx);
+    else duk_push_int(ctx, g_embed_batch_chunks);
+    duk_put_prop_string(ctx, -2, "batchChunks");
+    duk_push_int(ctx, g_embed_batch_tokens);
+    duk_put_prop_string(ctx, -2, "batchTokens");
+    duk_push_int(ctx, g_embed_threads);
+    duk_put_prop_string(ctx, -2, "threads");
+    duk_push_int(ctx, g_embed_threads_batch);
+    duk_put_prop_string(ctx, -2, "threadsBatch");
+    /* Which way `auto` will resolve on this box.  NB: ggml registers its GPU
+     * backend at the first model load, so before any model exists this reads
+     * false even on a GPU host.  The batchChunks decision itself is always
+     * made after a load (initEmbed / the first rp_embed_doc), so it is
+     * unaffected -- only this informational field can be early-false. */
+    duk_push_boolean(ctx, lt_gpu_in_use());
+    duk_put_prop_string(ctx, -2, "gpuInUse");
+    return 1;
+}
+
 #ifdef LANGTOOLS_MAIN_INCLUDE
 static duk_ret_t open_llama(duk_context *ctx)
 #else
@@ -3559,6 +3851,9 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     duk_push_c_function(ctx, llamacpp_model_info, 1);
     duk_put_prop_string(ctx, -2, "modelInfo");     // read dim/ctx/arch w/o loading weights
+
+    duk_push_c_function(ctx, llamacpp_embed_defaults, 1);
+    duk_put_prop_string(ctx, -2, "embedDefaults"); // batchChunks/threads/threadsBatch (also the sql path)
 
     duk_push_c_function(ctx, lg_init_gen, 2);
     duk_put_prop_string(ctx, -2, "__rawInitGen");   // raw per-thread slot engine (used by initGen's owner thread)

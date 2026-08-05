@@ -138,6 +138,31 @@ build and call it.
 - **`GGML_CUDA_DISABLE_GRAPHS=1`** set for the batched embed/rerank paths (~1649). Avoids a
   CUDA-graph-cache VRAM leak under many sequential embeds. Opt out: `RAMPART_LLAMA_CUDA_GRAPHS=1`.
 - `nCtx: 0/-1 => model n_ctx_train` (matches llama-server); resolved in the shim/embed builder.
+- **Batched chunk embedding (EXPERIMENTAL, `ll_decode_pooled_batch`).** A document's chunks are
+  packed as independent sequences into one `llama_decode` (chunk *j* -> `seq_id j`, positions
+  restarting at 0 per sequence, every token flagged as an output). This leans on four upstream
+  behaviors — RE-VERIFY each on upgrade:
+  1. **Variable-length packing is legal.** With `kv_unified = true`, `llama_kv_cache::init_batch`
+     picks `split_simple`, which has no equal-length requirement. If a future version routes the
+     unified path through `split_equal` instead, ragged chunks would be split across ubatches.
+  2. **Per-sequence pooled output.** `llama_get_embeddings_seq(ctx, j)` returns sequence *j*'s
+     pooled vector, and `embd_seq` is cleared at the top of the NEXT decode — so all K vectors
+     must be copied out before returning (we do).
+  3. **`n_ubatch >= n_tokens` is asserted only for NON-causal models.** For causal embedders
+     (qwen3-embedding) the assert is skipped, and a batch split across ubatches silently
+     overwrites each sequence's pooled output. `ll_batch_budget()` enforces the invariant
+     ourselves rather than relying on the assert — keep it that way.
+  4. **Positions must restart per sequence.** BERT-style models index a learned position table of
+     `n_ctx_train` rows with the raw position and do NOT clamp (`src/models/bert.cpp`), and
+     CLS/LAST pooling select by min/max position within a sequence.
+- **`batchTokens` (default 512) is a PERFORMANCE constant, not a correctness one.** No-KV encoders
+  compute attention over the whole packed batch as one NxN matrix (cross-sequence pairs are only
+  masked), so cost grows with batch tokens x model width while the overhead saved grows linearly.
+  Uncapped, bge-m3 measured **0.65x — slower than unbatched** on an RTX 4070 Ti. Note flash
+  attention is auto-probed per (model x backend) and changes this cost curve: on one 4070 Ti /
+  cu12 build, nomic and bge-m3 resolved FA **on** while bge-small (head_dim 32) resolved **off**.
+  Re-measure the optimum after an upgrade or on new hardware; `claude-work/gpu-batch-test/`
+  (`sweep.js`, `TOKENS=1`) does exactly that.
 
 ### Known non-issues (don't chase on upgrade)
 - `Qwen3-Reranker` returns 0.0 — the GGUF isn't a valid reranking conversion; the official
