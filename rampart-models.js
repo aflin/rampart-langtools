@@ -74,6 +74,7 @@
 
 var u = rampart.utils;
 var curl = require("rampart-curl");
+var crypto = require("rampart-crypto");
 
 var HF = u.getenv("HF_ENDPOINT") || "https://huggingface.co";
 
@@ -347,7 +348,30 @@ function progressEnd(prog, label, got) {
     u.fprintf(fh, "\r  %-44s done (%.1f MB)%*s\n", label, mb(got), 24, "");
 }
 
-/* download url -> dest (file).  size/sha256 optional (verified when known).
+/* normalize an expected sha256 (HF LFS oid; tolerate a "sha256:" prefix) */
+function wantSha(o) {
+    return o.sha256 ? String(o.sha256).replace(/^sha256:/i, "").toLowerCase() : null;
+}
+
+/* stream len bytes of an existing file into a HashStream, 8MB at a time */
+function hashFeedFile(h, path, len) {
+    var fh = u.fopen(path, "r"), b;
+    while (len > 0 && (b = fh.fread(Math.min(8388608, len))) && b.byteLength) {
+        h.update(b);
+        len -= b.byteLength;
+    }
+    fh.fclose();
+}
+
+/* sha256 of an existing file (verifying an already-complete .part) */
+function sha256File(path) {
+    var h = new crypto.HashStream("sha256");
+    hashFeedFile(h, path, fsize(path));
+    return h.final();
+}
+
+/* download url -> dest (file).  size/sha256 optional (verified when known;
+ * sha256 is hashed incrementally in chunkCallback -- no second read).
  * Resumes an existing dest.part; retries transient failures. */
 function fetchFile(url, dest, o) {
     o = o || {};
@@ -358,12 +382,17 @@ function fetchFile(url, dest, o) {
     if (slash > 0) u.mkDir(dest.substring(0, slash));
     var part = dest + ".part";
     var label = o.label || dest.split("/").pop();
+    var want = wantSha(o);
 
     /* a previous run may have fully downloaded the payload and died before
      * the rename (or between): finalize it instead of re-downloading */
     if (!o.force && o.size > 0 && isFile(part) && fsize(part) === o.size) {
-        u.rename(part, dest);
-        return dest;
+        if (want && sha256File(part) !== want)
+            u.rmFile(part);                            /* corrupt: re-download */
+        else {
+            u.rename(part, dest);
+            return dest;
+        }
     }
 
     for (var attempt = 0; attempt < 4; attempt++) {
@@ -378,6 +407,11 @@ function fetchFile(url, dest, o) {
             base = fsize(part);
             if (base > 0) { headers["Range"] = "bytes=" + base + "-"; mode = "a"; }
         }
+        /* hash incrementally as chunks arrive; on a resume, feed the bytes
+         * already on disk first so the digest covers the whole file */
+        var hash = want ? new crypto.HashStream("sha256") : null;
+        if (hash && base > 0)
+            hashFeedFile(hash, part, base);
         var f = u.fopen(part, mode);
         var got = base, lastDraw = 0;
         var res = { status: 0 };
@@ -390,6 +424,7 @@ function fetchFile(url, dest, o) {
             skipFinalRes: true,
             chunkCallback: function (r) {
                 f.fprintf("%s", r.body);
+                if (hash) hash.update(r.body);
                 /* count bytes ourselves: r.progress is 32-bit and wraps
                  * negative past 2GiB */
                 var n = r.body.byteLength;
@@ -418,8 +453,14 @@ function fetchFile(url, dest, o) {
             throwErr("%s: server sent Content-Encoding '%s' despite identity request -- refusing to store compressed bytes", url, enc);
         }
         if (res.status === 416) {
-            /* range past EOF: if the part is in fact complete, finalize it */
-            if (o.size > 0 && fsize(part) === o.size) { u.rename(part, dest); progressEnd(o.progress, label, o.size); return dest; }
+            /* range past EOF: if the part is in fact complete, finalize it.
+             * Re-hash from disk rather than trusting `hash`: a 416 can carry
+             * an error body that chunkCallback fed into the digest. */
+            if (o.size > 0 && fsize(part) === o.size && (!want || sha256File(part) === want)) {
+                u.rename(part, dest);
+                progressEnd(o.progress, label, o.size);
+                return dest;
+            }
             u.rmFile(part);
             continue;
         }
@@ -455,12 +496,13 @@ function fetchFile(url, dest, o) {
             if (attempt < 3) continue;                 /* resume the remainder */
             throwErr("%s: size mismatch (%d != %d)", dest, have, o.size);
         }
-        if (o.sha256) {
-            try {
-                var h = u.hashFile(part, "sha256");
-                if (typeof h === "string" && h.length === 64 && h !== o.sha256)
-                    throwErr("%s: sha256 mismatch", dest);
-            } catch (e) {}                             /* hash alg unavailable: skip */
+        if (hash) {
+            var got256 = hash.final();
+            if (got256 !== want) {
+                u.rmFile(part);                        /* never keep corrupt bytes */
+                if (attempt < 3) continue;             /* clean re-download */
+                throwErr("%s: sha256 mismatch (%s != %s)", dest, got256, want);
+            }
         }
         u.rename(part, dest);
         progressEnd(o.progress, label, have);
@@ -501,8 +543,14 @@ function getGguf(name, entry, o) {
     if (!confirmed(o, { name: name, format: "gguf", quant: q, dest: dest,
                        bytes: qi.size, size: sizeStr(qi.size), repo: g.repo }))
         return null;
+    /* the catalog carries no digest; the tree API's lfs.oid is the file's
+     * sha256.  Best-effort: an unreachable tree just skips verification. */
+    var sha = null, tree = repoTree(g.repo, o.revision || g.revision, o.token);
+    if (tree)
+        for (var ti = 0; ti < tree.length; ti++)
+            if (tree[ti].path === qi.file) { sha = tree[ti].sha256; break; }
     fetchFile(resolveUrl(g.repo, o.revision || g.revision, qi.file), dest, {
-        size: qi.size, progress: o.progress, token: o.token, force: o.force
+        size: qi.size, sha256: sha, progress: o.progress, token: o.token, force: o.force
     });
     writePromptSidecar(dest, entry);
     return dest;
@@ -601,12 +649,14 @@ function getOnnx(name, entry, o) {
 /* ------------------------------------------------------------------ *
  * resolution: catalog / repo-id / live search
  * ------------------------------------------------------------------ */
-function entryFromRepo(repo, o) {
-    /* build a catalog-shaped entry by inspecting one explicit repo */
-    var tree = repoTree(repo, o.revision, o.token);
+function entryFromRepo(repo, o, tree) {
+    /* build a catalog-shaped entry by inspecting one explicit repo.
+     * `tree` optional: a caller that already fetched the repo tree
+     * (discover) passes it in to avoid a second API call. */
+    if (!tree) tree = repoTree(repo, o.revision, o.token);
     if (!tree) throwErr("cannot list %s (typo? gated? set HF_TOKEN)", repo);
     var entry = { category: o.category || "embed" };
-    var quants = {}, model = null, hasTok = false;
+    var quants = {}, model = null;
     var QUANT_RE = /(?:^|[-_.])((?:i?q[0-9][a-z0-9_]*|mxfp[0-9][a-z0-9_]*|f16|f32|bf16|fp16|fp32))\.gguf$/i;
     for (var i = 0; i < tree.length; i++) {
         var p = tree[i].path;
@@ -616,11 +666,9 @@ function entryFromRepo(repo, o) {
         }
         if (p === "onnx/model.onnx") model = p;
         if (!model && /^[^\/]+\.onnx$/.test(p)) model = p;
-        if (p === "tokenizer.json" || p === "vocab.txt") hasTok = true;
     }
     if (Object.keys(quants).length) entry.gguf = { repo: repo, revision: o.revision, quants: quants };
-    if (model && hasTok) entry.onnx = { repo: repo, revision: o.revision, model: model };
-    else if (model) entry.onnx = { repo: repo, revision: o.revision, model: model };
+    if (model) entry.onnx = { repo: repo, revision: o.revision, model: model };
     if (!entry.gguf && !entry.onnx) throwErr("%s has no .gguf or .onnx files", repo);
     if (entry.category === "embed") {
         var p = fetchPrompts(repo, o.token);
@@ -665,7 +713,7 @@ function discover(name, o) {
         var tree = repoTree(ranked[i].id, null, o.token);
         if (!tree) continue;
         var e = null;
-        try { e = entryFromRepo(ranked[i].id, o); } catch (err) { continue; }
+        try { e = entryFromRepo(ranked[i].id, o, tree); } catch (err) { continue; }
         if (e.gguf) viable.push({ id: ranked[i].id, gguf: e.gguf,
                                   nq: Object.keys(e.gguf.quants).length });
     }
