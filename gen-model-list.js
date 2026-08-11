@@ -68,7 +68,8 @@ var CONVERTER_ORGS = [
  * (repo string pins it; null drops that format; absent = discovered) ---- */
 var OVERRIDES = {
     /* --- taxonomy gaps: models HF's pipeline tags don't surface --- */
-    "gte-multilingual-base":   { category: "embed",  onnx: "onnx-community/gte-multilingual-base", gguf: null },
+    "gte-multilingual-base":   { category: "embed",  onnx: "onnx-community/gte-multilingual-base", gguf: null,
+                                 license: "apache-2.0" },   /* mirror repo untagged */
     "snowflake-arctic-embed-m-v1.5": { category: "embed", onnx: "Snowflake/snowflake-arctic-embed-m-v1.5", gguf: "Snowflake/snowflake-arctic-embed-m-v1.5" },
     "bge-reranker-base":       { category: "rerank", onnx: "BAAI/bge-reranker-base",                 gguf: "cstr/bge-reranker-base-GGUF" },
     "bge-reranker-v2-m3":      { category: "rerank", onnx: "onnx-community/bge-reranker-v2-m3-ONNX", gguf: "gpustack/bge-reranker-v2-m3-GGUF" },
@@ -89,6 +90,63 @@ var OVERRIDES = {
     "qwen3-reranker-0.6b":     { gguf: "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF", onnx: null },
     "qwen3-reranker-4b":       { gguf: null, onnx: null },
     "qwen3-reranker-8b":       { gguf: null, onnx: null },
+    /* --- 2026-08 curated additions: gen models the last sweep predates,
+     * gguf-only, from ungated repos.  License policy (2026-08-10, Aaron):
+     * any license is acceptable as long as the files download without a
+     * login; --list shows a short license phrase so the license is
+     * visible at a glance.  Still excluded: hy3 (no trustworthy gguf
+     * conversion -- only an unaffiliated mirror), laguna-s-2.1
+     * (originating lab unidentifiable), abliterated/distill-merge
+     * variants.  ov.license overrides the repo tag where converter repos
+     * are untagged (nemotron nano-v2). --- */
+    "lfm2.5-230m":          { category: "gen", gguf: "LiquidAI/LFM2.5-230M-GGUF" },
+    "lfm2.5-1.2b-instruct": { category: "gen", gguf: "LiquidAI/LFM2.5-1.2B-Instruct-GGUF" },
+    "lfm2.5-1.2b-thinking": { category: "gen", gguf: "LiquidAI/LFM2.5-1.2B-Thinking-GGUF" },
+    "lfm2.5-2.6b":          { category: "gen", gguf: "LiquidAI/LFM2.5-2.6B-GGUF" },
+    "lfm2.5-8b-a1b":        { category: "gen", gguf: "LiquidAI/LFM2.5-8B-A1B-GGUF" },
+    "nemotron-nano-9b-v2":  { category: "gen", gguf: "bartowski/nvidia_NVIDIA-Nemotron-Nano-9B-v2-GGUF",
+                              license: "nvidia-open-model-license" },
+    "nemotron-nano-12b-v2": { category: "gen", gguf: "MaziyarPanahi/NVIDIA-Nemotron-Nano-12B-v2-GGUF",
+                              license: "nvidia-open-model-license" },
+    /* nemotron-3 license set explicitly: converter repos tag old/new
+     * nvidia license names inconsistently; nvidia's canonical repos all
+     * carry the (newer, apache-shaped) nemotron open model license */
+    "nemotron-3-nano-4b":   { category: "gen", gguf: "lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF",
+                              license: "nvidia-nemotron-open-model-license" },
+    "nemotron-3-nano-30b-a3b": { category: "gen", gguf: "unsloth/Nemotron-3-Nano-30B-A3B-GGUF",
+                              license: "nvidia-nemotron-open-model-license" },
+    "nemotron-3-super-120b-a12b": { category: "gen", gguf: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+                              license: "nvidia-nemotron-open-model-license" },
+    /* bonsai: prism-ml is the family org but famWord("bonsai") never
+     * matches it, so the sweep's owner filter drops these -- pin.
+     * ternary = BitNet-class quants; not yet load-validated on b9494. */
+    "bonsai-27b":           { category: "gen", gguf: "prism-ml/Bonsai-27B-gguf" },
+    "ternary-bonsai-8b":    { category: "gen", gguf: "prism-ml/Ternary-Bonsai-8B-gguf" },
+    "ternary-bonsai-27b":   { category: "gen", gguf: "prism-ml/Ternary-Bonsai-27B-gguf" },
+    /* embeddinggemma prompts per google's model card (query prefix +
+     * untitled-document prefix) */
+    "embeddinggemma-300m":  { category: "embed", gguf: "unsloth/embeddinggemma-300m-GGUF", onnx: null,
+                              prompts: { query: "task: search result | query: ", document: "title: none | text: " } },
+    "qwen3.5-0.8b":           { category: "gen", gguf: "unsloth/Qwen3.5-0.8B-GGUF" },
+    "qwen3.5-2b":             { category: "gen", gguf: "unsloth/Qwen3.5-2B-GGUF" },
+    "qwen3.5-27b":            { category: "gen", gguf: "unsloth/Qwen3.5-27B-GGUF" },
+    "qwen3.5-122b-a10b":      { category: "gen", gguf: "unsloth/Qwen3.5-122B-A10B-GGUF" },
+    "qwen3-1.7b":             { category: "gen", gguf: "unsloth/Qwen3-1.7B-GGUF" },
+    "qwen3-32b":              { category: "gen", gguf: "unsloth/Qwen3-32B-GGUF" },
+    "qwen3-235b-a22b":        { category: "gen", gguf: "unsloth/Qwen3-235B-A22B-GGUF" },
+    "qwen3-4b-instruct-2507": { category: "gen", gguf: "unsloth/Qwen3-4B-Instruct-2507-GGUF" },
+    "glm-5.2":                { category: "gen", gguf: "unsloth/GLM-5.2-GGUF" },
+    "deepseek-v4-flash":      { category: "gen", gguf: "unsloth/DeepSeek-V4-Flash-GGUF" },
+    "ornith-1.0-9b":          { category: "gen", gguf: "ornith-ai/Ornith-1.0-9B-GGUF" },
+    "ornith-1.0-35b":         { category: "gen", gguf: "ornith-ai/Ornith-1.0-35B-GGUF" },
+    "kat-coder-v2.5":         { category: "gen", gguf: "bartowski/Kwaipilot_KAT-Coder-V2.5-Dev-GGUF" },
+    "gemma-4-12b-it":         { category: "gen", gguf: "unsloth/gemma-4-12b-it-GGUF" },
+    "gemma-4-26b-a4b-it":     { category: "gen", gguf: "unsloth/gemma-4-26B-A4B-it-GGUF" },
+    /* nomic v2: apache MoE embedder, first-party gguf; prompts are the
+     * README-documented nomic prefixes (same as v1).  gguf-only per the
+     * 2026-08 curation pass. */
+    "nomic-embed-text-v2-moe": { category: "embed", gguf: "nomic-ai/nomic-embed-text-v2-moe-GGUF", onnx: null,
+                                 prompts: { query: "search_query: ", document: "search_document: " } },
     /* gpt-oss ships natively in MXFP4 (the MoE expert weights); ggml-org's
      * single-file MXFP4 ggufs ARE the original release.  Discovery ranks
      * unsloth's requantized ladders first (more downloads/quants), but every
@@ -104,7 +162,8 @@ var OVERRIDES = {
     "phi-4-mini-instruct":     { category: "gen", gguf: "unsloth/Phi-4-mini-instruct-GGUF" },
     "mistral-7b-instruct-v0.3":{ category: "gen", gguf: "bartowski/Mistral-7B-Instruct-v0.3-GGUF" },
     "smollm2-1.7b-instruct":   { category: "gen", gguf: "bartowski/SmolLM2-1.7B-Instruct-GGUF" },
-    "deepseek-r1-qwen-7b":     { category: "gen", gguf: "bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF" },
+    "deepseek-r1-qwen-7b":     { category: "gen", gguf: "bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF",
+                                 license: "mit" },          /* conversion repo untagged */
     "granite-3.3-8b-instruct": { category: "gen", gguf: "ibm-granite/granite-3.3-8b-instruct-GGUF" },
     "tinyllama-1.1b-chat":     { category: "gen", gguf: "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF" },
     /* --- CLIP (image+text shared space, for rampart-clip): the monatis/clip.cpp
@@ -122,6 +181,32 @@ var OVERRIDES = {
     /* --- junk / non-text models the sweeps surface --- */
     "w2v-bert-2.0": "skip",                    /* speech embedder, not text */
     "stories15m_moe": "skip",                  /* ggml-org test model */
+    /* --- 2026-08 sweep guard: high-download entries that must NOT enter
+     * the catalog.  Gguf only from unaffiliated mirrors (hy3,
+     * deepseek-v4), unidentifiable provenance (laguna), name-squatting
+     * merges (qwen3.6/3.8, deepwen), Claude-distill merges, abliterated
+     * variants, and dataset-junk (automotive). --- */
+    "hy3": "skip",                             /* tencent, apache, but only mirror ggufs */
+    "deepseek-v4": "skip",                     /* only a personal-mirror gguf; flash is pinned */
+    "laguna-s-2.1": "skip",
+    /* discovery aliases of repos already pinned under cleaner names below */
+    "nvidia-nemotron-nano-9b-v2": "skip", "nvidia-nemotron-nano-12b-v2": "skip",
+    "nvidia-nemotron-3-nano-4b": "skip", "nvidia-nemotron-3-super-120b-a12b": "skip",
+    "gemma-4-12b-agentic-fable5-composer2.5-v2-3.5x-tau2": "skip",
+    "gemma-4-12b-coder-fable5-composer2.5-v1": "skip",
+    "minicpm5-1b-claude-opus-fable5-thinking": "skip",
+    "minicpm5-1b-claude-opus-fable5-v2-thinking": "skip",
+    "parable-qwen3-4b-claude-fable-5": "skip",
+    "huihui-deepseek-v4-flash-0731-abliterated": "skip",
+    "gemma-4-12b-heretic-abliterated": "skip",
+    "qwen3.6-27b": "skip", "qwen3.8_4b_distilled": "skip", "deepwen-3.6": "skip",
+    "dolphin3-cyber-8b": "skip",
+    "automotive": "skip",
+    /* discovery's alias for the SAME bartowski repo the kat-coder-v2.5
+     * override pins -- skip the ugly duplicate */
+    "kwaipilot_kat-coder-v2.5-dev": "skip",
+    /* bartowski org_Model naming produces a dup alias of qwen3-0.6b */
+    "qwen_qwen3-0.6b": "skip",
     /* --- retrieval prompts documented only in the README (not in the
      * repo's config_sentence_transformers.json) -- exact strings, trailing
      * whitespace/colons significant.  Discovery still fills the rest of the
@@ -181,10 +266,15 @@ function apiGet(path) {
 function repoMeta(repo) {
     var j = apiGet("/api/models/" + encodeURI(repo));
     if (j._status) return null;
+    /* "other" is a placeholder tag; the real name lives in license_name
+     * (e.g. nvidia-nemotron-open-model-license, lfm1.0) -- record that */
+    var lic = (j.cardData && j.cardData.license) || null;
+    if ((!lic || lic === "other") && j.cardData && j.cardData.license_name)
+        lic = j.cardData.license_name;
     return {
         sha: j.sha,
         gated: j.gated === true || (typeof j.gated === "string" && j.gated !== "false"),
-        license: (j.cardData && j.cardData.license) || null,
+        license: lic,
         downloads: j.downloads || 0
     };
 }
@@ -293,20 +383,49 @@ function rankCandidates(alias, cands) {
 
 var QUANT_RE = /(?:^|[-_.])((?:i?q[0-9][a-z0-9_]*|mxfp[0-9][a-z0-9_]*|f16|f32|bf16|fp16|fp32))\.gguf$/i;
 
+var SPLIT_RE = /-(\d{5})-of-(\d{5})\.gguf$/i;
+
 function ggufQuants(tree) {
-    var quants = {};
+    var quants = {}, groups = {};
     for (var i = 0; i < tree.length; i++) {
         var p = tree[i].path;
         if (!/\.gguf$/i.test(p)) continue;
-        if (/-\d{5}-of-\d{5}\.gguf$/i.test(p)) continue;   /* split models */
         if (/mmproj/i.test(p)) continue;                    /* vision projectors */
+        if (/(^|\/)eagle\d*-/i.test(p)) continue;           /* EAGLE draft heads (a
+             draft's Q8_0 would win the default-quant pick over e.g. MXFP4) */
+        if (/imatrix/i.test(p) &&
+            !/[-_.](i?q[0-9]|f16|f32|bf16|fp16|fp32|mxfp[0-9])/i.test(p)) continue;
+             /* bare importance-matrix data (imatrix_unsloth.gguf, *-imatrix.gguf
+              * with no quant token); "*-q4_k-imatrix.gguf" IS a model -- kept */
         if (/[-_.](text|vision)-model[-_.]/i.test(p)) continue;  /* CLIP single-tower
              variants: keep only the two-tower _ggml-model- files (else the smaller
              text-only file would win a quant slot).  No-op for non-CLIP repos. */
+        var sm = SPLIT_RE.exec(p);
+        if (sm) {
+            /* a quant split into parts (per-file upload limits): group under
+             * the reassembled name; big repos ship every larger quant this way */
+            var gk = p.replace(SPLIT_RE, ".gguf");
+            var g = groups[gk] = groups[gk] || { parts: [], size: 0, total: parseInt(sm[2], 10) };
+            g.parts.push({ file: p, size: tree[i].size });
+            g.size += tree[i].size;
+            continue;
+        }
         var m = QUANT_RE.exec(p);
         var q = m ? m[1].toUpperCase() : "DEFAULT";
         if (!quants[q] || tree[i].size < quants[q].size)
             quants[q] = { file: p, size: tree[i].size };
+    }
+    /* fold complete split groups in as one quant each: file = first part
+     * (what llama.cpp opens), size = sum, parts = the full download list.
+     * Same smaller-file-wins rule on a key collision. */
+    for (var gk2 in groups) {
+        var g2 = groups[gk2];
+        if (g2.parts.length !== g2.total) continue;         /* incomplete upload */
+        g2.parts.sort(function (a, b) { return a.file < b.file ? -1 : 1; });
+        var m2 = QUANT_RE.exec(gk2);
+        var q2 = m2 ? m2[1].toUpperCase() : "DEFAULT";
+        if (!quants[q2] || g2.size < quants[q2].size)
+            quants[q2] = { file: g2.parts[0].file, size: g2.size, parts: g2.parts };
     }
     return Object.keys(quants).length ? quants : null;
 }
@@ -552,6 +671,8 @@ if (PIN_IX !== -1) {
             else failures.push(pname + ": pinned onnx repo unusable: " + pov.onnx);
         }
         if (pov.dim) pentry.dim = pov.dim;    /* static dim for a gguf-only model (CLIP) */
+        if (pov.license) pentry.license = pov.license;  /* model license when the
+                                                           conversion repo is untagged */
         attachPrompts(pname, pentry);
         printf("gguf:%s onnx:%s\n",
                pentry.gguf ? pentry.gguf.repo : "-",
@@ -596,6 +717,8 @@ for (var name in OVERRIDES) {
     if (ov.onnx) { var o = resolveOnnx(name, ov.onnx, null); if (o) entry.onnx = o; }
     if (ov.gguf) { var g = resolveGguf(name, ov.gguf, repoTree(ov.gguf), false); if (g) entry.gguf = g; }
     if (ov.dim) entry.dim = ov.dim;    /* static dim for a gguf-only model (e.g. CLIP) */
+    if (ov.license) entry.license = ov.license;  /* model license when the conversion
+                                                    repo is untagged */
     if (entry.onnx || entry.gguf) { attachPrompts(name, entry); catalog[name] = entry; printf("ok\n"); }
     else { printf("FAILED\n"); failures.push(name + ": override repos unusable"); }
 }
