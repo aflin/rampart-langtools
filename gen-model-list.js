@@ -154,6 +154,17 @@ var OVERRIDES = {
      * finds is F16-only.  Pin the canonical repos. */
     "gpt-oss-20b":             { category: "gen", gguf: "ggml-org/gpt-oss-20b-GGUF" },
     "gpt-oss-120b":            { category: "gen", gguf: "ggml-org/gpt-oss-120b-GGUF" },
+    /* --- churn guard (2026-08): models the download-rank sweep dropped as
+     * newer families took the top slots, pinned back deliberately -- they
+     * anchor memory tiers in downstream pickers (qwen3-30b-a3b = the 24GB
+     * recommendation).  qwen2.5-72b stays retired (superseded at that
+     * tier by qwen3-32b/qwen3.5). --- */
+    "qwen3-30b-a3b":        { category: "gen", gguf: "unsloth/Qwen3-30B-A3B-GGUF" },
+    "qwen2.5-14b-instruct": { category: "gen", gguf: "Qwen/Qwen2.5-14B-Instruct-GGUF" },
+    "qwen2.5-32b-instruct": { category: "gen", gguf: "Qwen/Qwen2.5-32B-Instruct-GGUF" },
+    /* qwen3.6: real Qwen family (apache, ungated) -- the earlier
+     * qwen3.6-27b skip covers only batiai's name-squat repo */
+    "qwen3.6-35b-a3b":      { category: "gen", gguf: "unsloth/Qwen3.6-35B-A3B-GGUF" },
     /* --- classics below the popularity window --- */
     "qwen2.5-7b-instruct":     { category: "gen", gguf: "Qwen/Qwen2.5-7B-Instruct-GGUF" },
     "gemma-3-1b-it":           { category: "gen", gguf: "ggml-org/gemma-3-1b-it-GGUF" },
@@ -207,6 +218,8 @@ var OVERRIDES = {
     "kwaipilot_kat-coder-v2.5-dev": "skip",
     /* bartowski org_Model naming produces a dup alias of qwen3-0.6b */
     "qwen_qwen3-0.6b": "skip",
+    /* discovery alias for the SAME repo the deepseek-r1-qwen-7b classic pins */
+    "deepseek-r1-distill-qwen-7b": "skip",
     /* --- retrieval prompts documented only in the README (not in the
      * repo's config_sentence_transformers.json) -- exact strings, trailing
      * whitespace/colons significant.  Discovery still fills the rest of the
@@ -381,7 +394,10 @@ function rankCandidates(alias, cands) {
     });
 }
 
-var QUANT_RE = /(?:^|[-_.])((?:i?q[0-9][a-z0-9_]*|mxfp[0-9][a-z0-9_]*|f16|f32|bf16|fp16|fp32))\.gguf$/i;
+/* the optional UD- prefix (Unsloth Dynamic) is part of the key: a UD build
+ * uses a different quantisation strategy than the plain build of the same
+ * name, and repos may ship both */
+var QUANT_RE = /(?:^|[-_.])((?:ud-)?(?:i?q[0-9][a-z0-9_]*|mxfp[0-9][a-z0-9_]*|f16|f32|bf16|fp16|fp32))\.gguf$/i;
 
 var SPLIT_RE = /-(\d{5})-of-(\d{5})\.gguf$/i;
 
