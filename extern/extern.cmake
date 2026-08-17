@@ -2,7 +2,20 @@ set(EXTERN_DIR ${CMAKE_SOURCE_DIR}/extern)
 
 # LLAMA.CPP
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+# NOTE: LLAMA_CURL is gone -- llama.cpp dropped libcurl for its own vendored
+# cpp-httplib (built from source in extern/llama.cpp/vendor), so there is nothing
+# to switch off.  It has been deprecated since at least b9494, so the old
+# set(LLAMA_CURL OFF) here was a no-op that only tripped llama_option_depr().
+
+# Upstream defaults LLAMA_OPENSSL=ON (also true at b9494 -- long-standing, not new),
+# so on a builder that has OpenSSL it runs find_package(OpenSSL) and links
+# OpenSSL::SSL/::Crypto into libcpp-httplib.a.  We never reference libcommon's
+# download.cpp, so nothing pulls that archive into our .so and no libssl appears
+# in ldd -- but if that ever changed we would silently acquire a system OpenSSL 3
+# runtime dependency, which the 2_17/2_28 tiers, macOS and FreeBSD cannot all
+# satisfy.  Off means the trap can't spring, and skips a pointless find_package.
+# (rampart does its own HTTP.)
+set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 
 # Build ggml WITHOUT OpenMP so it uses its own pthread threadpool. We run llama
 # inference on a dedicated worker thread (the generation engine); macOS libomp

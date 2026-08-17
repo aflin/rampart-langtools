@@ -885,8 +885,21 @@ static void parse_common_opts(duk_context *ctx, duk_idx_t o,
     duk_pop(ctx);
     if (duk_get_prop_string(ctx, o, "mainGpu"))   mp->main_gpu     = REQUIRE_INT(ctx, -1, "mainGpu must be an integer");
     duk_pop(ctx);
-    if (lt_opt_bool2(ctx, o, "useMmap",      NULL, "useMmap must be boolean",      &b)) mp->use_mmap      = b;
-    if (lt_opt_bool2(ctx, o, "useMlock",     NULL, "useMlock must be boolean",     &b)) mp->use_mlock     = b;
+    /* b10446 replaced the independent use_mmap/use_mlock booleans with a single
+     * load_mode enum.  Keep the JS option names and fold them back into it.
+     * LLAMA_LOAD_MODE_AUTO already resolves to (mmap on, mlock off) -- exactly
+     * the old defaults -- so only override it when the script asked for
+     * something, which also preserves llama.cpp's "auto" load-mode log line. */
+    {
+        int mmap_set = 0, mlock_set = 0, want_mmap = 1, want_mlock = 0;
+        if (lt_opt_bool2(ctx, o, "useMmap",  NULL, "useMmap must be boolean",  &b)) { mmap_set  = 1; want_mmap  = b; }
+        if (lt_opt_bool2(ctx, o, "useMlock", NULL, "useMlock must be boolean", &b)) { mlock_set = 1; want_mlock = b; }
+        if (mmap_set || mlock_set) {
+            mp->load_mode = want_mmap
+                ? (want_mlock ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MMAP)
+                : (want_mlock ? LLAMA_LOAD_MODE_MLOCK      : LLAMA_LOAD_MODE_NONE);
+        }
+    }
     if (lt_opt_bool2(ctx, o, "checkTensors", NULL, "checkTensors must be boolean", &b)) mp->check_tensors = b;
     if (duk_get_prop_string(ctx, o, "splitMode")) {
         const char *s = REQUIRE_STRING(ctx, -1, "splitMode must be a string (none|layer|row)");

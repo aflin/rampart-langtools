@@ -1,0 +1,45 @@
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -356,8 +356,6 @@
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+ 
+-        GGML_ASSERT(buf_dst);
+-
+         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
+         if (bid_src.metal == nil) {
+             GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
+@@ -371,6 +369,33 @@
+         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+ 
++        if (buf_dst == nil) {
++            // rampart-langtools: macOS 11 returns nil from newBufferWithBytesNoCopy
++            // for non-page-aligned host memory (macOS 12+ tolerates it).  Upstream
++            // then GGML_ASSERTs and kills the process -- this is why embed()/rerank()
++            // die on macOS 11.  Fall back to a Metal-owned staging buffer: blit into
++            // it, wait, then memcpy the result back to `data`.  Synchronous (vs the
++            // zero-copy async path), but get_tensor is a tail op so correctness wins.
++            id<MTLBuffer> buf_tmp = [device newBufferWithLength:size
++                                                       options:MTLResourceStorageModeShared];
++            GGML_ASSERT(buf_tmp);
++
++            [encoder copyFromBuffer:bid_src.metal
++                       sourceOffset:bid_src.offs
++                           toBuffer:buf_tmp
++                  destinationOffset:0
++                               size:size];
++
++            [encoder endEncoding];
++            [cmd_buf commit];
++            [cmd_buf waitUntilCompleted];
++
++            memcpy(data, [buf_tmp contents], size);
++            [buf_tmp release];
++
++            return;
++        }
++
+         [encoder copyFromBuffer:bid_src.metal
+                    sourceOffset:bid_src.offs
+                        toBuffer:buf_dst

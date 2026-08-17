@@ -427,8 +427,8 @@ llama_model *model_acquire_path(const char *path, const llama_model_params *mp,
     /* key on path + every load param that changes the resulting model, so two
      * engines differing in GPU offload / split don't wrongly share one model. */
     char flags[96];
-    snprintf(flags, sizeof flags, "|%d%d%d|ngl%d|sm%d|mg%d",
-             mp->use_mmap ? 1 : 0, mp->use_mlock ? 1 : 0, mp->check_tensors ? 1 : 0,
+    snprintf(flags, sizeof flags, "|lm%d|ct%d|ngl%d|sm%d|mg%d",
+             (int) mp->load_mode, mp->check_tensors ? 1 : 0,
              mp->n_gpu_layers, (int) mp->split_mode, mp->main_gpu);
     std::string key = std::string(path) + flags;
     for (auto &e : g_model_cache)

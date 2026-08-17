@@ -665,7 +665,18 @@ class Gemma4Model(Gemma3Model):
         swa_layers = [t == "sliding_attention" for t in self.hparams["layer_types"]]
         self.gguf_writer.add_sliding_window_pattern(swa_layers)
 
-        head_dim_full = self.hparams["global_head_dim"]
+        per_layer_config = self.hparams.get("per_layer_config")
+        layer_types = self.hparams.get("layer_types", [])
+        if (head_dim_full := self.hparams.get("global_head_dim")) is None and per_layer_config is not None:
+            for layer_idx, layer_config in per_layer_config.items():
+                layer_idx = int(layer_idx)
+                if layer_idx < len(layer_types):
+                    if layer_types[layer_idx] == "full_attention" and "head_dim" in layer_config:
+                        head_dim_full = layer_config["head_dim"]
+                        break
+
+        assert head_dim_full is not None
+
         head_dim_swa = self.hparams["head_dim"]
         # correct the head dim for global/swa layers
         self.gguf_writer.add_key_length(head_dim_full)
@@ -685,15 +696,21 @@ class Gemma4Model(Gemma3Model):
             n_ff_arr = [n_ff if il < first_kv_shared_layer_idx else n_ff * 2 for il in range(self.block_count)]
             self.gguf_writer.add_feed_forward_length(n_ff_arr)
 
-        # handle num_global_key_value_heads
-        num_key_value_heads_full = self.hparams.get("num_global_key_value_heads")
+        if (num_key_value_heads_full := self.hparams.get("num_global_key_value_heads")) is None and per_layer_config is not None:
+            for layer_idx, layer_config in per_layer_config.items():
+                layer_idx = int(layer_idx)
+                if layer_idx < len(layer_types):
+                    if layer_types[layer_idx] == "full_attention" and "num_key_value_heads" in layer_config:
+                        num_key_value_heads_full = layer_config["num_key_value_heads"]
+                        break
+
         num_key_value_heads_swa = self.hparams.get("num_key_value_heads")
         if num_key_value_heads_full is not None and num_key_value_heads_swa is not None:
             value_arr = [num_key_value_heads_swa if is_swa else num_key_value_heads_full for is_swa in swa_layers]
             self.gguf_writer.add_head_count_kv(value_arr)
 
         # handle n_rot differently for global vs swa layers
-        partial_rotary_factor_swa = self.hparams.get("partial_rotary_factor", 1.0)
+        partial_rotary_factor_swa = self.rope_parameters.get("partial_rotary_factor", 1.0)
         n_rot_full = int(head_dim_full) # "proportional" is used, see generate_extra_tensors
         n_rot_swa = int(head_dim_swa * partial_rotary_factor_swa)
         self.gguf_writer.add_rope_dimension_count(n_rot_full)
@@ -708,7 +725,19 @@ class Gemma4Model(Gemma3Model):
         # IMPORTANT: this ROPE_FREQS tensor is ONLY used by the full_attention layers
         rope_params_full = self.hparams["rope_parameters"]["full_attention"]
         assert rope_params_full["rope_type"] == "proportional"
-        head_dim_full = (self.hparams["global_head_dim"])
+
+        per_layer_config = self.hparams.get("per_layer_config")
+        if (head_dim_full := self.hparams.get("global_head_dim")) is None and per_layer_config is not None:
+            layer_types = self.hparams.get("layer_types", [])
+            for layer_idx, layer_config in per_layer_config.items():
+                layer_idx = int(layer_idx)
+                if layer_idx < len(layer_types):
+                    if layer_types[layer_idx] == "full_attention" and "head_dim" in layer_config:
+                        head_dim_full = layer_config["head_dim"]
+                        break
+
+        assert head_dim_full is not None
+
         partial_rotary_factor_full = rope_params_full["partial_rotary_factor"]
         n_rot_full = int(head_dim_full * partial_rotary_factor_full / 2)
         n_unrot_full = int(head_dim_full / 2) - n_rot_full
@@ -785,6 +814,26 @@ class Gemma4UnifiedModel(Gemma4Model):
             self.gguf_writer.add_suppress_tokens(suppress_tokens)
 
 
+@ModelBase.register("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
+class Gemma4AssistantModel(Gemma4Model):
+    model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        if "masked_embedding" in name:
+            logger.debug(f"Skipping get tensor {name!r} in safetensors so that convert can end normally.")
+            return None
+
+        return super().filter_tensors(item)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_embedding_length_out(self.hparams["backbone_hidden_size"])
+        self.gguf_writer.add_nextn_predict_layers(self.block_count)
+
+
 @ModelBase.register("Gemma4ForConditionalGeneration")
 class Gemma4VisionAudioModel(MmprojModel):
     has_audio_encoder = True
@@ -798,7 +847,8 @@ class Gemma4VisionAudioModel(MmprojModel):
         # remap audio hparams
         if self.hparams_audio:
             self.hparams_audio["feat_in"] = self.hparams_audio.get("input_feat_size", 128)
-            self.hparams_audio["intermediate_size"] = self.hparams_audio["hidden_size"] * 4
+            if "hidden_size" in self.hparams_audio:
+                self.hparams_audio["intermediate_size"] = self.hparams_audio["hidden_size"] * 4
         else:
             self.has_audio_encoder = False
 
@@ -811,10 +861,11 @@ class Gemma4VisionAudioModel(MmprojModel):
         self.gguf_writer.add_vision_attention_layernorm_eps(self.hparams_vision.get("layer_norm_eps", 1e-6))
 
         # audio params
-        assert self.hparams_audio is not None
-        self.gguf_writer.add_clip_audio_projector_type(gguf.VisionProjectorType.GEMMA4A)
-        self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["feat_in"])
-        self.gguf_writer.add_audio_attention_layernorm_eps(self.hparams_audio.get("layer_norm_eps", 1e-6))
+        if self.has_audio_encoder:
+            assert self.hparams_audio is not None
+            self.gguf_writer.add_clip_audio_projector_type(gguf.VisionProjectorType.GEMMA4A)
+            self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["feat_in"])
+            self.gguf_writer.add_audio_attention_layernorm_eps(self.hparams_audio.get("layer_norm_eps", 1e-6))
 
     def is_audio_tensor(self, name: str) -> bool:
         return "audio_tower" in name or "embed_audio" in name
@@ -872,7 +923,7 @@ class Gemma4UnifiedVisionAudioModel(Gemma4VisionAudioModel):
         assert self.hparams_audio is not None
         text_embd_dim = self.hparams_vision["mm_embed_dim"]
         self.hparams_vision["hidden_size"] = text_embd_dim
-        self.hparams_audio["hidden_size"] = text_embd_dim
+        self.hparams_audio["hidden_size"] = self.hparams_audio["audio_embed_dim"]
         # this is a transformer-less vision tower, the params below are redundant but set to avoid error
         self.hparams_vision["intermediate_size"] = 0
         self.hparams_vision["num_layers"] = 0
@@ -897,7 +948,10 @@ class Gemma4UnifiedVisionAudioModel(Gemma4VisionAudioModel):
             # ggml im2col outputs in RR..GG..BB.. (CHW) order, but weight expects RGBRGB.. (HWC).
             # Permute columns so column i aligns with CHW input position i.
             assert self.hparams_vision is not None
-            p = self.hparams_vision["model_patch_size"]
+            if "model_patch_size" in self.hparams_vision:
+                p = self.hparams_vision["model_patch_size"]
+            else:
+                p = self.hparams_vision["patch_size"] * self.hparams_vision["pooling_kernel_size"]
             i = torch.arange(p * p * 3)
             ch  = i // (p * p)
             row = (i % (p * p)) // p
@@ -908,7 +962,10 @@ class Gemma4UnifiedVisionAudioModel(Gemma4VisionAudioModel):
         elif "patch_ln1.weight" in name or "patch_ln1.bias" in name:
             # same permutation for patch_ln1 as patch_dense to align with CHW input order
             assert self.hparams_vision is not None
-            p = self.hparams_vision["model_patch_size"]
+            if "model_patch_size" in self.hparams_vision:
+                p = self.hparams_vision["model_patch_size"]
+            else:
+                p = self.hparams_vision["patch_size"] * self.hparams_vision["pooling_kernel_size"]
             i = torch.arange(p * p * 3)
             ch  = i // (p * p)
             row = (i % (p * p)) // p
