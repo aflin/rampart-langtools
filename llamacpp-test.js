@@ -19,6 +19,9 @@ rampart.globalize(rampart.utils);
    require auto-appends the .so extension. */
 function loadModule() {
     var sp = process.scriptPath;
+    /* LTMOD lets the suite run against an arbitrary build dir (e.g. build-cpu/,
+       whose name the list below does not match) without copying the .so around */
+    if (process.env.LTMOD) { try { return require(process.env.LTMOD); } catch(e) {} }
     var tries = [
         sp + '/build/rampart-llamacpp',
         sp + '/build_gpu/rampart-llamacpp',
@@ -215,7 +218,133 @@ function runGenTest(done) {
 }
 
 /* ================================================================
-   run: embedding (sync), then generation (async tail), then summary
+   Test: tool calling (initGen + tools)
+   ================================================================ */
+var TOOL_MARKUP = /<tool_call|<tool_code|functools|<\|tool/;
+var TOOLS = [{
+    type: "function",
+    function: {
+        name: "keep_search",
+        description: "Search the document collection for a phrase.",
+        parameters: { type: "object",
+                      properties: { query: { type: "string" } },
+                      required: ["query"] }
+    }
+}];
+
+function runToolTest(done) {
+    printf("\n--- tool calling (initGen + tools) ---\n");
+    var path = obtain(MODELS.gen);
+    if (!path) { printf("- skipped\n"); return done(); }
+
+    /* threads: gen defaults to n_threads=1, which makes a tool request (larger
+       prompt + a full call) exceed the batched coordinator's 120s thread.get
+       deadline on many machines.  4 is llama.cpp's own default and is safe
+       anywhere. */
+    var gen = null;
+    try { gen = llamacpp.initGen(path, { nCtx: 2048, nSeqMax: 2, threads: 4 }); }
+    catch (e) { printf("- unsupported: %s\n", String(e.message || e)); return done(); }
+
+    /* Capability reporting: no upstream query exists, so the module probes the
+       template at initGen time. */
+    testFeature("gen reports supportsTools / chatFormat", function() {
+        return typeof gen.supportsTools === 'boolean' && typeof gen.chatFormat === 'string';
+    });
+    if (!gen.supportsTools) {
+        printf("  model's template has no tool support; tool tests skipped\n");
+        testFeature("tools on a toolless template throw", function() {
+            try { gen.predict({ messages:[{role:"user",content:"hi"}], tools: TOOLS, maxTokens: 8 }); }
+            catch (e) { return true; }
+            return false;
+        });
+        try { gen.destroy(); } catch(e) {}
+        return done();
+    }
+
+    var r = gen.predict({
+        messages: [{ role: "user", content: "Search the collection for documents about HTTP/1.1." }],
+        tools: TOOLS, maxTokens: 128, temp: 0
+    });
+
+    testFeature("predict with tools returns a structured Object", function() {
+        return typeof r === 'object' && r !== null && typeof r.fullText === 'string';
+    });
+    testFeature("a tool call is produced", function() { return !!(r.toolCalls && r.toolCalls.length); });
+    testFeature("call names the supplied tool", function() {
+        return r.toolCalls && r.toolCalls[0].function.name === 'keep_search';
+    });
+    testFeature("call arguments parse as JSON", function() {
+        if (!r.toolCalls) return false;
+        var a = JSON.parse(r.toolCalls[0].function.arguments);
+        return a !== null && typeof a === 'object';
+    });
+    testFeature("call has an id and type", function() {
+        return r.toolCalls && typeof r.toolCalls[0].id === 'string' && r.toolCalls[0].id.length > 0
+               && r.toolCalls[0].type === 'function';
+    });
+    testFeature("finishReason is tool_calls", function() { return r.finishReason === 'tool_calls'; });
+    /* the regression this whole feature exists to prevent */
+    testFeature("no tool markup leaks into fullText", function() {
+        return !TOOL_MARKUP.test(r.fullText || '');
+    });
+
+    testFeature("tool loop closes (assistant+tool turns round-trip)", function() {
+        if (!r.toolCalls) return false;
+        var r2 = gen.predict({ messages: [
+            { role: "user", content: "Search the collection for documents about HTTP/1.1." },
+            { role: "assistant", content: "", tool_calls: r.toolCalls },
+            { role: "tool", tool_call_id: r.toolCalls[0].id, name: "keep_search",
+              content: "Found 3 documents mentioning HTTP/1.1." }
+        ], tools: TOOLS, maxTokens: 48, temp: 0 });
+        return !r2.toolCalls && (r2.fullText || '').length > 0;
+    });
+
+    /* With toolChoice:"none" upstream renders the tools but disables tool
+       PARSING, so the contract we can assert is that no structured call comes
+       back.  A small model that parrots the template's own example emits it as
+       ordinary content; that is model quality, and per the design notes we do
+       not paper over it with a regex in the module. */
+    testFeature("toolChoice:'none' returns no structured calls", function() {
+        var r3 = gen.predict({
+            messages: [{ role: "user", content: "Search the collection for documents about HTTP/1.1." }],
+            tools: TOOLS, toolChoice: "none", maxTokens: 32, temp: 0 });
+        return !r3.toolCalls && typeof r3.fullText === 'string';
+    });
+
+    /* toolChoice:"required" is passed through as COMMON_CHAT_TOOL_CHOICE_REQUIRED
+       and upstream does build a non-lazy tool-calls grammar for it -- but as of
+       b10446 that grammar is not enforced during sampling (reproducible with no
+       rampart code at all).  Assert only that the request is accepted, so this
+       test starts telling us something the day upstream enforces it. */
+    testFeature("toolChoice:'required' is accepted", function() {
+        var r4 = gen.predict({ messages: [{ role: "user", content: "Say hello." }],
+                               tools: TOOLS, toolChoice: "required", maxTokens: 32, temp: 0 });
+        return typeof r4 === 'object' && r4 !== null;
+    });
+
+    testFeature("without tools, predict still returns a String", function() {
+        var r5 = gen.predict({ messages: [{ role: "user", content: "Say hi." }], maxTokens: 8 });
+        return typeof r5 === 'string';
+    });
+
+    /* streaming must deliver content only -- never the tool-call markup */
+    var streamed = "";
+    gen.predictAsync(
+        { messages: [{ role: "user", content: "Search the collection for documents about HTTP/1.1." }],
+          tools: TOOLS, maxTokens: 64, temp: 0 },
+        function(t) { if (!t.done && !t.error && t.token) streamed += t.token; },
+        function(res) {
+            testFeature("streamed tokens contain no tool markup", !TOOL_MARKUP.test(streamed));
+            testFeature("streamed text equals fullText", streamed === (res.fullText || ''));
+            testFeature("streamed request still reports the call", !!(res.toolCalls && res.toolCalls.length));
+            try { gen.destroy(); } catch(e) {}
+            done();
+        }
+    );
+}
+
+/* ================================================================
+   run: embedding (sync), then generation, then tools (async tails)
    ================================================================ */
 function finish() {
     printf("\nllamacpp: %d tests run, %d failed\n", testnum, failed);
@@ -223,11 +352,12 @@ function finish() {
 }
 
 runEmbedTest();
-runGenTest(finish);   // when gen is skipped/unavailable, done() == finish() runs now;
-                      // otherwise finish() runs from the streaming callback after the loop drains.
+runGenTest(function(){ runToolTest(finish); });
+                      // when gen is skipped/unavailable, done() runs now; otherwise
+                      // it runs from the streaming callback after the loop drains.
 
 /* safety net: never hang forever */
 setTimeout(function() {
-    printf("\nllamacpp: GLOBAL TIMEOUT - tests did not complete in 180 seconds\n");
+    printf("\nllamacpp: GLOBAL TIMEOUT - tests did not complete in 600 seconds\n");
     process.exit(1);
-}, 180000);
+}, 600000);

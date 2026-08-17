@@ -57,16 +57,36 @@ enum {
     LGEN_FINISH_EOG    = 1, /* end-of-generation token               */
     LGEN_FINISH_LENGTH = 2, /* hit maxTokens or context limit        */
     LGEN_FINISH_CANCEL = 3, /* cancelled via lgen_session_cancel      */
-    LGEN_FINISH_ERROR  = 4  /* error; see err string in lgen_on_done  */
+    LGEN_FINISH_ERROR  = 4, /* error; see err string in lgen_on_done  */
+    LGEN_FINISH_TOOL_CALLS = 5 /* stopped normally AND emitted tool calls */
 };
+
+/* ---- tool-call choice (mirrors common_chat_tool_choice) ---- */
+enum {
+    LGEN_TOOL_CHOICE_AUTO     = 0,
+    LGEN_TOOL_CHOICE_REQUIRED = 1,
+    LGEN_TOOL_CHOICE_NONE     = 2
+};
+
+/* Extra results produced by the chat parser, handed to lgen_on_done.
+ * Passed as a struct pointer (not extra args) so future parser outputs can be
+ * added without touching every callback signature again.  Both strings are
+ * owned by the shim and valid only for the duration of the callback. */
+typedef struct {
+    const char *tool_calls_json; /* OpenAI-shape JSON array; NULL if no calls   */
+    const char *reasoning;       /* reasoning_content; NULL if none            */
+    size_t      reasoning_len;
+} lgen_result_extra;
 
 /* ---- callbacks (invoked synchronously inside lgen_engine_step, ON the calling
  * thread, where duktape is valid) ----
  * ud is the per-request userdata passed to lgen_engine_submit; the C side uses
- * it to trampoline into the JS piece/done callbacks. */
+ * it to trampoline into the JS piece/done callbacks.
+ * `extra` is never NULL, but its members may be. */
 typedef void (*lgen_on_piece)(void *ud, const char *piece, size_t len);
 typedef void (*lgen_on_done)(void *ud, int status, const char *err,
-                             int finish_reason, const char *full_text, size_t full_len);
+                             int finish_reason, const char *full_text, size_t full_len,
+                             const lgen_result_extra *extra);
 
 /* ---- engine creation params ----
  * The model/context options are the real llama structs, filled by the single
@@ -92,6 +112,14 @@ typedef struct {
     const char *messages_json;   /* JSON array [{role,content},...] parsed in shim */
     const char *chat_template;   /* NULL = model default                          */
     int         add_assistant;   /* bool                                          */
+
+    /* tool calling.  tools_json is an OpenAI-shape JSON array, parsed in the shim
+     * by common_chat_tools_parse_oaicompat; NULL/empty = no tools.  Only honoured
+     * when the engine was created with use_jinja (the template fields carrying
+     * tools are jinja-only upstream). */
+    const char *tools_json;
+    int         tool_choice;          /* LGEN_TOOL_CHOICE_*                        */
+    int         parallel_tool_calls;  /* bool                                      */
 
     /* sampling (maps onto common_params_sampling) */
     int    max_tokens;
@@ -124,6 +152,13 @@ void         lgen_engine_free(lgen_engine *e);   /* frees context + model (call 
 /* informational */
 uint32_t     lgen_engine_n_ctx(lgen_engine *e);
 int32_t      lgen_engine_n_vocab(lgen_engine *e);
+/* 1 if the loaded model's chat template renders tool definitions.  Determined at
+ * create time by applying the template with a probe tool -- there is no upstream
+ * capability query.  0 also when use_jinja is off (tools are jinja-only). */
+int          lgen_engine_supports_tools(lgen_engine *e);
+/* human-readable chat format of the loaded template, e.g. "Hermes 2 Pro".
+ * Never NULL; "" if unknown. Owned by the engine. */
+const char  *lgen_engine_chat_format(lgen_engine *e);
 
 /* ---- driving the engine (all ON the owning thread) ----
  * submit: deep-copy + enqueue a request; returns id (>0) or 0 on error (errbuf).

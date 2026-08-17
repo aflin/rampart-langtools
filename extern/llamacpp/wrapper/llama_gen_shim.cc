@@ -54,6 +54,11 @@ struct gen_request {
     std::string chat_template;
     int         add_assistant = 1;
 
+    /* tool calling (OpenAI-shape JSON, parsed in apply_templates) */
+    std::string tools_json;
+    int         tool_choice = LGEN_TOOL_CHOICE_AUTO;
+    bool        parallel_tool_calls = false;
+
     int    max_tokens = 512;
     float  temp = -1, top_p = -1, min_p = -1, typ_p = -1;
     int    top_k = 0;
@@ -94,6 +99,16 @@ struct gen_slot {
     bool         has_next_token = true;
     int          finish_reason  = LGEN_FINISH_EOG;
 
+    /* ---- chat-parser state (tool calling / reasoning).
+     * `parsing` is the switch between the two streaming disciplines: false keeps
+     * the original byte-offset path (n_sent) exactly as it was, true uses
+     * incremental common_chat_parse + compute_diffs.  It is only true when the
+     * template produced a non-trivial format, so a plain prompt/messages request
+     * is byte-for-byte unchanged from before tool calling existed. */
+    bool                     parsing = false;
+    common_chat_parser_params parser_params;
+    common_chat_msg          prev_msg;   /* last successfully parsed partial */
+
     lgen_on_piece on_piece = nullptr;
     lgen_on_done  on_done  = nullptr;
     void         *ud       = nullptr;
@@ -127,6 +142,8 @@ struct lgen_engine {
     llama_batch    batch{};
     std::vector<gen_slot> slots;
     common_chat_templates_ptr templates;
+    bool        supports_tools = false; /* probed at create; see probe_tool_support */
+    std::string chat_format;            /* format name of a plain (toolless) apply  */
     bool     add_bos = false;
     uint32_t n_ctx = 0;
     uint32_t n_batch = 0;
@@ -171,12 +188,40 @@ static size_t find_stopping_strings(gen_slot &slot, const std::string &text,
     return stop_pos;
 }
 
+/* chat-parser adapter (defined further down, next to the rest of the
+ * common_chat_* contact -- see "chat-template / tool-call adapter") */
+static std::string stream_content_delta(gen_slot &slot);
+static void        parse_final(gen_slot &slot, std::string &content,
+                               std::string &tool_calls_json, std::string &reasoning);
+
 /* fully reset the slot BEFORE firing on_done (idempotent / re-entrancy safe) */
 static void slot_finish(lgen_engine *e, gen_slot &slot, int status, const char *err) {
     if (slot.state == SLOT_IDLE) return;
     lgen_on_done on_done = slot.on_done;
     void        *ud      = slot.ud;
     int          reason  = slot.finish_reason;
+
+    /* Final parse BEFORE the slot is reset: strips tool-call markup out of the
+     * text the caller sees and yields the structured calls.  Non-parsing
+     * requests keep exactly the old behaviour (raw generated text). */
+    std::string content, tool_calls_json, reasoning;
+    lgen_result_extra extra{};
+    const char *full     = slot.generated.data();
+    size_t      full_len = slot.generated.size();
+    if (slot.parsing && status == 0) {
+        parse_final(slot, content, tool_calls_json, reasoning);
+        full     = content.data();
+        full_len = content.size();
+        if (!tool_calls_json.empty()) {
+            extra.tool_calls_json = tool_calls_json.c_str();
+            if (reason == LGEN_FINISH_EOG || reason == LGEN_FINISH_STOP)
+                reason = LGEN_FINISH_TOOL_CALLS;
+        }
+        if (!reasoning.empty()) {
+            extra.reasoning     = reasoning.c_str();
+            extra.reasoning_len = reasoning.size();
+        }
+    }
 
     if (slot.smpl) { common_sampler_free(slot.smpl); slot.smpl = nullptr; }
     llama_memory_seq_rm(llama_get_memory(e->ctx), slot.id, -1, -1);
@@ -186,7 +231,7 @@ static void slot_finish(lgen_engine *e, gen_slot &slot, int status, const char *
     slot.req_id   = 0;
     slot.state    = SLOT_IDLE;
 
-    if (on_done) on_done(ud, status, err, reason, slot.generated.data(), slot.generated.size());
+    if (on_done) on_done(ud, status, err, reason, full, full_len, &extra);
 }
 
 static bool process_token(lgen_engine *e, gen_slot &slot, llama_token id, const std::string &piece) {
@@ -208,9 +253,26 @@ static bool process_token(lgen_engine *e, gen_slot &slot, llama_token id, const 
             send_text = (stop_pos == std::string::npos);
         }
         if (send_text) {
-            const std::string to_send = slot.generated.substr(pos);
-            slot.n_sent += to_send.size();
-            if (!to_send.empty() && slot.on_piece) slot.on_piece(slot.ud, to_send.data(), to_send.size());
+            if (slot.parsing && slot.on_piece) {
+                /* Tool-call syntax is generated as ordinary tokens, so the raw
+                 * stream would leak exactly the markup we exist to remove.
+                 * Emit only the parser's content delta; tool-call and reasoning
+                 * text is withheld and delivered structured at completion.
+                 *
+                 * Only when someone is actually streaming: this re-parses the
+                 * whole generated string per token (quadratic, and the PEG
+                 * parser is not cheap), which is pure waste for predict(), where
+                 * the single parse in slot_finish is all that is needed. */
+                const std::string delta = stream_content_delta(slot);
+                slot.n_sent = slot.generated.size();
+                if (!delta.empty()) slot.on_piece(slot.ud, delta.data(), delta.size());
+            } else if (slot.parsing) {
+                slot.n_sent = slot.generated.size();   /* parsed once, at finish */
+            } else {
+                const std::string to_send = slot.generated.substr(pos);
+                slot.n_sent += to_send.size();
+                if (!to_send.empty() && slot.on_piece) slot.on_piece(slot.ud, to_send.data(), to_send.size());
+            }
         }
     }
     if (slot.n_decoded > 0 && slot.has_next_token &&
@@ -237,43 +299,266 @@ static common_params_sampling sampling_from_req(const gen_request *req) {
     return sp;
 }
 
-static std::string build_prompt(lgen_engine *e, const gen_request *req) {
-    common_chat_templates_inputs in;
-    in.use_jinja = e->use_jinja;
-    in.add_generation_prompt = req->add_assistant ? true : false;
-    if (req->has_messages) {
-        json arr = json::parse(req->messages_json, nullptr, false);
-        if (arr.is_array()) {
-            for (auto &m : arr) {
-                common_chat_msg msg;
-                msg.role    = m.value("role", std::string("user"));
-                msg.content = m.value("content", std::string(""));
-                in.messages.push_back(std::move(msg));
-            }
-        }
-    } else {
-        common_chat_msg sys; sys.role = "system"; sys.content = "You are a helpful assistant";
-        common_chat_msg usr; usr.role = "user";   usr.content = req->prompt;
-        in.messages.push_back(std::move(sys));
-        in.messages.push_back(std::move(usr));
+/* ==================== chat-template / tool-call adapter =====================
+ *
+ * ALL common_chat_* contact lives in this section, deliberately: it is the
+ * fastest-churning API in llama.cpp, and keeping it in one block means the next
+ * vendor bump has exactly one place to fix (see extern/llamacpp-vendoring.md,
+ * "Re-vendoring procedure").  Do not scatter these calls back into start_slot /
+ * process_token.
+ *
+ * Nothing here may let a C++ exception escape: every entry point is called from
+ * code that is ultimately reached through the extern "C" ABI.
+ * ========================================================================== */
+
+/* Lenient message parsing, preserving the pre-tool-calling behaviour: role
+ * defaults to "user", content to "", unknown fields ignored.  Used as a fallback
+ * when the strict oaicompat parser rejects input that used to be accepted. */
+static void msgs_parse_lenient(const json &arr, std::vector<common_chat_msg> &out) {
+    if (!arr.is_array()) return;
+    for (auto &m : arr) {
+        common_chat_msg msg;
+        msg.role    = m.value("role", std::string("user"));
+        msg.content = m.value("content", std::string(""));
+        out.push_back(std::move(msg));
     }
-    common_chat_params p = common_chat_templates_apply(e->templates.get(), in);
-    return p.prompt;
+}
+
+struct applied_prompt {
+    bool                ok = false;
+    std::string         err;
+    std::string         prompt;
+    common_chat_params  params;
+    bool                parsing = false;  /* run the chat parser over the output */
+};
+
+/* Apply the chat template, keeping the WHOLE common_chat_params (grammar, stops,
+ * parser, format) rather than just the prompt string. */
+static applied_prompt apply_templates(lgen_engine *e, const gen_request *req) {
+    applied_prompt out;
+    try {
+        common_chat_templates_inputs in;
+        in.use_jinja             = e->use_jinja;
+        in.add_generation_prompt = req->add_assistant ? true : false;
+
+        if (req->has_messages) {
+            json arr = json::parse(req->messages_json, nullptr, false);
+            if (arr.is_discarded()) { out.err = "messages is not valid JSON"; return out; }
+            /* Prefer the upstream OpenAI-shape parser: it round-trips tool_calls,
+             * tool_call_id, tool_name and reasoning_content, which an agent loop
+             * must feed back.  It is stricter than the old lenient loop, so fall
+             * back on rejection rather than breaking existing callers. */
+            try {
+                in.messages = common_chat_msgs_parse_oaicompat(arr);
+            } catch (const std::exception &) {
+                in.messages.clear();
+                msgs_parse_lenient(arr, in.messages);
+            }
+            if (in.messages.empty()) { out.err = "messages array is empty"; return out; }
+        } else {
+            common_chat_msg sys; sys.role = "system"; sys.content = "You are a helpful assistant";
+            common_chat_msg usr; usr.role = "user";   usr.content = req->prompt;
+            in.messages.push_back(std::move(sys));
+            in.messages.push_back(std::move(usr));
+        }
+
+        const bool want_tools = !req->tools_json.empty();
+        if (want_tools) {
+            if (!e->use_jinja) { out.err = "tools require the Jinja chat template path (useJinja must be on)"; return out; }
+            if (!e->supports_tools) { out.err = "this model's chat template does not support tools"; return out; }
+            json tj = json::parse(req->tools_json, nullptr, false);
+            if (tj.is_discarded()) { out.err = "tools is not valid JSON"; return out; }
+            try {
+                in.tools = common_chat_tools_parse_oaicompat(tj);
+            } catch (const std::exception &ex) {
+                out.err = std::string("tools: ") + ex.what();
+                return out;
+            }
+            switch (req->tool_choice) {
+                case LGEN_TOOL_CHOICE_REQUIRED: in.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED; break;
+                case LGEN_TOOL_CHOICE_NONE:     in.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;     break;
+                default:                        in.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;     break;
+            }
+            in.parallel_tool_calls = req->parallel_tool_calls;
+            /* AUTO is upstream's recommended value: thinking models yield
+             * reasoning_content instead of inline <think> text. Enabled only for
+             * tool requests -- turning it on unconditionally would change what
+             * existing non-tool callers see in fullText. */
+            in.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        }
+
+        out.params = common_chat_templates_apply(e->templates.get(), in);
+        out.prompt = out.params.prompt;
+        /* Parse the reply only for tool requests: that keeps every existing
+         * caller on the original byte-streaming path, unchanged. */
+        out.parsing = want_tools;
+        out.ok = true;
+    } catch (const std::exception &ex) {
+        out.ok = false;
+        out.err = std::string("chat template: ") + ex.what();
+    } catch (...) {
+        out.ok = false;
+        out.err = "chat template: unknown error";
+    }
+    return out;
+}
+
+/* Feed the template's constraints into the sampler + slot.  Mirrors what
+ * tools/server does in server-schema.cpp; see the vendoring notes for the two
+ * traps here (grammar is a struct now, preserved_tokens needs tokenizing). */
+static void apply_constraints(lgen_engine *e, gen_slot &slot,
+                              common_params_sampling &sp, const applied_prompt &ap) {
+    const common_chat_params &p = ap.params;
+
+    if (!p.grammar.empty()) {
+        sp.grammar      = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS, p.grammar);
+        sp.grammar_lazy = p.grammar_lazy;
+        /* same type on both sides -- copy directly (the server only round-trips
+         * these through JSON because it crosses an HTTP boundary) */
+        sp.grammar_triggers = p.grammar_triggers;
+        /* REQUIRED, and easy to miss: the assistant generation prompt is already
+         * prefilled into the prompt, and a tool-calls grammar must be advanced
+         * past those tokens or it starts misaligned -- toolChoice:"required"
+         * then fails to force a call and the generation prompt ("assistant\n")
+         * leaks into the output.  Only honoured for output-format/tool-calls
+         * grammars, which is exactly what we set above. */
+        sp.generation_prompt = p.generation_prompt;
+    }
+
+    /* vector<string> -> set<llama_token>: only single-token strings are usable,
+     * exactly as server-schema.cpp does it. */
+    for (const std::string &tok : p.preserved_tokens) {
+        std::vector<llama_token> ids = common_tokenize(e->vocab, tok, false, true);
+        if (ids.size() == 1) sp.preserved_tokens.insert(ids[0]);
+    }
+
+    for (const std::string &s : p.additional_stops) slot.antiprompt.push_back(s);
+
+    slot.parsing = ap.parsing;
+    if (slot.parsing) {
+        slot.parser_params = common_chat_parser_params(p);  /* copies format + generation_prompt ONLY */
+        slot.parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        /* The converting ctor does NOT carry the serialized PEG parser.  Without
+         * this load, every PEG-format model silently degrades to content-only
+         * parsing: no error, no tool calls. */
+        if (!p.parser.empty()) {
+            try { slot.parser_params.parser.load(p.parser); }
+            catch (const std::exception &) { slot.parsing = false; }
+        }
+        slot.prev_msg = common_chat_msg();
+    }
+}
+
+/* Incremental stream: parse what we have so far, diff against the previous
+ * parse, and hand back only the new *content* text.  Tool-call and reasoning
+ * deltas are accumulated by the parser and delivered at completion, so the
+ * markup never reaches on_piece.  Returns "" when nothing new is emittable. */
+static std::string stream_content_delta(gen_slot &slot) {
+    common_chat_msg msg;
+    try {
+        msg = common_chat_parse(slot.generated, /*is_partial=*/true, slot.parser_params);
+    } catch (const std::exception &) {
+        return std::string();   /* mid-token garbage; wait for more */
+    }
+    std::string delta;
+    try {
+        for (const auto &d : common_chat_msg_diff::compute_diffs(slot.prev_msg, msg))
+            delta += d.content_delta;
+    } catch (const std::exception &) {
+        return std::string();
+    }
+    slot.prev_msg = std::move(msg);
+    return delta;
+}
+
+/* Final parse.  Fills `content` with the markup-free text, `tool_calls_json`
+ * with an OpenAI-shape array (empty if none) and `reasoning`. */
+static void parse_final(gen_slot &slot, std::string &content,
+                        std::string &tool_calls_json, std::string &reasoning) {
+    content.clear(); tool_calls_json.clear(); reasoning.clear();
+    common_chat_msg msg;
+    try {
+        msg = common_chat_parse(slot.generated, /*is_partial=*/false, slot.parser_params);
+    } catch (const std::exception &) {
+        content = slot.generated;   /* unparseable: hand back the raw text */
+        return;
+    }
+    content   = msg.content;
+    reasoning = msg.reasoning_content;
+    if (!msg.tool_calls.empty()) {
+        try {
+            json arr = json::array();
+            int i = 0;
+            for (const auto &tc : msg.tool_calls) {
+                /* common_chat_tool_call has no `type`; the OpenAI wrapper shape
+                 * is ours to synthesize.  ids are generated when the model's
+                 * format doesn't carry them. */
+                arr.push_back({
+                    { "id",   tc.id.empty() ? ("call_" + std::to_string(i)) : tc.id },
+                    { "type", "function" },
+                    { "function", { { "name", tc.name }, { "arguments", tc.arguments } } }
+                });
+                i++;
+            }
+            tool_calls_json = arr.dump();
+        } catch (const std::exception &) { tool_calls_json.clear(); }
+    }
+}
+
+/* Does this model's template actually render tool definitions?  There is no
+ * upstream capability query, so apply the template twice -- with and without a
+ * probe tool -- and see whether anything changed.  Also records the format name
+ * of the plain apply for diagnostics. */
+static void probe_tool_support(lgen_engine *e) {
+    e->supports_tools = false;
+    e->chat_format    = "";
+    if (!e->use_jinja || !e->templates) return;
+    try {
+        common_chat_templates_inputs in;
+        in.use_jinja             = true;
+        in.add_generation_prompt = true;
+        common_chat_msg usr; usr.role = "user"; usr.content = "hi";
+        in.messages.push_back(usr);
+
+        common_chat_params plain = common_chat_templates_apply(e->templates.get(), in);
+        const char *fmt = common_chat_format_name(plain.format);
+        e->chat_format = fmt ? fmt : "";
+
+        common_chat_tool probe;
+        probe.name        = "rampart_probe";
+        probe.description = "probe";
+        probe.parameters  = "{\"type\":\"object\",\"properties\":{}}";
+        in.tools.push_back(probe);
+        in.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+
+        common_chat_params withtool = common_chat_templates_apply(e->templates.get(), in);
+        /* A template that understands tools either names the probe in the
+         * rendered prompt or switches to a tool-aware format/grammar. */
+        e->supports_tools = withtool.prompt.find("rampart_probe") != std::string::npos
+                         || withtool.format != plain.format
+                         || !withtool.grammar.empty();
+    } catch (const std::exception &) {
+        e->supports_tools = false;
+    } catch (...) {
+        e->supports_tools = false;
+    }
 }
 
 /* start a request on a free slot; consumes (frees) req on success or failure */
 static void start_slot(lgen_engine *e, gen_slot &slot, gen_request *req) {
-    std::string prompt = build_prompt(e, req);
+    applied_prompt ap = apply_templates(e, req);
     char errbuf[256];
     const char *err = nullptr;
     std::vector<llama_token> toks;
-    if (prompt.empty()) { err = "empty prompt"; }
+    if (!ap.ok) { err = ap.err.empty() ? "failed to apply chat template" : ap.err.c_str(); }
+    else if (ap.prompt.empty()) { err = "empty prompt"; }
     else {
-        toks = common_tokenize(e->vocab, prompt, true, true);
+        toks = common_tokenize(e->vocab, ap.prompt, true, true);
         if ((int) toks.size() >= slot.n_ctx_slot) { snprintf(errbuf, sizeof errbuf, "prompt longer than slot context (%d >= %d)", (int)toks.size(), slot.n_ctx_slot); err = errbuf; }
     }
     if (err) {
-        if (req->on_done) req->on_done(req->ud, 1, err, LGEN_FINISH_ERROR, "", 0);
+        lgen_result_extra extra{};
+        if (req->on_done) req->on_done(req->ud, 1, err, LGEN_FINISH_ERROR, "", 0, &extra);
         delete req;
         return;
     }
@@ -294,8 +579,13 @@ static void start_slot(lgen_engine *e, gen_slot &slot, gen_request *req) {
     slot.finish_reason = LGEN_FINISH_EOG;
     slot.on_piece = req->on_piece; slot.on_done = req->on_done; slot.ud = req->ud;
     slot.antiprompt = req->stop;
+    slot.parsing = false;                 /* slots are reused; never inherit */
+    slot.parser_params = common_chat_parser_params();
+    slot.prev_msg = common_chat_msg();
 
     common_params_sampling sp = sampling_from_req(req);
+    /* grammar / triggers / preserved tokens / extra stops / parser setup */
+    apply_constraints(e, slot, sp, ap);
     slot.smpl = common_sampler_init(e->model, sp);
     slot.state = SLOT_STARTED;
 
@@ -544,6 +834,7 @@ static bool build_context(lgen_engine *e, char *err, size_t errlen) {
     e->add_bos = llama_vocab_get_add_bos(e->vocab);
     e->templates = common_chat_templates_init(e->model,
                        e->chat_template.empty() ? "" : e->chat_template);
+    probe_tool_support(e);   /* sets supports_tools + chat_format */
     e->batch = llama_batch_init(e->n_batch + e->n_seq_max, 0, 1);
 
     e->slots.assign(e->n_seq_max, gen_slot());
@@ -620,7 +911,8 @@ void lgen_engine_free(lgen_engine *e) {
     for (auto &slot : e->slots)
         if (slot.is_processing()) { slot.finish_reason = LGEN_FINISH_CANCEL; slot_finish(e, slot, 0, nullptr); }
     for (gen_request *r : e->waitq) {
-        if (r->on_done) r->on_done(r->ud, 1, "engine destroyed", LGEN_FINISH_CANCEL, "", 0);
+        lgen_result_extra extra{};
+        if (r->on_done) r->on_done(r->ud, 1, "engine destroyed", LGEN_FINISH_CANCEL, "", 0, &extra);
         delete r;
     }
     e->waitq.clear();
@@ -631,6 +923,8 @@ void lgen_engine_free(lgen_engine *e) {
 
 uint32_t lgen_engine_n_ctx(lgen_engine *e)   { return e ? (e->n_ctx ? e->n_ctx : e->n_ctx_cfg) : 0; }
 int32_t  lgen_engine_n_vocab(lgen_engine *e) { return e ? e->n_vocab : 0; }
+int      lgen_engine_supports_tools(lgen_engine *e) { return (e && e->supports_tools) ? 1 : 0; }
+const char *lgen_engine_chat_format(lgen_engine *e) { return e ? e->chat_format.c_str() : ""; }
 
 /* advance every active slot one continuous-batching decode step, ON the calling
  * thread; on_piece/on_done fire here (duktape-safe). Returns 1 if work remains
@@ -656,6 +950,9 @@ uint64_t lgen_engine_submit(lgen_engine *e, const lgen_request *req,
     if (req->prompt && req->prompt[0])               { r->has_prompt = true;   r->prompt = req->prompt; }
     if (req->messages_json && req->messages_json[0]) { r->has_messages = true; r->messages_json = req->messages_json; }
     if (req->chat_template)                           r->chat_template = req->chat_template;
+    if (req->tools_json && req->tools_json[0])        r->tools_json = req->tools_json;
+    r->tool_choice = req->tool_choice;
+    r->parallel_tool_calls = req->parallel_tool_calls ? true : false;
     r->add_assistant = req->add_assistant;
     r->max_tokens = req->max_tokens; r->temp = req->temp; r->top_p = req->top_p; r->min_p = req->min_p;
     r->typ_p = req->typ_p; r->top_k = req->top_k; r->penalty_repeat = req->penalty_repeat;

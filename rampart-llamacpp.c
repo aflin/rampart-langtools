@@ -426,6 +426,38 @@ static void lg_build_request(duk_context *ctx, duk_idx_t obj_idx, lgen_request *
     if (duk_get_prop_string(ctx, obj_idx, "addAssistant")) req->add_assistant = REQUIRE_BOOL(ctx, -1, "addAssistant must be a Boolean");
     duk_pop(ctx);
 
+    /* ---- tool calling.  The array is JSON-encoded here and parsed in the shim
+       by common_chat_tools_parse_oaicompat (OpenAI shape), so the wire format
+       between the two layers is just JSON -- no struct marshalling. */
+    req->tool_choice = LGEN_TOOL_CHOICE_AUTO;
+    if (duk_get_prop_string(ctx, obj_idx, "tools")) {
+        if (!duk_is_array(ctx, -1)) RP_THROW(ctx, "tools must be an Array");
+        if (duk_get_length(ctx, -1) > 0) {
+            duk_dup(ctx, -1);
+            /* The encoded string MUST stay on the stack: req->tools_json points
+               into it and duktape frees the value as soon as it is popped (the
+               same reason `messages` is left there).  Drop the array underneath
+               instead, so the string survives until duk_set_top after submit. */
+            req->tools_json = duk_json_encode(ctx, -1);
+            duk_remove(ctx, -2);
+        } else {
+            duk_pop(ctx);   /* empty tools array == no tools */
+        }
+    } else {
+        duk_pop(ctx);
+    }
+    if (duk_get_prop_string(ctx, obj_idx, "toolChoice")) {
+        const char *tc = REQUIRE_STRING(ctx, -1, "toolChoice must be a String (auto|none|required)");
+        if      (!strcmp(tc, "auto"))     req->tool_choice = LGEN_TOOL_CHOICE_AUTO;
+        else if (!strcmp(tc, "none"))     req->tool_choice = LGEN_TOOL_CHOICE_NONE;
+        else if (!strcmp(tc, "required")) req->tool_choice = LGEN_TOOL_CHOICE_REQUIRED;
+        else RP_THROW(ctx, "toolChoice: unknown '%s' (auto|none|required)", tc);
+    }
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, obj_idx, "parallelToolCalls"))
+        req->parallel_tool_calls = REQUIRE_BOOL(ctx, -1, "parallelToolCalls must be a Boolean");
+    duk_pop(ctx);
+
     *stops_out = lg_build_stops(ctx, obj_idx, n_stops);
     req->stop = *stops_out;
     req->n_stop = *n_stops;
@@ -571,20 +603,55 @@ static void lg_arm_pump(duk_context *ctx, rp_llama_info *info)
 
 /* ---- SYNC predict: drive the engine on THIS thread until the request ends ---- */
 
+/* LGEN_FINISH_* -> the JS `finishReason` string */
+static const char *lg_finish_name(int reason)
+{
+    switch (reason) {
+        case LGEN_FINISH_TOOL_CALLS: return "tool_calls";
+        case LGEN_FINISH_LENGTH:     return "length";
+        case LGEN_FINISH_CANCEL:     return "cancel";
+        case LGEN_FINISH_ERROR:      return "error";
+        default:                     return "stop";   /* STOP and EOG both */
+    }
+}
+
+/* Attach finishReason / toolCalls / reasoning to the object on top of the stack.
+   `toolCalls` is left ABSENT (not an empty array) when the model called nothing,
+   so `if (res.toolCalls)` is the caller's test. */
+static void lg_push_result_extra(duk_context *ctx, int reason, const lgen_result_extra *extra)
+{
+    duk_push_string(ctx, lg_finish_name(reason));
+    duk_put_prop_string(ctx, -2, "finishReason");
+    if (extra && extra->tool_calls_json) {
+        duk_push_string(ctx, extra->tool_calls_json);
+        duk_json_decode(ctx, -1);   /* shim-generated, always valid JSON */
+        duk_put_prop_string(ctx, -2, "toolCalls");
+    }
+    if (extra && extra->reasoning) {
+        duk_push_lstring(ctx, extra->reasoning, (duk_size_t)extra->reasoning_len);
+        duk_put_prop_string(ctx, -2, "reasoning");
+    }
+}
+
 typedef struct {
     int    done;
     int    status;
     char  *err;
     char  *full;
     size_t full_len;
+    int    reason;
+    char  *tool_calls_json;   /* strdup'd: the shim's copy dies with the callback */
+    char  *reasoning;
+    size_t reasoning_len;
 } lg_sync_ud;
 
 static void lg_sync_on_done(void *ud, int status, const char *err, int reason,
-                            const char *full, size_t full_len)
+                            const char *full, size_t full_len,
+                            const lgen_result_extra *extra)
 {
-    (void)reason;
     lg_sync_ud *s = (lg_sync_ud *)ud;
     s->status = status;
+    s->reason = reason;
     if (status != 0 && err) s->err = strdup(err);
     if (full && full_len) {
         s->full = NULL;
@@ -592,6 +659,14 @@ static void lg_sync_on_done(void *ud, int status, const char *err, int reason,
         memcpy(s->full, full, full_len);
         s->full[full_len] = '\0';
         s->full_len = full_len;
+    }
+    if (extra && extra->tool_calls_json) s->tool_calls_json = strdup(extra->tool_calls_json);
+    if (extra && extra->reasoning) {
+        s->reasoning = NULL;
+        REMALLOC(s->reasoning, extra->reasoning_len + 1);
+        memcpy(s->reasoning, extra->reasoning, extra->reasoning_len);
+        s->reasoning[extra->reasoning_len] = '\0';
+        s->reasoning_len = extra->reasoning_len;
     }
     s->done = 1;
 }
@@ -611,6 +686,11 @@ static duk_ret_t lg_predict(duk_context *ctx)
     lg_sync_ud s;
     memset(&s, 0, sizeof s);
 
+    /* predict() has always returned a plain String.  Callers that supply `tools`
+       are opting into the structured form, so only they get an Object back --
+       every existing caller keeps the String it has today. */
+    int want_object = (req.tools_json != NULL);
+
     char err[256];
     uint64_t rid = lgen_engine_submit(info->eng, &req, NULL, lg_sync_on_done, &s, err, sizeof err);
     lg_free_stops(stops, n_stops);
@@ -627,6 +707,8 @@ static duk_ret_t lg_predict(duk_context *ctx)
     if (s.status != 0) {
         char *e = s.err ? s.err : strdup("generation error");
         if (s.full) free(s.full);
+        if (s.tool_calls_json) free(s.tool_calls_json);
+        if (s.reasoning) free(s.reasoning);
         duk_push_error_object(ctx, DUK_ERR_ERROR, "%s", e);
         free(e);
         (void)duk_throw(ctx);
@@ -634,7 +716,22 @@ static duk_ret_t lg_predict(duk_context *ctx)
 
     if (info->last_out) free(info->last_out);
     info->last_out = s.full; info->last_out_len = s.full_len;
-    duk_push_lstring(ctx, info->last_out ? info->last_out : "", info->last_out_len);
+
+    if (want_object) {
+        lgen_result_extra extra;
+        memset(&extra, 0, sizeof extra);
+        extra.tool_calls_json = s.tool_calls_json;
+        extra.reasoning       = s.reasoning;
+        extra.reasoning_len   = s.reasoning_len;
+        duk_push_object(ctx);
+        duk_push_lstring(ctx, info->last_out ? info->last_out : "", info->last_out_len);
+        duk_put_prop_string(ctx, -2, "fullText");
+        lg_push_result_extra(ctx, s.reason, &extra);
+    } else {
+        duk_push_lstring(ctx, info->last_out ? info->last_out : "", info->last_out_len);
+    }
+    if (s.tool_calls_json) free(s.tool_calls_json);
+    if (s.reasoning) free(s.reasoning);
     return 1;
 }
 
@@ -689,9 +786,9 @@ static void lg_infer_on_piece(void *ud, const char *piece, size_t len)
     }
 }
 static void lg_infer_on_done(void *ud, int status, const char *err, int reason,
-                             const char *full, size_t full_len)
+                             const char *full, size_t full_len,
+                             const lgen_result_extra *extra)
 {
-    (void)reason;
     lg_areq *r = (lg_areq *)ud;
     duk_context *ctx = r->ctx;
 
@@ -706,6 +803,7 @@ static void lg_infer_on_done(void *ud, int status, const char *err, int reason,
         duk_push_object(ctx);
         if (full) { duk_push_lstring(ctx, full, (duk_size_t)full_len); duk_put_prop_string(ctx, -2, "fullText"); }
         if (status != 0 && err) { duk_push_string(ctx, err); duk_put_prop_string(ctx, -2, "error"); }
+        lg_push_result_extra(ctx, reason, extra);
         if (duk_pcall(ctx, 1) != 0) { /* swallow */ }
         duk_pop(ctx);
     }
@@ -1059,6 +1157,14 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
     duk_push_int(ctx, (int)lgen_engine_n_vocab(eng));
     duk_rp_put_prop_string_ro(ctx, -2, "nVocab");
 
+    /* Tool-calling capability.  There is no upstream query for this, so the shim
+       probes the template at create time; a caller checks it before building a
+       request (supplying tools to a template that can't render them throws). */
+    duk_push_boolean(ctx, lgen_engine_supports_tools(info->eng));
+    duk_rp_put_prop_string_ro(ctx, -2, "supportsTools");
+    duk_push_string(ctx, lgen_engine_chat_format(info->eng));
+    duk_rp_put_prop_string_ro(ctx, -2, "chatFormat");
+
     duk_push_pointer(ctx, info);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rp_llama_info"));
 
@@ -1121,28 +1227,50 @@ static const char *BATCHGEN_SCRIPT =
 "    var canc = {};\n"   /* request ids signalled to cancel (set by the cancel event) */
 "    rampart.event.on('can_'+a.uid, 'c', function(uv, c){ canc[c.id] = 1; });\n"
 "    rampart.event.on('sub_'+a.uid, 'h', function(uv, r){\n"
+/* The request crosses a thread boundary as a JSON string, not as a live object:
+   the event transport does not round-trip nested Arrays faithfully (an
+   assistant turn's tool_calls arrived as {\"0\":{...}}), which broke tool loops
+   and silently dropped scalars like toolChoice.  Stringify/parse is exact. */
+"      r.req = (typeof r.req === 'string') ? JSON.parse(r.req) : r.req;\n"
 "      if (r.stream) {\n"
 "        raw.predictAsync(r.req,\n"
 "          function(t){ if (canc[r.id]) { delete canc[r.id]; return true; }\n"   /* hard cancel -> frees the slot */
 "                       if (!t.done && !t.error && t.token) rampart.event.trigger('tok_'+a.uid+'_'+r.id, { tok: t.token }); },\n"
-"          function(res){ delete canc[r.id]; rampart.event.trigger('fin_'+a.uid+'_'+r.id, { full: res.fullText || '', err: res.error }); });\n"
+"          function(res){ delete canc[r.id]; rampart.event.trigger('fin_'+a.uid+'_'+r.id, { full: res.fullText || '', err: res.error,\n"
+"                           toolCalls: res.toolCalls, reasoning: res.reasoning, finishReason: res.finishReason }); });\n"
 "      } else {\n"
 "        raw.predictAsync(r.req, function(){}, function(res){\n"
 "          rampart.thread.put('res_'+a.uid+'_'+r.id,\n"
-"            res.error ? ('[gen err:'+res.error+']') : (res.fullText || ''));\n"
+"            { text: res.error ? ('[gen err:'+res.error+']') : (res.fullText || ''),\n"
+"              toolCalls: res.toolCalls, reasoning: res.reasoning, finishReason: res.finishReason });\n"
 "        });\n"
 "      }\n"
 "    });\n"
-"    rampart.thread.put('ready_'+a.uid, { nCtx: raw.nCtx, nVocab: raw.nVocab });\n"
+"    rampart.thread.put('ready_'+a.uid, { nCtx: raw.nCtx, nVocab: raw.nVocab,\n"
+"                                         supportsTools: raw.supportsTools, chatFormat: raw.chatFormat });\n"
 "  }, { rawInit: mod.__rawInitGen, model: model, opts: opts || {}, uid: uid });\n"
 "  var meta = thread.get('ready_'+uid, 120000) || {};\n"
 "  return {\n"
-"    __uid: uid, nCtx: meta.nCtx, nVocab: meta.nVocab, _last: '', _ctr: 0,\n"
+"    __uid: uid, nCtx: meta.nCtx, nVocab: meta.nVocab,\n"
+"    supportsTools: !!meta.supportsTools, chatFormat: meta.chatFormat || '',\n"
+"    _last: '', _ctr: 0,\n"
 "    predict: function(o){\n"
 "      var id = rampart.thread.getCurrentId() + '_' + (this._ctr = (this._ctr||0)+1);\n"
-"      rampart.event.trigger('sub_'+this.__uid, { id: id, req: o });\n"
-"      var text = rampart.thread.get('res_'+this.__uid+'_'+id, 120000);\n"
-"      this._last = (text === undefined) ? '' : text;\n"
+"      rampart.event.trigger('sub_'+this.__uid, { id: id, req: JSON.stringify(o) });\n"
+/* A tool request carries a much larger prompt than a bare chat turn, so the
+   old 120s deadline was easy to exceed on a slow/CPU-only box -- and expiring
+   it returned an empty string that was indistinguishable from a real empty
+   reply.  Wait longer, and report an expiry the same way engine errors are
+   reported rather than silently yielding ''. */
+"      var r = rampart.thread.get('res_'+this.__uid+'_'+id, 600000);\n"
+"      if (r === undefined || r === null)\n"
+"        r = { text: '[gen err:timed out waiting for the generation engine]' };\n"
+"      this._last = (r.text === undefined) ? '' : r.text;\n"
+/* structured form only when the caller opted in with tools -- otherwise the
+   String that predict() has always returned */
+"      if (o && o.tools && o.tools.length)\n"
+"        return { fullText: this._last, toolCalls: r.toolCalls,\n"
+"                 reasoning: r.reasoning, finishReason: r.finishReason };\n"
 "      return this._last;\n"
 "    },\n"
 "    predictAsync: function(o, perTok, fin){\n"
@@ -1153,8 +1281,9 @@ static const char *BATCHGEN_SCRIPT =
 "        if (typeof perTok === 'function') perTok({ token: t.tok, done: false }); });\n"
 "      rampart.event.on(fn, 'h', function(uv, f){\n"
 "        rampart.event.remove(tn); rampart.event.remove(fn);\n"
-"        if (typeof fin === 'function') fin({ fullText: (f.full !== undefined ? f.full : full), error: f.err }); });\n"
-"      rampart.event.trigger('sub_'+uid, { id: id, req: o, stream: true });\n"
+"        if (typeof fin === 'function') fin({ fullText: (f.full !== undefined ? f.full : full), error: f.err,\n"
+"                                             toolCalls: f.toolCalls, reasoning: f.reasoning, finishReason: f.finishReason }); });\n"
+"      rampart.event.trigger('sub_'+uid, { id: id, req: JSON.stringify(o), stream: true });\n"
 "      return { cancel: function(){ rampart.event.trigger('can_'+uid, { id: id }); } };\n"   /* hard cancel handle */
 "    },\n"
 "    getLast: function(){ return this._last; },\n"
