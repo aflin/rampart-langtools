@@ -33,6 +33,10 @@
 #include <mutex>
 #include <pthread.h>
 #include <unistd.h>
+#if defined(__FreeBSD__)
+#include <sys/types.h>
+#include <sys/sysctl.h>   /* kern.smp.cores; see lgen_default_n_threads */
+#endif
 
 #include "llama_gen_shim.h"
 
@@ -58,6 +62,8 @@ struct gen_request {
     std::string tools_json;
     int         tool_choice = LGEN_TOOL_CHOICE_AUTO;
     bool        parallel_tool_calls = false;
+    bool        reasoning_separate = false;  /* run the parser without tools */
+    int         thinking = -1;               /* tri-state; <0 = template default */
 
     int    max_tokens = 512;
     float  temp = -1, top_p = -1, min_p = -1, typ_p = -1;
@@ -190,7 +196,7 @@ static size_t find_stopping_strings(gen_slot &slot, const std::string &text,
 
 /* chat-parser adapter (defined further down, next to the rest of the
  * common_chat_* contact -- see "chat-template / tool-call adapter") */
-static std::string stream_content_delta(gen_slot &slot);
+static void stream_deltas(gen_slot &slot, std::string &content, std::string &reasoning);
 static void        parse_final(gen_slot &slot, std::string &content,
                                std::string &tool_calls_json, std::string &reasoning);
 
@@ -263,15 +269,19 @@ static bool process_token(lgen_engine *e, gen_slot &slot, llama_token id, const 
                  * whole generated string per token (quadratic, and the PEG
                  * parser is not cheap), which is pure waste for predict(), where
                  * the single parse in slot_finish is all that is needed. */
-                const std::string delta = stream_content_delta(slot);
+                std::string cdelta, rdelta;
+                stream_deltas(slot, cdelta, rdelta);
                 slot.n_sent = slot.generated.size();
-                if (!delta.empty()) slot.on_piece(slot.ud, delta.data(), delta.size());
+                /* reasoning first: it precedes the answer in every format that
+                 * separates them, and the flag lets a UI render them apart */
+                if (!rdelta.empty()) slot.on_piece(slot.ud, rdelta.data(), rdelta.size(), 1);
+                if (!cdelta.empty()) slot.on_piece(slot.ud, cdelta.data(), cdelta.size(), 0);
             } else if (slot.parsing) {
                 slot.n_sent = slot.generated.size();   /* parsed once, at finish */
             } else {
                 const std::string to_send = slot.generated.substr(pos);
                 slot.n_sent += to_send.size();
-                if (!to_send.empty() && slot.on_piece) slot.on_piece(slot.ud, to_send.data(), to_send.size());
+                if (!to_send.empty() && slot.on_piece) slot.on_piece(slot.ud, to_send.data(), to_send.size(), 0);
             }
         }
     }
@@ -340,6 +350,8 @@ static applied_prompt apply_templates(lgen_engine *e, const gen_request *req) {
         common_chat_templates_inputs in;
         in.use_jinja             = e->use_jinja;
         in.add_generation_prompt = req->add_assistant ? true : false;
+        /* tri-state: leave the template's own default alone unless asked */
+        if (req->thinking >= 0) in.enable_thinking = req->thinking != 0;
 
         if (req->has_messages) {
             json arr = json::parse(req->messages_json, nullptr, false);
@@ -380,18 +392,23 @@ static applied_prompt apply_templates(lgen_engine *e, const gen_request *req) {
                 default:                        in.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;     break;
             }
             in.parallel_tool_calls = req->parallel_tool_calls;
-            /* AUTO is upstream's recommended value: thinking models yield
-             * reasoning_content instead of inline <think> text. Enabled only for
-             * tool requests -- turning it on unconditionally would change what
-             * existing non-tool callers see in fullText. */
-            in.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
         }
+
+        /* Run the chat parser for tool requests, and for anyone who asked for
+         * reasoning to be separated.  The latter is not cosmetic: where a
+         * format carries reasoning as a CHANNEL rather than a <think> span,
+         * only llama.cpp's parser for that format knows where it ends, so a
+         * caller that must machine-read the answer cannot recover it itself.
+         * Still opt-in -- parsing unconditionally would move <think> blocks out
+         * of fullText for every existing caller. */
+        const bool want_parse = want_tools || req->reasoning_separate;
+        /* AUTO is upstream's recommended value: thinking models yield
+         * reasoning_content instead of inline <think> text. */
+        if (want_parse) in.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
 
         out.params = common_chat_templates_apply(e->templates.get(), in);
         out.prompt = out.params.prompt;
-        /* Parse the reply only for tool requests: that keeps every existing
-         * caller on the original byte-streaming path, unchanged. */
-        out.parsing = want_tools;
+        out.parsing = want_parse;
         out.ok = true;
     } catch (const std::exception &ex) {
         out.ok = false;
@@ -450,25 +467,34 @@ static void apply_constraints(lgen_engine *e, gen_slot &slot,
 }
 
 /* Incremental stream: parse what we have so far, diff against the previous
- * parse, and hand back only the new *content* text.  Tool-call and reasoning
- * deltas are accumulated by the parser and delivered at completion, so the
- * markup never reaches on_piece.  Returns "" when nothing new is emittable. */
-static std::string stream_content_delta(gen_slot &slot) {
+ * parse, and hand back the new content AND reasoning text separately.  Tool-call
+ * deltas are accumulated by the parser and delivered whole at completion (no
+ * consumer wants those token by token), so the markup never reaches on_piece.
+ *
+ * Reasoning IS streamed: on a thinking model the deliberation is the longest
+ * part of a turn, and withholding it means a reader watches a frozen screen and
+ * -- worse -- nothing can be cancelled, because cancellation works by refusing
+ * the next token and no token arrives.  Both come back empty when there is
+ * nothing new to emit. */
+static void stream_deltas(gen_slot &slot, std::string &content, std::string &reasoning) {
+    content.clear();
+    reasoning.clear();
     common_chat_msg msg;
     try {
         msg = common_chat_parse(slot.generated, /*is_partial=*/true, slot.parser_params);
     } catch (const std::exception &) {
-        return std::string();   /* mid-token garbage; wait for more */
+        return;   /* mid-token garbage; wait for more */
     }
-    std::string delta;
     try {
-        for (const auto &d : common_chat_msg_diff::compute_diffs(slot.prev_msg, msg))
-            delta += d.content_delta;
+        for (const auto &d : common_chat_msg_diff::compute_diffs(slot.prev_msg, msg)) {
+            content   += d.content_delta;
+            reasoning += d.reasoning_content_delta;
+        }
     } catch (const std::exception &) {
-        return std::string();
+        content.clear(); reasoning.clear();
+        return;
     }
     slot.prev_msg = std::move(msg);
-    return delta;
 }
 
 /* Final parse.  Fills `content` with the markup-free text, `tool_calls_json`
@@ -921,10 +947,34 @@ void lgen_engine_free(lgen_engine *e) {
     delete e;
 }
 
+int lgen_default_n_threads(void) {
+#if defined(__FreeBSD__)
+    /* libcommon has no FreeBSD branch in common_cpu_get_num_physical_cores():
+     * it falls through to the generic tail, hardware_concurrency() and then
+     * "/2 if > 4" -- which assumes SMT is always on and therefore HALVES a
+     * non-SMT box (8 real cores -> 4).  FreeBSD publishes the topology, so ask
+     * it.  (Linux enumerates thread_siblings and macOS uses
+     * hw.perflevel0.physicalcpu, both of which are already correct.) */
+    {
+        int cores = 0;
+        size_t len = sizeof(cores);
+        if (sysctlbyname("kern.smp.cores", &cores, &len, NULL, 0) == 0 && cores > 0)
+            return cores;
+    }
+#endif
+    int n = 0;
+    try { n = (int) common_cpu_get_num_math(); } catch (...) { n = 0; }
+    return n > 0 ? n : 4;
+}
+
 uint32_t lgen_engine_n_ctx(lgen_engine *e)   { return e ? (e->n_ctx ? e->n_ctx : e->n_ctx_cfg) : 0; }
 int32_t  lgen_engine_n_vocab(lgen_engine *e) { return e ? e->n_vocab : 0; }
 int      lgen_engine_supports_tools(lgen_engine *e) { return (e && e->supports_tools) ? 1 : 0; }
 const char *lgen_engine_chat_format(lgen_engine *e) { return e ? e->chat_format.c_str() : ""; }
+int lgen_engine_supports_thinking_toggle(lgen_engine *e) {
+    if (!e || !e->templates || !e->use_jinja) return 0;
+    return common_chat_templates_support_enable_thinking(e->templates.get()) ? 1 : 0;
+}
 
 /* advance every active slot one continuous-batching decode step, ON the calling
  * thread; on_piece/on_done fire here (duktape-safe). Returns 1 if work remains
@@ -953,6 +1003,8 @@ uint64_t lgen_engine_submit(lgen_engine *e, const lgen_request *req,
     if (req->tools_json && req->tools_json[0])        r->tools_json = req->tools_json;
     r->tool_choice = req->tool_choice;
     r->parallel_tool_calls = req->parallel_tool_calls ? true : false;
+    r->reasoning_separate  = req->reasoning_separate ? true : false;
+    r->thinking            = req->thinking;
     r->add_assistant = req->add_assistant;
     r->max_tokens = req->max_tokens; r->temp = req->temp; r->top_p = req->top_p; r->min_p = req->min_p;
     r->typ_p = req->typ_p; r->top_k = req->top_k; r->penalty_repeat = req->penalty_repeat;

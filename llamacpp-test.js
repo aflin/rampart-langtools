@@ -237,12 +237,10 @@ function runToolTest(done) {
     var path = obtain(MODELS.gen);
     if (!path) { printf("- skipped\n"); return done(); }
 
-    /* threads: gen defaults to n_threads=1, which makes a tool request (larger
-       prompt + a full call) exceed the batched coordinator's 120s thread.get
-       deadline on many machines.  4 is llama.cpp's own default and is safe
-       anywhere. */
+    /* No `threads` here on purpose: the module now defaults to libcommon's
+       machine heuristic, so this exercises the real default. */
     var gen = null;
-    try { gen = llamacpp.initGen(path, { nCtx: 2048, nSeqMax: 2, threads: 4 }); }
+    try { gen = llamacpp.initGen(path, { nCtx: 2048, nSeqMax: 2 }); }
     catch (e) { printf("- unsupported: %s\n", String(e.message || e)); return done(); }
 
     /* Capability reporting: no upstream query exists, so the module probes the
@@ -327,15 +325,52 @@ function runToolTest(done) {
         return typeof r5 === 'string';
     });
 
+    /* ---- reasoning separation (no tools involved) --------------------------
+       The parser has to run for callers with no tools too: where a format
+       carries reasoning as a channel rather than a <think> span, only
+       llama.cpp's parser knows where it ends, so a caller that must
+       machine-read the reply cannot strip it itself. */
+    var REASON_Q = [{ role: "user",
+        content: "Which mention email? 1 HTTP spec, 4 SMTP spec, 7 IMAP spec. Only numbers, comma separated." }];
+
+    testFeature("default (no tools, no reasoning) still returns a String", function() {
+        var d = gen.predict({ messages: REASON_Q, maxTokens: 24, temp: 0 });
+        return typeof d === 'string';
+    });
+
+    var rr = gen.predict({ messages: REASON_Q, reasoning: true, maxTokens: 64, temp: 0 });
+    testFeature("reasoning:true returns a structured Object", function() {
+        return typeof rr === 'object' && rr !== null
+               && typeof rr.fullText === 'string' && typeof rr.finishReason === 'string';
+    });
+    /* Only a thinking model produces any; on a plain model the correct result
+       is simply no reasoning and an untouched answer. */
+    testFeature("reasoning is separated, not left in fullText", function() {
+        if (!rr.reasoning || !rr.reasoning.length) return true;   /* not a thinking model */
+        return !/<think|<\|channel|<\|start\|>/i.test(rr.fullText || '');
+    });
+
+    testFeature("gen reports supportsThinkingToggle", function() {
+        return typeof gen.supportsThinkingToggle === 'boolean';
+    });
+    testFeature("thinking:false is accepted", function() {
+        var nt = gen.predict({ messages: REASON_Q, reasoning: true, thinking: false,
+                               maxTokens: 32, temp: 0 });
+        return typeof nt === 'object' && typeof nt.fullText === 'string';
+    });
+
     /* streaming must deliver content only -- never the tool-call markup */
-    var streamed = "";
+    var streamed = "", streamedReasoning = "";
     gen.predictAsync(
         { messages: [{ role: "user", content: "Search the collection for documents about HTTP/1.1." }],
           tools: TOOLS, maxTokens: 64, temp: 0 },
-        function(t) { if (!t.done && !t.error && t.token) streamed += t.token; },
+        function(t) { if (t.done || t.error || !t.token) return;
+                      if (t.reasoning) streamedReasoning += t.token; else streamed += t.token; },
         function(res) {
             testFeature("streamed tokens contain no tool markup", !TOOL_MARKUP.test(streamed));
             testFeature("streamed text equals fullText", streamed === (res.fullText || ''));
+            testFeature("reasoning tokens are flagged, not mixed into content",
+                        streamedReasoning === (res.reasoning || ''));
             testFeature("streamed request still reports the call", !!(res.toolCalls && res.toolCalls.length));
             try { gen.destroy(); } catch(e) {}
             done();

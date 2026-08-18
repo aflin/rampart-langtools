@@ -83,7 +83,10 @@ typedef struct {
  * ud is the per-request userdata passed to lgen_engine_submit; the C side uses
  * it to trampoline into the JS piece/done callbacks.
  * `extra` is never NULL, but its members may be. */
-typedef void (*lgen_on_piece)(void *ud, const char *piece, size_t len);
+/* is_reasoning: 1 when this piece is deliberation rather than the answer, so a
+ * consumer can render or hide it separately.  Always 0 unless the chat parser is
+ * running (tools, or reasoning_separate). */
+typedef void (*lgen_on_piece)(void *ud, const char *piece, size_t len, int is_reasoning);
 typedef void (*lgen_on_done)(void *ud, int status, const char *err,
                              int finish_reason, const char *full_text, size_t full_len,
                              const lgen_result_extra *extra);
@@ -121,6 +124,21 @@ typedef struct {
     int         tool_choice;          /* LGEN_TOOL_CHOICE_*                        */
     int         parallel_tool_calls;  /* bool                                      */
 
+    /* Run the chat parser even when no tools are supplied, so a model's
+     * reasoning is separated from its answer instead of being returned as
+     * content.  Required for formats whose reasoning is a CHANNEL rather than a
+     * <think> span: only llama.cpp's parser for that format knows where the
+     * channel ends, so a caller cannot strip it.  Opt-in, because turning it on
+     * unconditionally would move <think> blocks out of fullText for every
+     * existing caller. */
+    int         reasoning_separate;   /* bool                                      */
+
+    /* Ask the model not to deliberate: maps to common_chat_templates_inputs
+     * .enable_thinking.  Tri-state: <0 leaves the template default alone,
+     * 0 disables, 1 enables.  Ignored by templates that do not support it --
+     * unlike tools there is no wrong output to guard against. */
+    int         thinking;
+
     /* sampling (maps onto common_params_sampling) */
     int    max_tokens;
     float  temp;
@@ -149,6 +167,14 @@ typedef struct {
 lgen_engine *lgen_engine_create(const lgen_engine_params *p, char *errbuf, size_t errlen);
 void         lgen_engine_free(lgen_engine *e);   /* frees context + model (call on owner thread) */
 
+/* Thread count to use when the caller does not specify one: libcommon's own
+ * machine heuristic (common_cpu_get_num_math) -- physical/performance cores,
+ * discounting hyperthread siblings, which do not help matmul throughput.  This
+ * is what llama.cpp's own tools resolve their -1 default to; GGML_DEFAULT_N_THREADS
+ * (4) is only the raw ggml struct fallback.  Exposed here because it lives in
+ * libcommon (C++) and rampart-llamacpp.c is C.  Always >= 1. */
+int          lgen_default_n_threads(void);
+
 /* informational */
 uint32_t     lgen_engine_n_ctx(lgen_engine *e);
 int32_t      lgen_engine_n_vocab(lgen_engine *e);
@@ -159,6 +185,9 @@ int          lgen_engine_supports_tools(lgen_engine *e);
 /* human-readable chat format of the loaded template, e.g. "Hermes 2 Pro".
  * Never NULL; "" if unknown. Owned by the engine. */
 const char  *lgen_engine_chat_format(lgen_engine *e);
+/* 1 if the loaded template honours enable_thinking (upstream
+ * common_chat_templates_support_enable_thinking). */
+int          lgen_engine_supports_thinking_toggle(lgen_engine *e);
 
 /* ---- driving the engine (all ON the owning thread) ----
  * submit: deep-copy + enqueue a request; returns id (>0) or 0 on error (errbuf).

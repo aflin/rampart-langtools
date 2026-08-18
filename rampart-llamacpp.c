@@ -458,6 +458,22 @@ static void lg_build_request(duk_context *ctx, duk_idx_t obj_idx, lgen_request *
         req->parallel_tool_calls = REQUIRE_BOOL(ctx, -1, "parallelToolCalls must be a Boolean");
     duk_pop(ctx);
 
+    /* Run the chat parser without tools, so reasoning is separated from the
+       answer.  Needed wherever the caller must machine-read the reply: a format
+       that carries reasoning as a channel (rather than a <think> span) cannot be
+       stripped by the caller -- only llama.cpp's parser knows where it ends. */
+    if (duk_get_prop_string(ctx, obj_idx, "reasoning"))
+        req->reasoning_separate = REQUIRE_BOOL(ctx, -1, "reasoning must be a Boolean");
+    duk_pop(ctx);
+
+    /* Ask the model not to deliberate.  Tri-state: absent leaves the template's
+       own default alone.  Silently ignored by templates that don't support it --
+       unlike tools, there is no wrong output to guard against. */
+    req->thinking = -1;
+    if (duk_get_prop_string(ctx, obj_idx, "thinking"))
+        req->thinking = REQUIRE_BOOL(ctx, -1, "thinking must be a Boolean") ? 1 : 0;
+    duk_pop(ctx);
+
     *stops_out = lg_build_stops(ctx, obj_idx, n_stops);
     req->stop = *stops_out;
     req->n_stop = *n_stops;
@@ -689,7 +705,7 @@ static duk_ret_t lg_predict(duk_context *ctx)
     /* predict() has always returned a plain String.  Callers that supply `tools`
        are opting into the structured form, so only they get an Object back --
        every existing caller keeps the String it has today. */
-    int want_object = (req.tools_json != NULL);
+    int want_object = (req.tools_json != NULL) || req.reasoning_separate;
 
     char err[256];
     uint64_t rid = lgen_engine_submit(info->eng, &req, NULL, lg_sync_on_done, &s, err, sizeof err);
@@ -766,7 +782,7 @@ static void lg_areq_clear_stash(lg_areq *r)
 
 // on_piece — fired on THIS thread inside lg_pump->lgen_engine_step. Returning a
 // truthy value from the perToken callback cancels the request.
-static void lg_infer_on_piece(void *ud, const char *piece, size_t len)
+static void lg_infer_on_piece(void *ud, const char *piece, size_t len, int is_reasoning)
 {
     lg_areq *r = (lg_areq *)ud;
     duk_context *ctx = r->ctx;
@@ -775,6 +791,9 @@ static void lg_infer_on_piece(void *ud, const char *piece, size_t len)
         duk_push_object(ctx);
         duk_push_lstring(ctx, piece ? piece : "", (duk_size_t)len);
         duk_put_prop_string(ctx, -2, "token");
+        /* deliberation rather than the answer; absent for ordinary tokens so
+           `if (t.reasoning)` is the test */
+        if (is_reasoning) { duk_push_true(ctx); duk_put_prop_string(ctx, -2, "reasoning"); }
         duk_push_false(ctx); duk_put_prop_string(ctx, -2, "done");
         if (duk_pcall(ctx, 1) == 0) {
             if (duk_get_boolean_default(ctx, -1, 0) && !r->canceled) {
@@ -1094,8 +1113,20 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
     struct llama_model_params   mp = llama_model_default_params();
     struct llama_context_params cp = llama_context_default_params();
     cp.n_seq_max       = 1;
-    cp.n_threads       = 1;
-    cp.n_threads_batch = 1;
+    /* Tune to the machine rather than hard-coding: n_threads_batch decides how
+       long a reader waits for the first token, and a retrieval payload is
+       thousands of tokens of prompt -- at the old default of 1 that was one core
+       at 100% while the rest idled.  lgen_default_n_threads() is libcommon's own
+       heuristic (common_cpu_get_num_math): physical/performance cores, ignoring
+       hyperthread siblings, which is what llama.cpp's tools resolve to and what
+       actually helps matmul.  `threads` / `threadsBatch` still override both.
+
+       Note this assumes ONE engine per process, which is the initGen case (its
+       coordinator runs a single shared engine on a dedicated owner thread).
+       Several concurrent engines would oversubscribe -- set `threads` explicitly
+       if you build more than one. */
+    cp.n_threads       = lgen_default_n_threads();
+    cp.n_threads_batch = cp.n_threads;
     cp.n_ctx           = 0;
 
     char *chat_template = NULL;  /* malloc'd; freed after lg_new_info copies it */
@@ -1164,6 +1195,8 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
     duk_rp_put_prop_string_ro(ctx, -2, "supportsTools");
     duk_push_string(ctx, lgen_engine_chat_format(info->eng));
     duk_rp_put_prop_string_ro(ctx, -2, "chatFormat");
+    duk_push_boolean(ctx, lgen_engine_supports_thinking_toggle(info->eng));
+    duk_rp_put_prop_string_ro(ctx, -2, "supportsThinkingToggle");
 
     duk_push_pointer(ctx, info);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rp_llama_info"));
@@ -1235,7 +1268,7 @@ static const char *BATCHGEN_SCRIPT =
 "      if (r.stream) {\n"
 "        raw.predictAsync(r.req,\n"
 "          function(t){ if (canc[r.id]) { delete canc[r.id]; return true; }\n"   /* hard cancel -> frees the slot */
-"                       if (!t.done && !t.error && t.token) rampart.event.trigger('tok_'+a.uid+'_'+r.id, { tok: t.token }); },\n"
+"                       if (!t.done && !t.error && t.token) rampart.event.trigger('tok_'+a.uid+'_'+r.id, { tok: t.token, r: t.reasoning ? 1 : 0 }); },\n"
 "          function(res){ delete canc[r.id]; rampart.event.trigger('fin_'+a.uid+'_'+r.id, { full: res.fullText || '', err: res.error,\n"
 "                           toolCalls: res.toolCalls, reasoning: res.reasoning, finishReason: res.finishReason }); });\n"
 "      } else {\n"
@@ -1247,12 +1280,14 @@ static const char *BATCHGEN_SCRIPT =
 "      }\n"
 "    });\n"
 "    rampart.thread.put('ready_'+a.uid, { nCtx: raw.nCtx, nVocab: raw.nVocab,\n"
-"                                         supportsTools: raw.supportsTools, chatFormat: raw.chatFormat });\n"
+"                                         supportsTools: raw.supportsTools, chatFormat: raw.chatFormat,\n"
+"                                         supportsThinkingToggle: raw.supportsThinkingToggle });\n"
 "  }, { rawInit: mod.__rawInitGen, model: model, opts: opts || {}, uid: uid });\n"
 "  var meta = thread.get('ready_'+uid, 120000) || {};\n"
 "  return {\n"
 "    __uid: uid, nCtx: meta.nCtx, nVocab: meta.nVocab,\n"
 "    supportsTools: !!meta.supportsTools, chatFormat: meta.chatFormat || '',\n"
+"    supportsThinkingToggle: !!meta.supportsThinkingToggle,\n"
 "    _last: '', _ctr: 0,\n"
 "    predict: function(o){\n"
 "      var id = rampart.thread.getCurrentId() + '_' + (this._ctr = (this._ctr||0)+1);\n"
@@ -1268,7 +1303,7 @@ static const char *BATCHGEN_SCRIPT =
 "      this._last = (r.text === undefined) ? '' : r.text;\n"
 /* structured form only when the caller opted in with tools -- otherwise the
    String that predict() has always returned */
-"      if (o && o.tools && o.tools.length)\n"
+"      if (o && ((o.tools && o.tools.length) || o.reasoning))\n"
 "        return { fullText: this._last, toolCalls: r.toolCalls,\n"
 "                 reasoning: r.reasoning, finishReason: r.finishReason };\n"
 "      return this._last;\n"
@@ -1277,8 +1312,9 @@ static const char *BATCHGEN_SCRIPT =
 "      var uid = this.__uid;\n"
 "      var id = rampart.thread.getCurrentId() + '_' + (this._ctr = (this._ctr||0)+1);\n"
 "      var tn = 'tok_'+uid+'_'+id, fn = 'fin_'+uid+'_'+id, full = '';\n"
-"      rampart.event.on(tn, 'h', function(uv, t){ full += t.tok;\n"
-"        if (typeof perTok === 'function') perTok({ token: t.tok, done: false }); });\n"
+"      rampart.event.on(tn, 'h', function(uv, t){ if (!t.r) full += t.tok;\n"
+"        if (typeof perTok === 'function')\n"
+"          perTok(t.r ? { token: t.tok, reasoning: true, done: false } : { token: t.tok, done: false }); });\n"
 "      rampart.event.on(fn, 'h', function(uv, f){\n"
 "        rampart.event.remove(tn); rampart.event.remove(fn);\n"
 "        if (typeof fin === 'function') fin({ fullText: (f.full !== undefined ? f.full : full), error: f.err,\n"

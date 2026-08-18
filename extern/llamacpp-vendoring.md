@@ -125,6 +125,16 @@ touches only 8 libcommon entry points and reads exactly one field of `common_cha
 (`.prompt`), so the heavy `chat.h` churn of that range (roles became an enum,
 `thinking_end_tag` -> `thinking_end_tags`, `message_spans` -> `message_delimiters`, plus
 +493/-94 across the in-tree jinja engine, which b9494 already had) missed us entirely.
+**As of 2026-08-17 that is no longer true, deliberately: the tool-calling +
+reasoning adapter widened this surface on purpose** (see
+`claude-work/llamacpp-tool-calling.md`). The shim now reads ~8 fields of
+`common_chat_params` and calls `common_chat_parse`,
+`common_chat_msg_diff::compute_diffs`, the three `*_parse_oaicompat` helpers,
+`common_chat_templates_support_enable_thinking` and `common_cpu_get_num_math`.
+All of it is confined to ONE adapter block in `llama_gen_shim.cc` so the next
+bump has one place to fix — do not let it spread. The probe in step 1 below is
+the tripwire; it is no longer optional.
+
 **Keeping the shim's libcommon
 surface small is what makes upgrades cheap — resist widening it.**
 
@@ -143,6 +153,25 @@ surface small is what makes upgrades cheap — resist widening it.**
    Also `patch -p1 --dry-run` the Metal patches against `/tmp/lc`, and re-check the
    silent-corruption invariants under "Batched chunk embedding" below — those do NOT
    show up as compile errors.
+
+   **The syntax check covers the chat adapter too**, which is the widest and
+   fastest-churning contact we have; a `chat.h` rename shows up here as a compile
+   error in seconds. But four things it CANNOT catch, all of which fail silently —
+   re-verify them by running `llamacpp-test.js` (tool + reasoning sections) against
+   the candidate build:
+   1. **`common_params_sampling.generation_prompt` must be set** whenever a
+      tool-calls grammar is set, or the grammar starts misaligned against the
+      already-prefilled assistant prompt: `toolChoice` misbehaves and the
+      generation prompt leaks into the output. Costs nothing to set; silent if
+      omitted.
+   2. **The serialized PEG parser must be loaded explicitly.**
+      `common_chat_parser_params(chat_params)` copies only `format` and
+      `generation_prompt` — NOT `parser`. Omit `parser.load(p.parser)` and every
+      PEG-format model degrades to content-only parsing: no error, no tool calls.
+   3. **`preserved_tokens` needs tokenizing** (`vector<string>` on the params side,
+      `set<llama_token>` on the sampler side; single-token strings only).
+   4. **`common_grammar` is a struct**, not a string:
+      `{COMMON_GRAMMAR_TYPE_TOOL_CALLS, str}`.
 2. Pick the tag; record tag + commit + ggml version in the table above.
 3. Replace the contents of `extern/llama.cpp` wholesale with that tag's tree (drop its
    `.git`), then **reapply `extern/patches/ggml-metal-*.patch`**.
@@ -286,6 +315,22 @@ noted above, these are not patches to llama.cpp — they are how *we* build and 
   `$<TARGET_OBJECTS:llama_gen_shim_obj>` in BOTH `add_library` targets (a plain target
   name does not pull an OBJECT lib's objects on macOS -> missing `lgen_*` at dlopen).
 
+### Thread defaults — `lgen_default_n_threads()` in the shim
+- Gen resolves its default thread count through libcommon's `common_cpu_get_num_math()`
+  rather than a constant. Exposed through the shim's C ABI because it is C++ and
+  `rampart-llamacpp.c` is C. Note `GGML_DEFAULT_N_THREADS` (4) is only the raw ggml
+  struct fallback — llama.cpp's own tools resolve `-1` through this heuristic.
+- **FreeBSD needs our own branch and always will, until upstream adds one.**
+  `common_cpu_get_num_physical_cores()` has branches for AIX, Linux, macOS and
+  Windows; FreeBSD falls through to the generic tail
+  (`hardware_concurrency()`, then `/2 if > 4`), which assumes SMT is always on and
+  therefore HALVES a non-SMT box. We read `sysctl kern.smp.cores` first. On upgrade,
+  check whether upstream has grown a `__FreeBSD__` branch; if so, drop ours.
+- Verified values: 16 on a 16-core Linux box; 16 (not 32) on a 32-thread/16-core box,
+  correctly discounting hyperthread siblings; 16 (not 20) on an Apple Silicon Mac
+  Studio, excluding its 4 E-cores (macOS uses `hw.perflevel0.physicalcpu`); 4 on the
+  FreeBSD VM.
+
 ### Generation shim — `extern/llamacpp/wrapper/llama_gen_shim.{h,cc}`
 - Built against **libcommon** (`common_sampler_*`, `common_chat_templates_*`,
   `string_find_partial_stop`, `common_batch_*`). Survived b9494 -> b10446 with one
@@ -355,6 +400,13 @@ noted above, these are not patches to llama.cpp — they are how *we* build and 
   (`sweep.js`, `TOKENS=1`) does exactly that. *b10446 sweep reproduced the b9494 curve; 512 stands.*
 
 ### Known non-issues (don't chase on upgrade)
+- **`toolChoice:"required"` is not enforced by b10446.** Upstream builds the correct
+  non-lazy tool-calls grammar (2000 bytes, 0 triggers) and hands it to
+  `common_sampler_init`, but generation comes out unconstrained. Reproduced with zero
+  rampart code in `claude-work/probe2.cc`, with and without `grammar_first`, on two
+  models. We pass the choice through correctly. `llamacpp-test.js` asserts only that
+  the request is accepted, so it will start failing usefully if upstream fixes this —
+  at which point tighten the test.
 - `Qwen3-Reranker` returns 0.0 — the GGUF isn't a valid reranking conversion; the official
   `llama-embedding` also returns 0.0. Not a regression. (`pu_test/FUTURE-qwen3-reranker.md`.)
 - macOS Metal **embed/rerank/gen now work on macOS 11+** thanks to the vendored Metal patches
