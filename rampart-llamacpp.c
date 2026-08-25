@@ -4029,7 +4029,9 @@ static size_t lg_log_mark(void)
 
 static void lg_load_reason(size_t from, char *out, size_t outlen)
 {
-    char why[320] = {0}, oom[320] = {0}, alloc[320] = {0}, line[512];
+    /* all one size: a shorter destination than `line' truncates silently,
+       and gcc is right to say so */
+    char why[512] = {0}, oom[512] = {0}, alloc[512] = {0}, line[512];
     const char *detail;
     struct llog_cap *cap = llog_cap_for_abort;
 
