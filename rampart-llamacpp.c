@@ -495,6 +495,68 @@ extern void event_free(struct event *ev);
 // shared via the shim's refcounted cache, so this only allocates a new context
 // + slots on the current thread (cheap next to loading weights).
 /* non-throwing core (lg_init_gen must free its chat_template before a throw) */
+/* defined with the log capture, far below */
+static size_t lg_log_mark(void);
+static void   lg_load_reason(size_t from, char *out, size_t outlen);
+
+/* Model-load progress, for initGenAsync().  llama.cpp calls the callback on
+ * the LOADING thread, inside the load, so it may only take the lock and
+ * store a float -- never re-enter duktape.  A waiting thread reads it by
+ * id.  Returning false would cancel the load; nothing does yet. */
+#define LG_PROG_SLOTS 8
+static struct lg_prog { char id[64]; float pct; int busy; } lg_prog[LG_PROG_SLOTS];
+static pthread_mutex_t lg_prog_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static struct lg_prog *lg_prog_claim(const char *id)
+{
+    struct lg_prog *s = NULL;
+    if (!id || !*id) return NULL;
+    pthread_mutex_lock(&lg_prog_mtx);
+    for (int i = 0; i < LG_PROG_SLOTS; i++)
+        if (!lg_prog[i].busy) { s = &lg_prog[i]; break; }
+    if (s) {
+        snprintf(s->id, sizeof s->id, "%s", id);
+        s->pct = 0.0f;
+        s->busy = 1;
+    }
+    pthread_mutex_unlock(&lg_prog_mtx);
+    return s;
+}
+
+static void lg_prog_release(struct lg_prog *s)
+{
+    if (!s) return;
+    pthread_mutex_lock(&lg_prog_mtx);
+    s->busy = 0; s->id[0] = 0; s->pct = 0.0f;
+    pthread_mutex_unlock(&lg_prog_mtx);
+}
+
+static bool lg_on_load_progress(float pct, void *ud)
+{
+    struct lg_prog *s = (struct lg_prog *)ud;
+    if (s) {
+        pthread_mutex_lock(&lg_prog_mtx);
+        s->pct = pct;
+        pthread_mutex_unlock(&lg_prog_mtx);
+    }
+    return true;
+}
+
+/* __loadProgress(id) -> 0..1 while loading, -1 when not in flight */
+static duk_ret_t lg_load_progress(duk_context *ctx)
+{
+    const char *id = duk_get_string(ctx, 0);
+    float pct = -1.0f;
+    if (id && *id) {
+        pthread_mutex_lock(&lg_prog_mtx);
+        for (int i = 0; i < LG_PROG_SLOTS; i++)
+            if (lg_prog[i].busy && !strcmp(lg_prog[i].id, id)) { pct = lg_prog[i].pct; break; }
+        pthread_mutex_unlock(&lg_prog_mtx);
+    }
+    duk_push_number(ctx, (double)pct);
+    return 1;
+}
+
 static rp_llama_info *lg_new_info_e(const lgen_engine_params *p, char *err, size_t errlen)
 {
     lgen_engine *eng = lgen_engine_create(p, err, errlen);
@@ -1171,13 +1233,31 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
     p.model_path    = model_path;
     p.chat_template = chat_template;   /* shim copies into the engine */
     p.use_jinja     = use_jinja;
+    /* opts.__loadId, set by the coordinator, opts a load into progress
+     * reporting.  A cache hit loads nothing and reports nothing, which is
+     * why a caller must treat "no progress" as normal. */
+    struct lg_prog *prog = NULL;
+    if (o > -1 && duk_get_prop_string(ctx, o, "__loadId")) {
+        prog = lg_prog_claim(duk_get_string(ctx, -1));
+        if (prog) {
+            mp.progress_callback           = lg_on_load_progress;
+            mp.progress_callback_user_data = prog;
+        }
+    }
+    if (o > -1) duk_pop(ctx);
+
     p.mparams       = mp;
     p.cparams       = cp;
 
     char nerr[256] = {0};
+    size_t logmark = lg_log_mark();
     rp_llama_info *info = lg_new_info_e(&p, nerr, sizeof nerr); // engine (shared model) + info
+    lg_prog_release(prog);
     if (!info) {
+        char why[512];
+        lg_load_reason(logmark, why, sizeof why);
         free(chat_template);   /* would leak across the longjmp otherwise */
+        if (why[0]) RP_THROW(ctx, "initGen: %s -- %s", nerr, why);
         RP_THROW(ctx, "initGen: %s", nerr);
     }
     lgen_engine *eng = info->eng;
@@ -1252,7 +1332,7 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
  * v1: predict() is fully batched; predictAsync() emulates via a blocking predict
  * then fires the callbacks (true token streaming is a separate, gated step). ---- */
 static const char *BATCHGEN_SCRIPT =
-"(function(mod, model, opts, uid){\n"
+"(function(mod, model, opts, uid, onprog, ondone){\n"
 "  var thread = rampart.thread;\n"
 "  var owner = new thread();\n"
 "  owner.exec(function(a){\n"
@@ -1260,7 +1340,7 @@ static const char *BATCHGEN_SCRIPT =
    dies before publishing `ready_', and initGen blocks for the full
    timeout and then returns a handle with no engine behind it. */
 "    var raw;\n"
-"    try { raw = a.rawInit(a.model, a.opts); }\n"
+"    try { a.opts.__loadId = a.uid; raw = a.rawInit(a.model, a.opts); }\n"
 "    catch(e) { rampart.thread.put('ready_'+a.uid, { err: String(e.message||e) }); return; }\n"
 "    var canc = {};\n"   /* request ids signalled to cancel (set by the cancel event) */
 "    rampart.event.on('can_'+a.uid, 'c', function(uv, c){ canc[c.id] = 1; });\n"
@@ -1288,11 +1368,9 @@ static const char *BATCHGEN_SCRIPT =
 "                                         supportsTools: raw.supportsTools, chatFormat: raw.chatFormat,\n"
 "                                         supportsThinkingToggle: raw.supportsThinkingToggle });\n"
 "  }, { rawInit: mod.__rawInitGen, model: model, opts: opts || {}, uid: uid });\n"
-"  var meta = thread.get('ready_'+uid, 120000);\n"
-"  if (!meta) throw new Error('initGen: the engine did not start within 120s');\n"
-"  if (meta.err) throw new Error(String(meta.err).indexOf('initGen') === 0\n"
-"                                ? meta.err : 'initGen: ' + meta.err);\n"
-"  return {\n"
+"  function fail(m){ return new Error(String(m).indexOf('initGen') === 0\n"
+"                                    ? m : 'initGen: ' + m); }\n"
+"  function mkgen(meta){ return {\n"
 "    __uid: uid, nCtx: meta.nCtx, nVocab: meta.nVocab,\n"
 "    supportsTools: !!meta.supportsTools, chatFormat: meta.chatFormat || '',\n"
 "    supportsThinkingToggle: !!meta.supportsThinkingToggle,\n"
@@ -1332,7 +1410,41 @@ static const char *BATCHGEN_SCRIPT =
 "    },\n"
 "    getLast: function(){ return this._last; },\n"
 "    destroy: function(){ try { owner.terminate(); } catch(e) {} }\n"
-"  };\n"
+"  }; }\n"
+/* ASYNC: return at once, report percent while llama.cpp loads, hand back
+   the engine when the owner publishes.  A cache hit loads nothing and
+   reports no percent at all, so a caller must not read silence as a
+   stall. */
+"  if (typeof onprog === 'function' || typeof ondone === 'function') {\n"
+"    var seen = -1;\n"
+"    var poll = function(){\n"
+"      var m = thread.get('ready_'+uid);\n"
+"      if (m === undefined) {\n"
+"        var pct = mod.__loadProgress(uid);\n"
+"        if (onprog && pct >= 0 && pct !== seen) { seen = pct; onprog(pct); }\n"
+"        setTimeout(poll, 250); return;\n"
+"      }\n"
+/* An async failure with nowhere to report it must not be silent: without
+   an onDone the load error had no path out at all. */
+"      if (m.err) {\n"
+"        if (ondone) ondone(fail(m.err), null);\n"
+"        else rampart.utils.fprintf(rampart.utils.stderr,\n"
+"               'initGenAsync: %s (no onDone callback was given)\\n', String(m.err));\n"
+"        return;\n"
+"      }\n"
+"      if (onprog && seen !== 1) onprog(1);\n"
+"      if (ondone) ondone(null, mkgen(m));\n"
+"    };\n"
+"    setTimeout(poll, 50);\n"
+"    return undefined;\n"
+"  }\n"
+/* SYNC: no deadline.  A cold 35GB model off a slow disk outlasts any
+   constant anyone would pick, and the owner always publishes a result,
+   so the wait is bounded by the load itself. */
+"  var meta;\n"
+"  while ((meta = thread.get('ready_'+uid, 30000)) === undefined) ;\n"
+"  if (meta.err) throw fail(meta.err);\n"
+"  return mkgen(meta);\n"
 "})\n";
 
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
@@ -1399,12 +1511,26 @@ static duk_ret_t lg_init_gen_batched(duk_context *ctx)
     char uid[64];
     snprintf(uid, sizeof uid, "bg%d_%d", (int)getpid(), n);
 
+    /* ASYNC FORM.  initGenAsync(model[, opts], onProgress[, onDone]) takes the
+       same coordinator with two callbacks appended: it returns at once and the
+       engine arrives at onDone.  Arguments are matched by TYPE so the opts
+       object stays optional in both forms. */
+    duk_idx_t optsi = -1, progi = -1, donei = -1, ai;
+    for (ai = 1; ai < duk_get_top(ctx) && ai < 4; ai++) {
+        if (duk_is_function(ctx, ai)) {
+            if (progi < 0)      progi = ai;
+            else if (donei < 0) donei = ai;
+        } else if (duk_is_object(ctx, ai) && optsi < 0) optsi = ai;
+    }
+
     duk_eval_string(ctx, BATCHGEN_SCRIPT);   /* -> wrapper function on the stack */
     duk_push_this(ctx);                       /* mod (this module object, has __rawInitGen) */
     duk_dup(ctx, 0);                          /* model */
-    duk_dup(ctx, 1);                          /* opts (may be undefined) */
+    if (optsi > -1) duk_dup(ctx, optsi); else duk_push_object(ctx);
     duk_push_string(ctx, uid);
-    duk_call(ctx, 4);                         /* wrapper(mod, model, opts, uid) -> gen object */
+    if (progi > -1) duk_dup(ctx, progi); else duk_push_undefined(ctx);
+    if (donei > -1) duk_dup(ctx, donei); else duk_push_undefined(ctx);
+    duk_call(ctx, 6);                         /* wrapper(mod, model, opts, uid, onProgress, onDone) */
     return 1;
 }
 
@@ -3851,6 +3977,70 @@ static void llamacpp_logger(enum ggml_log_level level, const char *text, void *u
  * takes no user data. */
 static struct llog_cap *llog_cap_for_abort = NULL;
 
+/* llama.cpp's own words for a failed load.  The shim reports "could not
+ * load model"; the reason -- nearly always a size that did not fit -- is
+ * in the captured log.  Scanned from a mark taken before the load so a
+ * previous failure cannot be reported as this one's. */
+static size_t lg_log_mark(void)
+{
+    size_t at = 0;
+    struct llog_cap *cap = llog_cap_for_abort;
+    if (!cap) return 0;
+    pthread_mutex_lock(&cap->mutex);
+    at = cap->len;
+    pthread_mutex_unlock(&cap->mutex);
+    return at;
+}
+
+static void lg_load_reason(size_t from, char *out, size_t outlen)
+{
+    char why[320] = {0}, oom[320] = {0}, alloc[320] = {0}, line[512];
+    const char *detail;
+    struct llog_cap *cap = llog_cap_for_abort;
+
+    if (outlen) out[0] = 0;
+    if (!cap) return;
+
+    pthread_mutex_lock(&cap->mutex);
+    if (cap->buf && cap->len > from)
+    {
+        const char *p = cap->buf + from, *end = cap->buf + cap->len, *m;
+        while (p < end)
+        {
+            const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+            size_t n = nl ? (size_t)(nl - p) : (size_t)(end - p);
+            if (n >= sizeof line) n = sizeof line - 1;
+            memcpy(line, p, n);
+            line[n] = 0;
+            /* keep the LAST of each: later lines sit closer to the failure */
+            if ((m = strstr(line, "error loading model: ")))
+                snprintf(why, sizeof why, "%s", m + strlen("error loading model: "));
+            /* the out-of-memory line carries the size in MiB and the cause;
+               the alloc line only repeats it in bytes, so it is the fallback */
+            else if (strstr(line, "cudaMalloc failed") || strstr(line, "out of memory"))
+                snprintf(oom, sizeof oom, "%s", line);
+            else if (strstr(line, "failed to allocate"))
+                snprintf(alloc, sizeof alloc, "%s", line);
+            p = nl ? nl + 1 : end;
+        }
+    }
+    pthread_mutex_unlock(&cap->mutex);
+
+    detail = oom[0] ? oom : (alloc[0] ? alloc : NULL);
+    /* drop a leading "some_function_name: " -- it names the internal that
+       noticed, which tells a reader nothing */
+    if (detail)
+    {
+        const char *c = strstr(detail, ": ");
+        if (c && !memchr(detail, ' ', (size_t)(c - detail))) detail = c + 2;
+    }
+
+    if (why[0] && detail) snprintf(out, outlen, "%s (%s)", why, detail);
+    else if (why[0])      snprintf(out, outlen, "%s", why);
+    else if (detail)      snprintf(out, outlen, "%s", detail);
+}
+
+
 /* ggml calls this immediately before abort() -- a failed CUDA/Metal call, a
  * GGML_ASSERT.  Nothing else here writes to stderr: the ordinary log goes only
  * to the capture buffer (.getLog()).  But that buffer dies with the process,
@@ -4044,8 +4234,15 @@ duk_ret_t duk_open_module(duk_context *ctx)
     duk_push_c_function(ctx, lg_init_gen, 2);
     duk_put_prop_string(ctx, -2, "__rawInitGen");   // raw per-thread slot engine (used by initGen's owner thread)
 
+    duk_push_c_function(ctx, lg_load_progress, 1);
+    duk_put_prop_string(ctx, -2, "__loadProgress"); // 0..1 while a load is in flight, -1 otherwise
+
     duk_push_c_function(ctx, lg_init_gen_batched, 2);
     duk_put_prop_string(ctx, -2, "initGen");        // transparent cross-thread batching wrapper
+
+    /* same coordinator, non-blocking: initGenAsync(model[, opts], onProgress[, onDone]) */
+    duk_push_c_function(ctx, lg_init_gen_batched, 4);
+    duk_put_prop_string(ctx, -2, "initGenAsync");
 
     duk_push_c_function(ctx, llamacpp_init_rerank, 2);
     duk_put_prop_string(ctx, -2, "initRerank");
