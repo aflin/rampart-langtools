@@ -1256,7 +1256,12 @@ static const char *BATCHGEN_SCRIPT =
 "  var thread = rampart.thread;\n"
 "  var owner = new thread();\n"
 "  owner.exec(function(a){\n"
-"    var raw = a.rawInit(a.model, a.opts);\n"
+/* A load that fails here must reach the CALLER.  Without this the owner
+   dies before publishing `ready_', and initGen blocks for the full
+   timeout and then returns a handle with no engine behind it. */
+"    var raw;\n"
+"    try { raw = a.rawInit(a.model, a.opts); }\n"
+"    catch(e) { rampart.thread.put('ready_'+a.uid, { err: String(e.message||e) }); return; }\n"
 "    var canc = {};\n"   /* request ids signalled to cancel (set by the cancel event) */
 "    rampart.event.on('can_'+a.uid, 'c', function(uv, c){ canc[c.id] = 1; });\n"
 "    rampart.event.on('sub_'+a.uid, 'h', function(uv, r){\n"
@@ -1283,7 +1288,10 @@ static const char *BATCHGEN_SCRIPT =
 "                                         supportsTools: raw.supportsTools, chatFormat: raw.chatFormat,\n"
 "                                         supportsThinkingToggle: raw.supportsThinkingToggle });\n"
 "  }, { rawInit: mod.__rawInitGen, model: model, opts: opts || {}, uid: uid });\n"
-"  var meta = thread.get('ready_'+uid, 120000) || {};\n"
+"  var meta = thread.get('ready_'+uid, 120000);\n"
+"  if (!meta) throw new Error('initGen: the engine did not start within 120s');\n"
+"  if (meta.err) throw new Error(String(meta.err).indexOf('initGen') === 0\n"
+"                                ? meta.err : 'initGen: ' + meta.err);\n"
 "  return {\n"
 "    __uid: uid, nCtx: meta.nCtx, nVocab: meta.nVocab,\n"
 "    supportsTools: !!meta.supportsTools, chatFormat: meta.chatFormat || '',\n"
