@@ -876,7 +876,18 @@ static bool build_context(lgen_engine *e, char *err, size_t errlen) {
         if (bos == LLAMA_TOKEN_NULL) bos = (llama_token) 0;
         common_batch_clear(e->batch);
         common_batch_add(e->batch, bos, 0, { 0 }, true);
-        (void) llama_decode(e->ctx, e->batch);
+        /* The warm-up is the first graph run, so it is where a context that
+           cannot actually compute -- weights fit, compute buffers do not --
+           first fails.  Reporting success here defers that to the reader's
+           first question, as a bare "compute error".  <0 is a real failure
+           (-2 alloc, -3 compute); >0 only means no KV slot, which a single
+           BOS token on a fresh context should never hit. */
+        const int wret = llama_decode(e->ctx, e->batch);
+        if (wret < 0) {
+            set_err(err, errlen, "engine created but cannot decode (warm-up "
+                                 "failed: " + std::to_string(wret) + ")");
+            return false;
+        }
         llama_memory_clear(llama_get_memory(e->ctx), true);
         common_batch_clear(e->batch);
     }

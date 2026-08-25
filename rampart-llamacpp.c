@@ -504,7 +504,7 @@ static void   lg_load_reason(size_t from, char *out, size_t outlen);
  * store a float -- never re-enter duktape.  A waiting thread reads it by
  * id.  Returning false would cancel the load; nothing does yet. */
 #define LG_PROG_SLOTS 8
-static struct lg_prog { char id[64]; float pct; int busy; } lg_prog[LG_PROG_SLOTS];
+static struct lg_prog { char id[64]; float pct; int busy; int cancel; } lg_prog[LG_PROG_SLOTS];
 static pthread_mutex_t lg_prog_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static struct lg_prog *lg_prog_claim(const char *id)
@@ -517,6 +517,7 @@ static struct lg_prog *lg_prog_claim(const char *id)
     if (s) {
         snprintf(s->id, sizeof s->id, "%s", id);
         s->pct = 0.0f;
+        s->cancel = 0;
         s->busy = 1;
     }
     pthread_mutex_unlock(&lg_prog_mtx);
@@ -527,19 +528,40 @@ static void lg_prog_release(struct lg_prog *s)
 {
     if (!s) return;
     pthread_mutex_lock(&lg_prog_mtx);
-    s->busy = 0; s->id[0] = 0; s->pct = 0.0f;
+    s->busy = 0; s->id[0] = 0; s->pct = 0.0f; s->cancel = 0;
     pthread_mutex_unlock(&lg_prog_mtx);
 }
 
 static bool lg_on_load_progress(float pct, void *ud)
 {
     struct lg_prog *s = (struct lg_prog *)ud;
+    int go = 1;
     if (s) {
         pthread_mutex_lock(&lg_prog_mtx);
         s->pct = pct;
+        go = !s->cancel;        /* false here tells llama.cpp to stop loading */
+        if (!go) s->cancel = 2; /* 2 = the load actually saw it and stopped */
         pthread_mutex_unlock(&lg_prog_mtx);
     }
-    return true;
+    return go ? true : false;
+}
+
+/* __cancelLoad(id) -> true if a load with that id was in flight.  The load
+ * stops at its next progress report, so a cancel is not instant. */
+static duk_ret_t lg_cancel_load(duk_context *ctx)
+{
+    const char *id = duk_get_string(ctx, 0);
+    int found = 0;
+    if (id && *id) {
+        pthread_mutex_lock(&lg_prog_mtx);
+        for (int i = 0; i < LG_PROG_SLOTS; i++)
+            if (lg_prog[i].busy && !strcmp(lg_prog[i].id, id)) {
+                lg_prog[i].cancel = 1; found = 1; break;
+            }
+        pthread_mutex_unlock(&lg_prog_mtx);
+    }
+    duk_push_boolean(ctx, found);
+    return 1;
 }
 
 /* __loadProgress(id) -> 0..1 while loading, -1 when not in flight */
@@ -1252,11 +1274,18 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
     char nerr[256] = {0};
     size_t logmark = lg_log_mark();
     rp_llama_info *info = lg_new_info_e(&p, nerr, sizeof nerr); // engine (shared model) + info
+    int cancelled = 0;
+    if (prog) {
+        pthread_mutex_lock(&lg_prog_mtx);
+        cancelled = (prog->cancel == 2);
+        pthread_mutex_unlock(&lg_prog_mtx);
+    }
     lg_prog_release(prog);
     if (!info) {
         char why[512];
         lg_load_reason(logmark, why, sizeof why);
         free(chat_template);   /* would leak across the longjmp otherwise */
+        if (cancelled) RP_THROW(ctx, "initGen: load cancelled");
         if (why[0]) RP_THROW(ctx, "initGen: %s -- %s", nerr, why);
         RP_THROW(ctx, "initGen: %s", nerr);
     }
@@ -1427,16 +1456,22 @@ static const char *BATCHGEN_SCRIPT =
 /* An async failure with nowhere to report it must not be silent: without
    an onDone the load error had no path out at all. */
 "      if (m.err) {\n"
-"        if (ondone) ondone(fail(m.err), null);\n"
+"        var e = fail(m.err);\n"
+"        if (ondone) ondone(e, null);\n"
 "        else rampart.utils.fprintf(rampart.utils.stderr,\n"
-"               'initGenAsync: %s (no onDone callback was given)\\n', String(m.err));\n"
+"               'initGenAsync: %s (no onDone callback was given)\\n', e.message);\n"
 "        return;\n"
 "      }\n"
 "      if (onprog && seen !== 1) onprog(1);\n"
 "      if (ondone) ondone(null, mkgen(m));\n"
 "    };\n"
 "    setTimeout(poll, 50);\n"
-"    return undefined;\n"
+/* the caller gets a way to stop it.  llama.cpp only checks between progress
+   reports, so a cancel lands at the next one, not instantly -- and a load
+   already served from the model cache cannot be cancelled at all. */
+"    return { cancel: function(){\n"
+"      return !!mod.__cancelLoad(uid);\n"
+"    } };\n"
 "  }\n"
 /* SYNC: no deadline.  A cold 35GB model off a slow disk outlasts any
    constant anyone would pick, and the owner always publishes a result,
@@ -4236,6 +4271,9 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     duk_push_c_function(ctx, lg_load_progress, 1);
     duk_put_prop_string(ctx, -2, "__loadProgress"); // 0..1 while a load is in flight, -1 otherwise
+
+    duk_push_c_function(ctx, lg_cancel_load, 1);
+    duk_put_prop_string(ctx, -2, "__cancelLoad");   // stop an in-flight load
 
     duk_push_c_function(ctx, lg_init_gen_batched, 2);
     duk_put_prop_string(ctx, -2, "initGen");        // transparent cross-thread batching wrapper
