@@ -1363,6 +1363,12 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
 static const char *BATCHGEN_SCRIPT =
 "(function(mod, model, opts, uid, onprog, ondone){\n"
 "  var thread = rampart.thread;\n"
+/* Seconds of NO load progress before the wait gives up.  Not a deadline:
+   it resets whenever llama.cpp reports progress, so a slow load is fine.
+   Raise it for a model whose allocation phase is long and silent -- the
+   clock only runs while nothing is being reported. */
+"  var stallsec = (opts && Number(opts.loadStallSeconds) > 0)\n"
+"               ? Number(opts.loadStallSeconds) : 120;\n"
 "  var owner = new thread();\n"
 "  owner.exec(function(a){\n"
 /* A load that fails here must reach the CALLER.  Without this the owner
@@ -1445,12 +1451,21 @@ static const char *BATCHGEN_SCRIPT =
    reports no percent at all, so a caller must not read silence as a
    stall. */
 "  if (typeof onprog === 'function' || typeof ondone === 'function') {\n"
-"    var seen = -1;\n"
+"    var seen = -1, quiet = 0;\n"
 "    var poll = function(){\n"
 "      var m = thread.get('ready_'+uid);\n"
 "      if (m === undefined) {\n"
 "        var pct = mod.__loadProgress(uid);\n"
-"        if (onprog && pct >= 0 && pct !== seen) { seen = pct; onprog(pct); }\n"
+"        if (pct >= 0 && pct !== seen) {\n"
+"          seen = pct; quiet = 0;\n"
+"          if (onprog) onprog(pct);\n"
+"        } else if ((quiet += 0.25) >= stallsec) {\n"
+"          var st = new Error('initGen: the engine did not start -- no '\n"
+"                           + 'load progress for ' + quiet + 's');\n"
+"          if (ondone) ondone(st, null);\n"
+"          else rampart.utils.fprintf(rampart.utils.stderr, '%s\\n', st.message);\n"
+"          return;\n"
+"        }\n"
 "        setTimeout(poll, 250); return;\n"
 "      }\n"
 /* An async failure with nowhere to report it must not be silent: without
@@ -1473,11 +1488,23 @@ static const char *BATCHGEN_SCRIPT =
 "      return !!mod.__cancelLoad(uid);\n"
 "    } };\n"
 "  }\n"
-/* SYNC: no deadline.  A cold 35GB model off a slow disk outlasts any
-   constant anyone would pick, and the owner always publishes a result,
-   so the wait is bounded by the load itself. */
-"  var meta;\n"
-"  while ((meta = thread.get('ready_'+uid, 30000)) === undefined) ;\n"
+/* SYNC: bounded by PROGRESS, not by a constant.  A cold 35GB model off a
+   slow disk outlasts any fixed deadline, so waiting a fixed time is
+   wrong -- but waiting forever is worse: an owner that dies before it
+   can publish leaves the caller asleep holding whatever it allocated
+   (measured once at 20 hours and 36GB).  So wait as long as the load
+   is moving, and give up when nothing has happened for LOADSTALL
+   seconds.  A cache hit publishes at once and never reports progress,
+   which is why the stall clock has to be generous. */
+"  var meta, seen = -1, quiet = 0;\n"
+"  while ((meta = thread.get('ready_'+uid, 2000)) === undefined) {\n"
+"    var pct = mod.__loadProgress(uid);\n"
+"    if (pct >= 0 && pct !== seen) { seen = pct; quiet = 0; }\n"
+"    else if ((quiet += 2) >= stallsec) {\n"
+"      throw new Error('initGen: the engine did not start -- no load '\n"
+"                    + 'progress for ' + quiet + 's (the loader may have died)');\n"
+"    }\n"
+"  }\n"
 "  if (meta.err) throw fail(meta.err);\n"
 "  return mkgen(meta);\n"
 "})\n";
