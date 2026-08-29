@@ -3170,11 +3170,34 @@ static duk_ret_t llamacpp_model_info(duk_context *ctx)
         }
     }
 
+    /* THE CHAT TEMPLATE, which is where a model states what it accepts.
+     *
+     * It is in the GGUF as tokenizer.chat_template, but the loader's own
+     * log truncates long string metadata to about forty characters, so
+     * the captured log proves only that a template EXISTS.  Callers that
+     * need to know which reasoning_effort values a model takes -- the
+     * template validates them and raises on anything else -- had no way
+     * to ask.  llama.cpp keeps the string alive with the model, so it is
+     * copied out before the model is freed below.
+     *
+     * Returned RAW.  What the levels are is a question about Jinja, and
+     * the answer differs per model family; deciding it here would bake a
+     * heuristic into C that callers cannot correct. */
+    const char *tmpl = llama_model_chat_template(m, NULL);
+
     long     hidden_dim = lt_meta_long(m, arch, "embedding_length", 0);
     long     embed_dim  = lt_meta_long(m, arch, "embedding_length_out", hidden_dim);
     long     n_ctx_tr   = lt_meta_long(m, arch, "context_length", 0);
     long     n_layer    = lt_meta_long(m, arch, "block_count", 0);
     uint64_t nparm      = llama_model_n_params(m);
+
+    /* before llama_model_free(): the string belongs to the model */
+    char *tmpl_copy = NULL;
+    if (tmpl && *tmpl) {
+        size_t tl = strlen(tmpl);
+        tmpl_copy = (char *)malloc(tl + 1);
+        if (tmpl_copy) memcpy(tmpl_copy, tmpl, tl + 1);
+    }
 
     llama_model_free(m);
 
@@ -3186,6 +3209,11 @@ static duk_ret_t llamacpp_model_info(duk_context *ctx)
     duk_push_string(ctx, arch);          duk_put_prop_string(ctx, -2, "arch");
     duk_push_string(ctx, pooling);       duk_put_prop_string(ctx, -2, "pooling");
     duk_push_number(ctx, (double)nparm); duk_put_prop_string(ctx, -2, "nParams");
+    if (tmpl_copy) {
+        duk_push_string(ctx, tmpl_copy);
+        duk_put_prop_string(ctx, -2, "chatTemplate");
+        free(tmpl_copy);
+    }
     return 1;
 }
 
