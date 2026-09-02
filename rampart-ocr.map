@@ -1,0 +1,24 @@
+# Linker version script for rampart-ocr.so.
+#
+# This module bundles its own stb_image (header-only, compiled into ocr-image.c).
+# rampart dlopen's modules RTLD_GLOBAL, so without this its ~43 stbi_* symbols
+# would be published into the global dynamic namespace, where rampart-clip --
+# which bundles the same header -- already publishes its own copy. Whichever
+# module loaded first would then satisfy the other's *exported* references. The
+# two copies are the same vendored file today, so nothing breaks; that is
+# precisely why it would be an unpleasant bug to acquire later, when one side
+# updates stb and the other does not.
+#
+# Export ONLY the module entry point. Internal cross-TU symbols (ocr_warn, the
+# det/rec/cls helpers) stay local: they are called within this .so, which
+# -Bsymbolic-functions already binds locally.
+#
+# rampart-ocr deliberately has no C ABI of its own yet. If one is added later,
+# give it an rp_ocr_* prefix and list it here, the way rampart-onnx.map exposes
+# rp_onnx_embed_* / rp_onnx_sess_*.
+{
+  global:
+    duk_open_module;
+  local:
+    *;
+};

@@ -139,6 +139,41 @@ add_subdirectory(${EXTERN_DIR}/llama.cpp ${CMAKE_BINARY_DIR}/extern/llama.cpp EX
 set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(${EXTERN_DIR}/sentencepiece EXCLUDE_FROM_ALL)
 
+# LIBTIFF -- TIFF decoding for rampart-ocr.
+#
+# Vendored and STATICALLY linked rather than linked against the system copy,
+# because there frequently is no system copy to link: the manylinux build ovens
+# carry no libtiff at all, macOS ships none in /usr/lib (TIFF lives behind the
+# ImageIO framework; the only copy on our Macs came from Homebrew), and even on
+# Debian -- where libtiff6 is present -- it arrives as a transitive dependency of
+# desktop applications rather than as a base package, and the headers are absent
+# everywhere.  Vendoring is also what makes every other module here run on a bare
+# host, so this follows the same rule as ORT, faiss and llama.cpp.
+#
+# TIFF matters because multi-page Group 4 is a standard archive format for
+# scanned documents, and stb_image has never supported it.  G3/G4, PackBits and
+# LZW are built into libtiff itself, so the codecs that scans actually use need
+# no external dependency; the optional third-party codecs are all disabled so
+# this adds exactly one library and no transitive ones.
+set(tiff-tools    OFF CACHE BOOL "" FORCE)
+set(tiff-tests    OFF CACHE BOOL "" FORCE)
+set(tiff-docs     OFF CACHE BOOL "" FORCE)
+set(tiff-contrib  OFF CACHE BOOL "" FORCE)
+set(tiff-install  OFF CACHE BOOL "" FORCE)
+set(jpeg          OFF CACHE BOOL "" FORCE)   # JPEG-in-TIFF: would drag in libjpeg
+set(old-jpeg      OFF CACHE BOOL "" FORCE)
+set(jbig          OFF CACHE BOOL "" FORCE)
+set(lzma          OFF CACHE BOOL "" FORCE)
+set(zstd          OFF CACHE BOOL "" FORCE)
+set(webp          OFF CACHE BOOL "" FORCE)
+set(lerc          OFF CACHE BOOL "" FORCE)
+set(libdeflate    OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${EXTERN_DIR}/libtiff ${CMAKE_BINARY_DIR}/extern/libtiff EXCLUDE_FROM_ALL)
+set(TIFF_INCLUDE_DIRS
+    ${EXTERN_DIR}/libtiff/libtiff
+    ${CMAKE_BINARY_DIR}/extern/libtiff/libtiff)
+
 
 # FAISS
 set(FAISS_ENABLE_PYTHON OFF CACHE BOOL "FAISS_ENABLE_PYTHON" FORCE)

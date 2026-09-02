@@ -24,6 +24,8 @@ function loadModule() {
     if (process.env.LTMOD) { try { return require(process.env.LTMOD); } catch(e) {} }
     var tries = [
         sp + '/build/rampart-llamacpp',
+        sp + '/build-cpu/rampart-llamacpp',
+        sp + '/build-gpu/rampart-llamacpp',
         sp + '/build_gpu/rampart-llamacpp',
         sp + '/build_cpu/rampart-llamacpp',
         sp + '/modules/rampart-llamacpp',

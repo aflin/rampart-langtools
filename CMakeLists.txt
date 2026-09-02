@@ -788,6 +788,10 @@ if(ONNX_LIBS)
     rampart-onnx.c
     rp-chunker.c
     rp-embed-cache.c
+    # public session C ABI (rp-onnx-session.h) -- lets sibling modules run their
+    # own graphs on the ORT statically linked here rather than bundling a second
+    # copy (two ORTs => duplicate protobuf/abseil static init).
+    rp-onnx-session.c
     $<TARGET_OBJECTS:onnx_shim_obj>
   )
   # build + merge the ORT static archives (ExternalProject) before linking,
@@ -823,6 +827,8 @@ if(ONNX_LIBS)
       "-Wl,-exported_symbol,_duk_open_module"
       # the C embed API (dlsym'd by rampart-sql) -- mirrors rampart-onnx.map
       "-Wl,-exported_symbol,_rp_onnx_embed_*"
+      # the session C ABI (dlsym'd by rampart-ocr) -- mirrors rampart-onnx.map
+      "-Wl,-exported_symbol,_rp_onnx_sess_*"
     )
   else()
     # Localize all of statically-linked ORT's symbols (bundled protobuf/abseil/
@@ -851,6 +857,70 @@ if(ONNX_LIBS)
     "${CMAKE_CURRENT_SOURCE_DIR}/onnx-test.js"
     DESTINATION "${RP_PATH}/test")
   message(STATUS "rampart-langtools: rampart-onnx target enabled")
+
+  # -------------------------------------------------------------------------
+  # rampart-ocr : PP-OCR (detection / angle / recognition) over rampart-onnx's
+  # engine.  Note what is absent: no ONNX include dirs, no ONNX_LIBS, no
+  # onnxruntime_ep dependency.  This module carries NO ORT of its own -- it
+  # dlopens rampart-onnx.so beside itself at require() time and calls the
+  # rp_onnx_sess_* ABI (rp-onnx-session.h).  A second static ORT in the same
+  # process would mean duplicate protobuf/abseil static init.
+  # Built alongside rampart-onnx because it is useless without it.
+  # -------------------------------------------------------------------------
+  add_library(rampart-ocr SHARED
+    rampart-ocr.c
+    ocr-image.c
+    ocr-det.c
+    ocr-rec.c
+  )
+  # stb_image.h (public domain) is vendored under extern/clip; ocr-image.c
+  # compiles its own copy.  rampart-ocr.map keeps the resulting stbi_* symbols
+  # local so they cannot bind against rampart-clip's copy of the same header.
+  target_include_directories(rampart-ocr PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern/clip
+    ${TIFF_INCLUDE_DIRS}
+  )
+  # libtiff: TIFF (incl. multi-page Group 4) decoding, which stb_image lacks.
+  # Statically linked -- see the note in extern.cmake for why the system copy
+  # is not an option on our build or deploy targets.
+  target_link_libraries(rampart-ocr PRIVATE tiff)
+  add_dependencies(rampart-ocr tiff)
+  set_target_properties(rampart-ocr PROPERTIES
+    SUFFIX ".so"
+    PREFIX ""
+    OUTPUT_NAME "rampart-ocr"
+    INSTALL_RPATH "${LT_RPATH}"
+    BUILD_RPATH   "${LT_RPATH}"
+  )
+  if(APPLE)
+    target_link_options(rampart-ocr PRIVATE
+      "-Wl,-headerpad_max_install_names"
+      "-Wl,-undefined,dynamic_lookup"
+      "-Wl,-install_name,@rpath/rampart-ocr.so"
+      "-Wl,-exported_symbol,_duk_open_module"
+    )
+  else()
+    target_link_options(rampart-ocr PRIVATE
+      "-Wl,-soname,@rpath/rampart-ocr.so"
+      "-Wl,-Bsymbolic-functions"
+      # export only duk_open_module: keep this module's bundled stb_image out of
+      # the global namespace, where rampart-clip already publishes its own copy.
+      "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/rampart-ocr.map"
+    )
+    target_link_libraries(rampart-ocr PRIVATE dl m)
+  endif()
+  install(TARGETS rampart-ocr DESTINATION "${RP_PATH}/modules")
+  install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-ocr.so\")")
+  install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/ocr-test.js"
+    DESTINATION "${RP_PATH}/test")
+  # ocr-test.js reads its pages from <prefix>/test/test_docs/ -- public-domain
+  # or generated here; see test_docs/PROVENANCE.md.  (The models are downloaded
+  # on demand by rampart-models, not shipped.)
+  install(DIRECTORY
+    "${CMAKE_CURRENT_SOURCE_DIR}/test_docs"
+    DESTINATION "${RP_PATH}/test")
+  message(STATUS "rampart-langtools: rampart-ocr target enabled")
 elseif(ONNX_GPU)
   # GPU (cu12/cu13) flavor: no module -- install this flavor's ORT runtime dir
   # (modules/onnx-${SUFFIX}/) for the unified rampart-onnx.so to dlopen.

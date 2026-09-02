@@ -23,6 +23,11 @@
     rp_onnx_embed_dim;
     rp_onnx_embed_set_cache_cap;
     rp_onnx_embed_release;
+    /* Session C ABI (rp-onnx-session.h), dlsym'd by sibling modules that need to
+     * run their own graphs on this module's statically-linked ORT instead of
+     * bundling a second copy -- rampart-ocr is the first.  Still no ORT/protobuf
+     * symbol is published: these are our own thin wrappers. */
+    rp_onnx_sess_*;
   local:
     *;
 };

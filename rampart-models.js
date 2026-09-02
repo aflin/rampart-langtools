@@ -242,6 +242,58 @@ var CATALOG = {
 /* ==== END GENERATED CATALOG ==== */
 
 /* ------------------------------------------------------------------ *
+ * OCR catalog (hand-maintained -- gen-model-list.js only knows about
+ * gguf/onnx text models, and an OCR entry is a different shape: a small
+ * SET of role-named files, not one model + tokenizer).
+ *
+ * PP-OCR is three graphs plus a character dictionary, so the entry names
+ * each file by ROLE (det / rec / cls / dict) and the fetcher pulls the
+ * set into one directory.  `variants` picks the accuracy/size tradeoff:
+ * `mobile` (~21 MB total) is the default and is what a page-at-a-time
+ * document pipeline wants; `server` (~172 MB) is more accurate on hard
+ * scans.  cls and dict are shared by both.
+ *
+ * Repo choice: bukuroo/PPOCRv5-ONNX is the only Apache-2.0 PP-OCRv5 ONNX
+ * conversion carrying ALL FOUR roles in one place (SWHL/RapidOCR -- the
+ * RapidOCR maintainer's own repo -- stops at v4 and ships no dictionary;
+ * webnn/PP-OCRv5-ONNX has no cls).  It is a third-party re-upload, so the
+ * revision is PINNED and every file is sha256-verified on download; the
+ * underlying PP-OCRv5 weights are Apache-2.0 from PaddlePaddle.
+ *
+ * The rec graph emits 18385 classes against a 18383-line dictionary:
+ * PP-OCR's character list is blank + dict + space (1+18383+1), which is
+ * what a CTC decoder must reconstruct.  Verified against the real graph,
+ * not assumed.
+ * ------------------------------------------------------------------ */
+var OCR_CATALOG = {
+    "ppocr-v5": {
+        category: "ocr",
+        ocr: {
+            repo: "bukuroo/PPOCRv5-ONNX",
+            revision: "47b3e1b4e90c79737cb71f562a6c85809067c7a5",
+            license: "apache-2.0",
+            defaultVariant: "mobile",
+            /* shared by every variant */
+            common: {
+                cls:  { file: "ppocrv5-cls.onnx",  size: 582663 },
+                dict: { file: "ppocrv5_dict.txt",  size: 92395  }
+            },
+            variants: {
+                mobile: {
+                    det: { file: "ppocrv5-mobile-det.onnx", size: 4748769  },
+                    rec: { file: "ppocrv5-mobile-rec.onnx", size: 16517247 }
+                },
+                server: {
+                    det: { file: "ppocrv5-server-det.onnx", size: 87697340 },
+                    rec: { file: "ppocrv5-server-rec.onnx", size: 84137438 }
+                }
+            }
+        }
+    }
+};
+for (var _k in OCR_CATALOG) CATALOG[_k] = OCR_CATALOG[_k];
+
+/* ------------------------------------------------------------------ *
  * small helpers
  * ------------------------------------------------------------------ */
 function mb(n) { return n / 1048576; }
@@ -739,6 +791,80 @@ function getOnnx(name, entry, o) {
     return modelFile;
 }
 
+/* Fetch an OCR model SET (PP-OCR: det + rec + cls + dict) into one directory.
+ *
+ * Unlike getGguf/getOnnx this returns an OBJECT, not a path:
+ *
+ *     { dir, det, rec, cls, dict, variant }     (absolute paths)
+ *
+ * because "the model" here is genuinely four files with distinct roles, and the
+ * consumer (ocr.init) needs each by role.  Guessing roles from filenames later
+ * would be fragile -- conversions do not agree on naming -- so the roles are
+ * resolved here, where the catalog states them, and also recorded in
+ * .source.json so an already-downloaded directory is self-describing.
+ *
+ * o.variant selects mobile (default) or server.  Returns null if o.confirm
+ * declines, matching the other fetchers. */
+function getOcr(name, entry, o) {
+    var x = entry.ocr, i;
+    if (!x) throwErr("'%s' has no ocr source", name);
+
+    var cat = o.category || entry.category || "ocr";
+    var dir = o.dest || (modelsDir() + "/" + cat + "/" + name);
+    var rev = o.revision || x.revision;
+    var variant = ("" + (o.variant || x.defaultVariant || "mobile")).toLowerCase();
+
+    var vset = x.variants && x.variants[variant];
+    if (!vset)
+        throwErr("unknown ocr variant '%s' for %s (have: %s)", variant, name,
+                 Object.keys(x.variants || {}).join(", "));
+
+    /* role -> {file,size}: the variant's det/rec plus the shared cls/dict */
+    var roles = {}, r;
+    for (r in x.common)  roles[r] = x.common[r];
+    for (r in vset)      roles[r] = vset[r];
+
+    var names = Object.keys(roles);
+    var out = { dir: dir, variant: variant };
+    for (i = 0; i < names.length; i++)
+        out[names[i]] = dir + "/" + roles[names[i]].file;
+
+    /* already complete?  (every role present on disk) */
+    var missing = [];
+    for (i = 0; i < names.length; i++)
+        if (!isFile(out[names[i]])) missing.push(names[i]);
+    if (!o.force && !missing.length) return out;
+
+    /* size the prompt on what is actually missing, not the whole set */
+    var total = 0;
+    for (i = 0; i < missing.length; i++) total += (roles[missing[i]].size || 0);
+    if (!confirmed(o, { name: name, format: "ocr", variant: variant, dest: dir,
+                        files: missing, bytes: total, size: sizeStr(total),
+                        repo: x.repo }))
+        return null;
+
+    /* sha256 comes from the repo tree (the catalog carries sizes, not hashes) */
+    var tree = repoTree(x.repo, rev, o.token) || [];
+    var sha = {};
+    for (i = 0; i < tree.length; i++) if (tree[i].sha256) sha[tree[i].path] = tree[i].sha256;
+
+    var fetchList = o.force ? names : missing;
+    for (i = 0; i < fetchList.length; i++) {
+        var f = roles[fetchList[i]].file;
+        fetchFile(resolveUrl(x.repo, rev, f), dir + "/" + f, {
+            size: roles[fetchList[i]].size, sha256: sha[f],
+            progress: o.progress, token: o.token, force: o.force,
+            label: name + "/" + f
+        });
+    }
+
+    var prov = { repo: x.repo, revision: rev, endpoint: HF, variant: variant, roles: {} };
+    for (i = 0; i < names.length; i++) prov.roles[names[i]] = roles[names[i]].file;
+    u.writeFile(dir + "/.source.json", u.sprintf("%4J", prov));
+
+    return out;
+}
+
 /* ------------------------------------------------------------------ *
  * resolution: catalog / repo-id / live search
  * ------------------------------------------------------------------ */
@@ -958,9 +1084,13 @@ function get(name, o) {
         }
     }
 
+    /* an ocr entry is a role-named SET of files, and no other format can serve
+     * it -- so it selects itself rather than waiting to be asked for */
     var format = o.format ||
-        (entry.onnx && (entry.category === "embed" || entry.category === "rerank") ? "onnx"
-                     : (entry.gguf ? "gguf" : "onnx"));
+        (entry.ocr ? "ocr"
+                   : (entry.onnx && (entry.category === "embed" || entry.category === "rerank") ? "onnx"
+                     : (entry.gguf ? "gguf" : "onnx")));
+    if (format === "ocr")  return getOcr(alias, entry, o);
     return format === "gguf" ? getGguf(alias, entry, o)
                              : getOnnx(alias, entry, o);
 }
@@ -968,9 +1098,11 @@ function get(name, o) {
 function list() {
     var out = {};
     for (var k in CATALOG) {
-        var c = CATALOG[k].category;
-        (out[c] = out[c] || []).push(k + (CATALOG[k].onnx ? " [onnx" : " [") +
-            (CATALOG[k].gguf ? (CATALOG[k].onnx ? "+gguf]" : "gguf]") : "]"));
+        var e = CATALOG[k], f = [];
+        if (e.onnx) f.push("onnx");
+        if (e.gguf) f.push("gguf");
+        if (e.ocr)  f.push("ocr");       /* det+rec+cls+dict set */
+        (out[e.category] = out[e.category] || []).push(k + " [" + f.join("+") + "]");
     }
     return out;
 }
@@ -1000,6 +1132,20 @@ function installedVariants(name, entry) {
         }
         if (found.length) parts.push("gguf " + found.join("/"));
     }
+    if (entry.ocr) {
+        /* an ocr set counts as installed per VARIANT: shared cls/dict plus that
+         * variant's det+rec all on disk */
+        var odir2 = modelsDir() + "/" + cat + "/" + name, vfound = [], v, rr;
+        for (v in entry.ocr.variants) {
+            var all2 = true;
+            for (rr in entry.ocr.common)
+                if (!isFile(odir2 + "/" + entry.ocr.common[rr].file)) { all2 = false; break; }
+            if (all2) for (rr in entry.ocr.variants[v])
+                if (!isFile(odir2 + "/" + entry.ocr.variants[v][rr].file)) { all2 = false; break; }
+            if (all2) vfound.push(v);
+        }
+        if (vfound.length) parts.push("ocr " + vfound.join("/"));
+    }
     return parts.length ? parts.join(", ") : null;
 }
 
@@ -1013,7 +1159,8 @@ var LIC_PHRASE = {
 };
 function licPhrase(entry) {
     var l = entry.license ||
-            (entry.gguf && entry.gguf.license) || (entry.onnx && entry.onnx.license);
+            (entry.gguf && entry.gguf.license) || (entry.onnx && entry.onnx.license) ||
+            (entry.ocr && entry.ocr.license);
     if (!l) return "";
     if (LIC_PHRASE[l]) return LIC_PHRASE[l];
     if (/^bsd/i.test(l)) return "BSD";
@@ -1079,6 +1226,9 @@ function variants(name, o) {
  */
 function ggufGet(name, o) { o = o ? Object.assign({}, o) : {}; o.format = "gguf"; return get(name, o); }
 function onnxGet(name, o) { o = o ? Object.assign({}, o) : {}; o.format = "onnx"; return get(name, o); }
+/* NB: returns an OBJECT of role paths ({dir,det,rec,cls,dict,variant}), not a
+ * single path -- an OCR model is a set.  Feed it straight to ocr.init(). */
+function ocrGet(name, o)  { o = o ? Object.assign({}, o) : {}; o.format = "ocr";  return get(name, o); }
 
 /* Module, or command line?  (standard rampart idiom: module.exports is set
  * when require()'d, falsy when run directly as the entry script.) */
@@ -1088,6 +1238,7 @@ if (module && module.exports) {
         pull: get,             /* alias */
         ggufGet: ggufGet,
         onnxGet: onnxGet,
+        ocrGet: ocrGet,
         url: urlGet,
         resolve: resolve,
         variants: variants,
@@ -1122,8 +1273,11 @@ if (module && module.exports) {
             u.printf("%as\n", "yellow", cats[ci] + ":");
             groups[cats[ci]].sort().forEach(function (name) {
                 var e = CATALOG[name];
-                var fmt = "[" + (e.onnx ? "onnx" : "") + (e.onnx && e.gguf ? "+" : "") +
-                          (e.gguf ? "gguf" : "") + "]";
+                var ff = [];
+                if (e.onnx) ff.push("onnx");
+                if (e.gguf) ff.push("gguf");
+                if (e.ocr)  ff.push("ocr");
+                var fmt = "[" + ff.join("+") + "]";
                 u.printf("  %-38s %as %as", name, "gray", u.sprintf("%-11s", fmt),
                          "cyan", u.sprintf("%-8s", licPhrase(e)));
                 var inst = installedVariants(name, e);
