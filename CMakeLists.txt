@@ -872,7 +872,8 @@ if(ONNX_LIBS)
     ocr-image.c
     ocr-det.c
     ocr-rec.c
-  )
+    ocr-layout.c
+)
   # stb_image.h (public domain) is vendored under extern/clip; ocr-image.c
   # compiles its own copy.  rampart-ocr.map keeps the resulting stbi_* symbols
   # local so they cannot bind against rampart-clip's copy of the same header.

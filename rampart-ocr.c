@@ -34,6 +34,7 @@
 #include "rp-onnx-session.h"
 #include "ocr-image.h"
 #include "ocr-det.h"
+#include "ocr-layout.h"
 #include "ocr-rec.h"
 
 /* get_current_thread() lives in the rampart binary.  WEAK so a non-rampart host
@@ -348,10 +349,14 @@ static duk_ret_t ocr_model_info(duk_context *ctx)
 #define OCR_NAME_MAX 96
 
 typedef struct {
-    rp_onnx_sess *det, *rec, *cls;
+    rp_onnx_sess *det, *rec, *cls, *layout;
     ocr_dict      dict;
     ocr_det_opts  det_opts;
     int           limit_side;
+    /* limitSideLen "auto": start at limit_side and, on a page whose source is
+     * much larger than that, re-detect at higher resolution while the box count
+     * keeps climbing.  0 when the caller pinned a number. */
+    int           limit_auto;
     int           use_cls;
     float         cls_thresh;
     int           rec_h, rec_max_w, rec_batch;
@@ -359,6 +364,10 @@ typedef struct {
      * PP-OCR conversions do not agree on them (this one uses "x" throughout, but
      * others use "images" / "input") */
     char          det_in[OCR_NAME_MAX], rec_in[OCR_NAME_MAX], cls_in[OCR_NAME_MAX];
+    /* layout: 0 = never, 1 = auto (only when the page looks multi-column),
+     * 2 = always.  Ignored when no layout model was given. */
+    int           layout_mode;
+    float         layout_thresh;
     int           destroyed;
 } ocr_handle;
 
@@ -368,6 +377,7 @@ static void ocr_handle_free(ocr_handle *h)
     if (h->det) ONNX.close(h->det);
     if (h->rec) ONNX.close(h->rec);
     if (h->cls) ONNX.close(h->cls);
+    if (h->layout) ONNX.close(h->layout);
     ocr_dict_free(&h->dict);
     free(h);
 }
@@ -415,6 +425,229 @@ static int ocr_run_batch(rp_onnx_sess *s, const char *in_name,
 
     if (ONNX.ensure_runnable(s, err, errlen) != 0) return -1;
     return ONNX.run(s, &in, 1, NULL, 0, outs, n_outs, err, errlen);
+}
+
+/* Run the layout model.  Unlike det/rec/cls it takes THREE inputs: the image,
+ * the (fixed) network shape, and the resize ratios.  The ratios are what make
+ * the model emit boxes in ORIGINAL page pixels -- it divides by them itself, so
+ * nothing has to be mapped back here. */
+static int ocr_run_layout(rp_onnx_sess *s, const float *img,
+                          float sh, float sw,
+                          rp_onnx_val_out **outs, size_t *n_outs,
+                          char *err, size_t errlen)
+{
+    rp_onnx_val_in in[3];
+    int64_t ishape[4], sshape[2], fshape[2];
+    float im_shape[2], scale[2];
+    rp_onnx_iodesc d;
+    const char *n_img = "image", *n_shape = "im_shape", *n_scale = "scale_factor";
+    size_t i;
+
+    /* names read from the model rather than hardcoded, as the det/rec code does:
+     * conversions of this graph do not all agree on them */
+    for (i = 0; i < ONNX.n_inputs(s) && i < 3; i++) {
+        if (ONNX.input(s, i, &d) != 0 || !d.name) continue;
+        if (d.n_dims == 4) n_img = d.name;
+        else if (strstr(d.name, "scale")) n_scale = d.name;
+        else if (strstr(d.name, "shape")) n_shape = d.name;
+    }
+
+    im_shape[0] = (float)OCR_LAYOUT_SIDE;
+    im_shape[1] = (float)OCR_LAYOUT_SIDE;
+    scale[0] = sh;
+    scale[1] = sw;
+
+    ishape[0] = 1; ishape[1] = 3;
+    ishape[2] = OCR_LAYOUT_SIDE; ishape[3] = OCR_LAYOUT_SIDE;
+    sshape[0] = 1; sshape[1] = 2;
+    fshape[0] = 1; fshape[1] = 2;
+
+    memset(in, 0, sizeof in);
+    in[0].name = n_shape; in[0].dtype = RP_ONNX_DT_FLOAT32;
+    in[0].shape = sshape; in[0].n_dims = 2;
+    in[0].data = im_shape; in[0].n_bytes = sizeof im_shape;
+
+    in[1].name = n_img; in[1].dtype = RP_ONNX_DT_FLOAT32;
+    in[1].shape = ishape; in[1].n_dims = 4;
+    in[1].data = img;
+    in[1].n_bytes = (size_t)3 * OCR_LAYOUT_SIDE * OCR_LAYOUT_SIDE * sizeof(float);
+
+    in[2].name = n_scale; in[2].dtype = RP_ONNX_DT_FLOAT32;
+    in[2].shape = fshape; in[2].n_dims = 2;
+    in[2].data = scale; in[2].n_bytes = sizeof scale;
+
+    if (ONNX.ensure_runnable(s, err, errlen) != 0) return -1;
+    return ONNX.run(s, in, 3, NULL, 0, outs, n_outs, err, errlen);
+}
+
+/* One detection pass at a given input cap.  Owns its tensor and outputs, so it
+ * can be called repeatedly to compare resolutions.  0 on success (boxes
+ * malloc'd, free with free()); -1 with err[] filled. */
+static int ocr_detect_pass(ocr_handle *h, const ocr_image *im, int limit,
+                           ocr_box **boxes_out, size_t *nb_out,
+                           char *err, size_t errlen)
+{
+    ocr_det_scale sc;
+    float *tensor = NULL;
+    rp_onnx_val_out *outs = NULL;
+    size_t n_outs = 0;
+    int mw = 0, mh = 0;
+
+    *boxes_out = NULL;
+    *nb_out = 0;
+
+    if (ocr_det_plan(im->w, im->h, limit, &sc) != 0) {
+        snprintf(err, errlen, "cannot size a detection pass for %dx%d", im->w, im->h);
+        return -1;
+    }
+    tensor = (float *)malloc((size_t)3 * sc.net_w * sc.net_h * sizeof(float));
+    if (!tensor) { snprintf(err, errlen, "out of memory"); return -1; }
+    if (ocr_det_preprocess(im, limit, tensor, &sc) != 0) {
+        free(tensor);
+        snprintf(err, errlen, "detection preprocessing failed");
+        return -1;
+    }
+    if (ocr_run_batch(h->det, h->det_in, tensor, 1, 3, sc.net_h, sc.net_w,
+                      &outs, &n_outs, err, errlen) != 0) {
+        free(tensor);
+        return -1;
+    }
+    free(tensor);
+    if (!n_outs || !outs[0].data || outs[0].dtype != RP_ONNX_DT_FLOAT32) {
+        ONNX.run_free(outs, n_outs);
+        snprintf(err, errlen, "detection produced no usable output");
+        return -1;
+    }
+    if (outs[0].n_dims >= 2) {
+        mh = (int)outs[0].shape[outs[0].n_dims - 2];
+        mw = (int)outs[0].shape[outs[0].n_dims - 1];
+    }
+    if (mw <= 0 || mh <= 0) {
+        ONNX.run_free(outs, n_outs);
+        snprintf(err, errlen, "detection output has an unusable shape");
+        return -1;
+    }
+    if (ocr_det_boxes((const float *)outs[0].data, mw, mh, &sc, &h->det_opts,
+                      boxes_out, nb_out) != 0) {
+        ONNX.run_free(outs, n_outs);
+        snprintf(err, errlen, "out of memory extracting boxes");
+        return -1;
+    }
+    ONNX.run_free(outs, n_outs);
+    return 0;
+}
+
+/* Raise the detection cap while it keeps finding materially more text.
+ *
+ * WHY.  The default cap (960, PP-OCR's own) downscales a broadsheet until the
+ * newsprint is unreadable and most of the page is never detected: measured on a
+ * 3036x4192 scan, 141 lines at 960 against 830 at 1920, and token agreement
+ * with the page's reference OCR rose from 0.21 to 0.80.  Ordering is a
+ * second-order concern when four fifths of the text is missing.
+ *
+ * The probe is GATED on the source being more than twice the cap, because that
+ * is where downscaling starts destroying glyphs -- every page in the fixture
+ * set that already works sits at 1.7x and skips this entirely, paying nothing.
+ * Escalation then stops when the count stops climbing: measured 141 -> 830 ->
+ * 860, so 1920 is the knee and 2880 buys 3% for 30% more time.  Two steps max,
+ * so the cost is bounded even on a huge scan. */
+static void ocr_detect_autoscale(ocr_handle *h, const ocr_image *im,
+                                 ocr_box **boxes, size_t *nb, int *limit_used)
+{
+    int limit = *limit_used, steps;
+    int longest = im->w > im->h ? im->w : im->h;
+
+    for (steps = 0; steps < 2; steps++) {
+        ocr_box *nboxes = NULL;
+        size_t n2 = 0;
+        char err[256] = {0};
+        int next;
+
+        if ((long)longest <= 2L * limit) break;      /* not being downscaled hard */
+        next = limit * 2;
+        if (ocr_detect_pass(h, im, next, &nboxes, &n2, err, sizeof err) != 0) {
+            ocr_warn("ocr.readText: could not re-detect at limitSideLen %d (%s); "
+                     "keeping %d\n", next, err, limit);
+            break;
+        }
+        /* materially more text, not noise: 30% */
+        if ((double)n2 <= (double)(*nb) * 1.3) { free(nboxes); break; }
+        free(*boxes);
+        *boxes = nboxes;
+        *nb = n2;
+        limit = next;
+    }
+    *limit_used = limit;
+}
+
+/* Layout-analyse the page and permute `boxes` into the model's reading order.
+ * Every failure here is non-fatal: the boxes keep the order they had, which is
+ * exactly today's behaviour.  Returns the regions (caller frees) or NULL. */
+static ocr_region *ocr_apply_layout(ocr_handle *h, const ocr_image *im,
+                                    ocr_box *boxes, size_t nb, size_t *nr_out)
+{
+    float *tensor = NULL;
+    rp_onnx_val_out *outs = NULL;
+    size_t n_outs = 0, nr = 0, i;
+    ocr_region *regions = NULL;
+    size_t *order = NULL;
+    ocr_box *tmp = NULL;
+    char err[512] = {0};
+
+    *nr_out = 0;
+    if (!h->layout || !nb) return NULL;
+
+    tensor = (float *)malloc((size_t)3 * OCR_LAYOUT_SIDE * OCR_LAYOUT_SIDE * sizeof *tensor);
+    if (!tensor) return NULL;
+    if (ocr_layout_preprocess(im, tensor, err, sizeof err) != 0) {
+        ocr_warn("ocr.readText: layout: %s; ordering lines top-to-bottom\n", err);
+        free(tensor);
+        return NULL;
+    }
+
+    if (ocr_run_layout(h->layout, tensor,
+                       (float)OCR_LAYOUT_SIDE / (float)im->h,
+                       (float)OCR_LAYOUT_SIDE / (float)im->w,
+                       &outs, &n_outs, err, sizeof err) != 0) {
+        ocr_warn("ocr.readText: layout model failed (%s); ordering lines "
+                 "top-to-bottom\n", err);
+        free(tensor);
+        return NULL;
+    }
+    free(tensor);
+
+    /* the detections are the 2-D float output; the other heads (a count and a
+     * coarse mask) are not needed here */
+    for (i = 0; i < n_outs; i++) {
+        if (outs[i].dtype == RP_ONNX_DT_FLOAT32 && outs[i].n_dims == 2 &&
+            outs[i].shape[1] >= 7) {
+            ocr_layout_decode((const float *)outs[i].data,
+                              (size_t)outs[i].shape[0], (size_t)outs[i].shape[1],
+                              h->layout_thresh, &regions, &nr);
+            break;
+        }
+    }
+    ONNX.run_free(outs, n_outs);
+
+    if (!regions || !nr) {
+        free(regions);
+        ocr_warn("ocr.readText: layout model found no regions above %.2f; "
+                 "ordering lines top-to-bottom\n", (double)h->layout_thresh);
+        return NULL;
+    }
+
+    order = (size_t *)malloc(nb * sizeof *order);
+    tmp   = (ocr_box *)malloc(nb * sizeof *tmp);
+    if (!order || !tmp) { free(order); free(tmp); free(regions); return NULL; }
+
+    ocr_layout_order(boxes, nb, regions, nr, order);
+    for (i = 0; i < nb; i++) tmp[i] = boxes[order[i]];
+    memcpy(boxes, tmp, nb * sizeof *boxes);
+    free(order);
+    free(tmp);
+
+    *nr_out = nr;
+    return regions;
 }
 
 /* ocr.detProbe(imagePath, detModelPath [, {limitSideLen, thresh}])
@@ -594,7 +827,6 @@ static duk_ret_t ocr_read_text(duk_context *ctx)
     ocr_handle *h = ocr_this(ctx);
     char err[512] = {0};
     ocr_image im;
-    ocr_det_scale sc;
     float *tensor = NULL, *batch = NULL;
     rp_onnx_val_out *outs = NULL;
     size_t n_outs = 0;
@@ -605,11 +837,17 @@ static duk_ret_t ocr_read_text(duk_context *ctx)
     char **texts = NULL;
     float *scores = NULL;
     size_t *order = NULL;
-    int mapw = 0, maph = 0, page = 0, npages = 1;
+    int page = 0, npages = 1;
+    ocr_region *regions = NULL;
+    size_t nregions = 0;
+    float col_cross = 1.0f, col_side = 0.0f;
+    int have_cols = 0;
+    int limit_used;
     duk_idx_t arr;
 
     ocr_errmsg_clear(ctx);
     memset(&im, 0, sizeof im);
+    limit_used = h->limit_side;
 
     /* opts.page selects a directory of a multi-page TIFF (0-based); ignored for
      * single-page formats.  The result's `pages` reports the total. */
@@ -635,6 +873,7 @@ static duk_ret_t ocr_read_text(duk_context *ctx)
 
 #define OCR_READ_BAIL(...) do {                                   \
         free(tensor); free(batch); free(boxes); free(order);       \
+        free(regions);                                             \
         if (outs) ONNX.run_free(outs, n_outs);                     \
         if (crops) { for (i = 0; i < ncrops; i++) ocr_image_free(&crops[i]); free(crops); } \
         if (texts) { for (i = 0; i < ncrops; i++) free(texts[i]); free(texts); } \
@@ -655,34 +894,8 @@ static duk_ret_t ocr_read_text(duk_context *ctx)
     {
         int attempt;
         for (attempt = 0; attempt < 2; attempt++) {
-            if (ocr_det_plan(im.w, im.h, h->limit_side, &sc) != 0)
-                OCR_READ_BAIL("ocr.readText: cannot size a detection pass for %dx%d", im.w, im.h);
-
-            tensor = (float *)malloc((size_t)3 * sc.net_w * sc.net_h * sizeof(float));
-            if (!tensor) OCR_READ_BAIL("ocr.readText: out of memory");
-            if (ocr_det_preprocess(&im, h->limit_side, tensor, &sc) != 0)
-                OCR_READ_BAIL("ocr.readText: detection preprocessing failed");
-
-            if (ocr_run_batch(h->det, h->det_in, tensor, 1, 3, sc.net_h, sc.net_w,
-                              &outs, &n_outs, err, sizeof err) != 0)
-                OCR_READ_BAIL("ocr.readText: detection failed: %s", err);
-            if (!n_outs || !outs[0].data || outs[0].dtype != RP_ONNX_DT_FLOAT32)
-                OCR_READ_BAIL("ocr.readText: detection produced no usable output");
-
-            if (outs[0].n_dims >= 2) {
-                maph = (int)outs[0].shape[outs[0].n_dims - 2];
-                mapw = (int)outs[0].shape[outs[0].n_dims - 1];
-            }
-            if (mapw <= 0 || maph <= 0)
-                OCR_READ_BAIL("ocr.readText: detection output has an unusable shape");
-
-            if (ocr_det_boxes((const float *)outs[0].data, mapw, maph, &sc, &h->det_opts,
-                              &boxes, &nb) != 0)
-                OCR_READ_BAIL("ocr.readText: out of memory extracting boxes");
-
-            ONNX.run_free(outs, n_outs);
-            outs = NULL; n_outs = 0;
-            free(tensor); tensor = NULL;
+            if (ocr_detect_pass(h, &im, limit_used, &boxes, &nb, err, sizeof err) != 0)
+                OCR_READ_BAIL("ocr.readText: %s", err);
 
             if (attempt == 0 && nb >= 4 &&
                 ocr_det_tall_fraction(boxes, nb) > 0.6f) {
@@ -698,9 +911,25 @@ static duk_ret_t ocr_read_text(duk_context *ctx)
             }
             break;
         }
+        /* Only after the page is the right way up: escalating first would size
+         * the retry from the wrong dimension. */
+        if (h->limit_auto && nb)
+            ocr_detect_autoscale(h, &im, &boxes, &nb, &limit_used);
     }
 
     ocr_det_sort_boxes(boxes, nb, 0.0f);
+
+    /* ---- layout: reading order for a page that is not one column ---------
+     * "auto" spends the extra inference only when the geometry says there is a
+     * gutter, so a single-column page keeps exactly the path (and the output)
+     * it had before this model existed. */
+    if (h->layout && h->layout_mode) {
+        int multi = ocr_layout_looks_multicolumn(boxes, nb, 0.0f,
+                                                 &col_cross, &col_side);
+        have_cols = 1;
+        if (h->layout_mode == 2 || multi)
+            regions = ocr_apply_layout(h, &im, boxes, nb, &nregions);
+    }
 
     /* ---- crops --------------------------------------------------------- */
     if (nb) {
@@ -885,8 +1114,50 @@ static duk_ret_t ocr_read_text(duk_context *ctx)
         free(pagetext);
     }
 
+    /* `columns`: the column statistic the "auto" trigger reads.  Present
+     * whenever layout was available, so a caller (or a tuning run) can see WHY
+     * layout did or did not run, not merely that it did not. */
+    if (have_cols) {
+        duk_push_object(ctx);
+        duk_push_number(ctx, (duk_double_t)col_cross);
+        duk_put_prop_string(ctx, -2, "crossFrac");
+        duk_push_number(ctx, (duk_double_t)col_side);
+        duk_put_prop_string(ctx, -2, "sideFrac");
+        duk_push_boolean(ctx, regions != NULL);
+        duk_put_prop_string(ctx, -2, "layoutRan");
+        duk_put_prop_string(ctx, -2, "columns");
+    }
+
+    /* what the detector actually ran at -- "auto" may have raised it */
+    duk_push_int(ctx, limit_used);
+    duk_put_prop_string(ctx, -2, "limitSideLen");
+
+    /* `regions`: present only when layout analysis actually ran, so its absence
+     * is how a caller tells that lines are in plain top-to-bottom order. */
+    if (regions && nregions) {
+        size_t ri;
+        duk_push_array(ctx);
+        for (ri = 0; ri < nregions; ri++) {
+            duk_push_object(ctx);
+            duk_push_string(ctx, regions[ri].label >= 0
+                            ? ocr_layout_labels[regions[ri].label] : "unknown");
+            duk_put_prop_string(ctx, -2, "label");
+            duk_push_number(ctx, (duk_double_t)regions[ri].score);
+            duk_put_prop_string(ctx, -2, "score");
+            duk_push_array(ctx);
+            duk_push_number(ctx, (duk_double_t)regions[ri].x0); duk_put_prop_index(ctx, -2, 0);
+            duk_push_number(ctx, (duk_double_t)regions[ri].y0); duk_put_prop_index(ctx, -2, 1);
+            duk_push_number(ctx, (duk_double_t)regions[ri].x1); duk_put_prop_index(ctx, -2, 2);
+            duk_push_number(ctx, (duk_double_t)regions[ri].y1); duk_put_prop_index(ctx, -2, 3);
+            duk_put_prop_string(ctx, -2, "box");
+            duk_put_prop_index(ctx, -2, (duk_uarridx_t)ri);
+        }
+        duk_put_prop_string(ctx, -2, "regions");
+    }
+
     free(order);
     free(boxes);
+    free(regions);
     if (crops) { for (i = 0; i < ncrops; i++) ocr_image_free(&crops[i]); free(crops); }
     if (texts) { for (i = 0; i < ncrops; i++) free(texts[i]); free(texts); }
     free(scores);
@@ -914,7 +1185,7 @@ static duk_ret_t ocr_init(duk_context *ctx)
 {
     ocr_handle *h;
     char err[512] = {0};
-    const char *det_p, *rec_p, *cls_p, *dict_p;
+    const char *det_p, *rec_p, *cls_p, *dict_p, *layout_p;
     rp_onnx_sess_opts so;
     int use_gpu = 1, gpu_explicit = 0, threads = 1;
     duk_idx_t o = 0;                     /* where options are read from */
@@ -939,6 +1210,7 @@ static duk_ret_t ocr_init(duk_context *ctx)
     rec_p  = OCR_OPT_STR("rec");
     cls_p  = OCR_OPT_STR("cls");
     dict_p = OCR_OPT_STR("dict");
+    layout_p = OCR_OPT_STR("layout");
 #undef OCR_OPT_STR
     /* the four duk_get_prop_string results stay on the stack until we return;
      * that keeps the strings alive while we use them */
@@ -973,7 +1245,21 @@ static duk_ret_t ocr_init(duk_context *ctx)
         if (duk_get_prop_string(ctx, o, key)) dst = (cast)duk_get_number(ctx, -1); \
         duk_pop(ctx);                                                           \
     } while (0)
-    OCR_NUM("limitSideLen", h->limit_side,          int);
+    /* limitSideLen: a number pins the cap (today's behaviour exactly); "auto",
+     * or absent, starts at the default and raises it on a page whose source is
+     * being downscaled hard.  See ocr_detect_autoscale. */
+    h->limit_auto = 1;
+    if (duk_get_prop_string(ctx, o, "limitSideLen") && !duk_is_undefined(ctx, -1)) {
+        if (duk_is_number(ctx, -1)) {
+            h->limit_side = (int)duk_get_number(ctx, -1);
+            h->limit_auto = 0;
+        } else {
+            const char *m = duk_to_string(ctx, -1);
+            if (strcmp(m, "auto"))
+                RP_THROW(ctx, "ocr.init: limitSideLen must be a Number or \"auto\"");
+        }
+    }
+    duk_pop(ctx);
     OCR_NUM("thresh",       h->det_opts.thresh,     float);
     OCR_NUM("boxThresh",    h->det_opts.box_thresh, float);
     OCR_NUM("unclipRatio",  h->det_opts.unclip_ratio, float);
@@ -987,6 +1273,24 @@ static duk_ret_t ocr_init(duk_context *ctx)
 #undef OCR_NUM
     if (duk_get_prop_string(ctx, o, "cls") && duk_is_boolean(ctx, -1))
         h->use_cls = duk_get_boolean(ctx, -1);
+    duk_pop(ctx);
+    /* layoutMode: "auto" (default when a layout model is present), "always",
+     * "never".  A Boolean is accepted as the obvious shorthand. */
+    h->layout_mode   = 1;
+    h->layout_thresh = 0.5f;                    /* config.json draw_threshold */
+    if (duk_get_prop_string(ctx, o, "layoutMode") && !duk_is_undefined(ctx, -1)) {
+        if (duk_is_boolean(ctx, -1)) h->layout_mode = duk_get_boolean(ctx, -1) ? 2 : 0;
+        else {
+            const char *m = duk_to_string(ctx, -1);
+            if      (!strcmp(m, "never"))  h->layout_mode = 0;
+            else if (!strcmp(m, "auto"))   h->layout_mode = 1;
+            else if (!strcmp(m, "always")) h->layout_mode = 2;
+            else RP_THROW(ctx, "ocr.init: layoutMode must be \"auto\", \"always\" or \"never\"");
+        }
+    }
+    duk_pop(ctx);
+    if (duk_get_prop_string(ctx, o, "layoutThresh") && !duk_is_undefined(ctx, -1))
+        h->layout_thresh = (float)REQUIRE_NUMBER(ctx, -1, "ocr.init: layoutThresh must be a number");
     duk_pop(ctx);
     /* gpu defaults to ON, as rampart-onnx's own handles do: a GPU build with a
      * usable device uses it, anything else lands on the CPU.  Only an EXPLICIT
@@ -1050,6 +1354,18 @@ static duk_ret_t ocr_init(duk_context *ctx)
         h->use_cls = 0;
     }
 
+    /* Layout is optional in every sense: absent from the options, or present
+     * and unloadable, leaves a working reader that simply orders lines
+     * top-to-bottom as before. */
+    if (layout_p && h->layout_mode) {
+        h->layout = ONNX.open(layout_p, &so, err, sizeof err);
+        if (!h->layout) {
+            ocr_warn("ocr.init: layout model could not be loaded (%s); "
+                     "continuing without layout analysis\n", err);
+            err[0] = '\0';
+        }
+    }
+
     if (ocr_input_name(h->det, h->det_in, sizeof h->det_in) != 0 ||
         ocr_input_name(h->rec, h->rec_in, sizeof h->rec_in) != 0) {
         ocr_handle_free(h);
@@ -1104,6 +1420,7 @@ static duk_ret_t ocr_init(duk_context *ctx)
     OCR_SET_N("threads",      threads);
     OCR_SET_B("cls",          h->use_cls);
     OCR_SET_N("limitSideLen", h->limit_side);
+    OCR_SET_B("limitAuto",    h->limit_auto);
     OCR_SET_N("thresh",       h->det_opts.thresh);
     OCR_SET_N("boxThresh",    h->det_opts.box_thresh);
     OCR_SET_N("unclipRatio",  h->det_opts.unclip_ratio);

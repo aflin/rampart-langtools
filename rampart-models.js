@@ -272,20 +272,86 @@ var OCR_CATALOG = {
             repo: "bukuroo/PPOCRv5-ONNX",
             revision: "47b3e1b4e90c79737cb71f562a6c85809067c7a5",
             license: "apache-2.0",
-            defaultVariant: "mobile",
-            /* shared by every variant */
+            /* Three variants, all PP-OCRv5, differing only in the
+             * recognition model.  Measured on OmniDocBench (block-level
+             * normalised edit distance, lower is better, 300 blocks per
+             * language, paired on identical crops):
+             *
+             *                  English   Chinese   size    speed
+             *   multi_mobile    0.0899    0.1602    21 MB   1.0x
+             *   multi_server    0.1094    0.1509   164 MB   0.55x
+             *   en_mobile       0.0954    0.9124    13 MB   1.16x
+             *
+             * multi_mobile is the default: best English, and the only one of
+             * the three that is strong on both languages.
+             *
+             * multi_server is NOT an upgrade, it is a language trade -- better
+             * Chinese, worse English.  PaddleOCR's own published per-scenario
+             * numbers agree (printed English 0.8679 server vs 0.8753 mobile;
+             * printed Chinese 0.9013 vs 0.8605): the server model is tuned for
+             * the multilingual average, which English does not benefit from.
+             *
+             * en_mobile is English-ONLY -- a 436-character Latin dictionary
+             * against 18383 -- so it cannot read Chinese at all, and it did
+             * not beat multi_mobile on English either (the model card's "11%
+             * better on English" did not reproduce here).  Kept because it is
+             * the smallest and fastest option at equal English accuracy, for
+             * a size-constrained English-only deployment.
+             */
+            defaultVariant: "multi_mobile",
             common: {
-                cls:  { file: "ppocrv5-cls.onnx",  size: 582663 },
-                dict: { file: "ppocrv5_dict.txt",  size: 92395  }
+                cls:  { file: "ppocrv5-cls.onnx",  size: 582663 }
             },
             variants: {
-                mobile: {
-                    det: { file: "ppocrv5-mobile-det.onnx", size: 4748769  },
-                    rec: { file: "ppocrv5-mobile-rec.onnx", size: 16517247 }
+                multi_mobile: {
+                    det:  { file: "ppocrv5-mobile-det.onnx", size: 4748769  },
+                    rec:  { file: "ppocrv5-mobile-rec.onnx", size: 16517247 },
+                    dict: { file: "ppocrv5_dict.txt",        size: 92395    }
                 },
-                server: {
-                    det: { file: "ppocrv5-server-det.onnx", size: 87697340 },
-                    rec: { file: "ppocrv5-server-rec.onnx", size: 84137438 }
+                multi_server: {
+                    det:  { file: "ppocrv5-server-det.onnx", size: 87697340 },
+                    rec:  { file: "ppocrv5-server-rec.onnx", size: 84137438 },
+                    dict: { file: "ppocrv5_dict.txt",        size: 92395    }
+                },
+                en_mobile: {
+                    det:  { file: "ppocrv5-mobile-det.onnx", size: 4748769 },
+                    /* from PaddleOCR's own ONNX export: one model per repo,
+                     * every file called inference.onnx, dictionary inside the
+                     * accompanying yml -- hence `as` and `dictFromYml`. */
+                    rec:  { repo: "PaddlePaddle/en_PP-OCRv5_mobile_rec_onnx",
+                            revision: "3fafbc3b5dcf",
+                            file: "inference.onnx", as: "ppocrv5-en-rec.onnx",
+                            size: 7848423 },
+                    dict: { repo: "PaddlePaddle/en_PP-OCRv5_mobile_rec_onnx",
+                            revision: "3fafbc3b5dcf",
+                            file: "inference.yml", as: "ppocrv5-en-dict.txt",
+                            dictFromYml: true, size: 3964 }
+                }
+            }
+        }
+    },
+
+    /* Document layout analysis: regions (text, table, figure, header, ...) and
+     * a reading order for them.  A SEPARATE entry rather than a role of
+     * ppocr-v5 because it is 130 MB against that set's 21 MB, and only pages
+     * that are not a single column need it -- nobody should pay for it by
+     * merely asking for OCR.  Combine the two explicitly:
+     *
+     *     var m = models.ocrGet("ppocr-v5");
+     *     m.layout = models.ocrGet("ppocr-layout").layout;
+     *     var reader = ocr.init(m);
+     */
+    "ppocr-layout": {
+        category: "ocr",
+        ocr: {
+            repo: "alex-dinh/PP-DocLayoutV3-ONNX",
+            revision: "7952bce3e684c7aa90aa7bf47798e8efae3c0921",
+            license: "apache-2.0",
+            defaultVariant: "v3",
+            common: {},
+            variants: {
+                v3: {
+                    layout: { file: "PP-DocLayoutV3.onnx", size: 130502049 }
                 }
             }
         }
@@ -824,16 +890,52 @@ function getOcr(name, entry, o) {
     for (r in x.common)  roles[r] = x.common[r];
     for (r in vset)      roles[r] = vset[r];
 
+    /* A role may name its OWN repo.  PaddleOCR publishes each model as a
+     * separate repository, every one of them holding a file called
+     * `inference.onnx`, so a role also carries `as` -- the name to store it
+     * under locally -- and may ask for its character dictionary to be pulled
+     * out of the accompanying `inference.yml`, which is where PaddleOCR keeps
+     * it rather than in a text file. */
     var names = Object.keys(roles);
     var out = { dir: dir, variant: variant };
+    function localName(role) { return roles[role].as || roles[role].file; }
     for (i = 0; i < names.length; i++)
-        out[names[i]] = dir + "/" + roles[names[i]].file;
+        out[names[i]] = dir + "/" + localName(names[i]);
+
+    /* Provenance.  Variants of one entry SHARE a directory, so a single
+     * "which variant is this" field is wrong the moment a second variant is
+     * fetched -- and with per-role repos a single "repo" field is wrong too.
+     * Record it per FILE instead, merging with whatever is already there, so
+     * the record describes the directory rather than the last call. */
+    function writeProv() {
+        var prov = { endpoint: HF, variants: [], files: {} }, j, k, prev;
+        try { prev = JSON.parse(u.readFile(dir + "/.source.json", true)); } catch (e) { prev = null; }
+        if (prev && prev.files) {
+            prov.files = prev.files;
+            if (prev.variants) prov.variants = prev.variants;
+        }
+        for (j = 0; j < names.length; j++) {
+            var ro = roles[names[j]];
+            prov.files[localName(names[j])] = {
+                repo: ro.repo || x.repo,
+                revision: ro.revision || (ro.repo ? "main" : rev)
+            };
+        }
+        /* drop entries for files no longer on disk, so a hand-cleaned
+         * directory does not keep claiming them */
+        for (k in prov.files) if (!isFile(dir + "/" + k)) delete prov.files[k];
+        if (prov.variants.indexOf(variant) < 0) prov.variants.push(variant);
+        prov.variants.sort();
+        u.writeFile(dir + "/.source.json", u.sprintf("%4J", prov));
+    }
 
     /* already complete?  (every role present on disk) */
     var missing = [];
     for (i = 0; i < names.length; i++)
         if (!isFile(out[names[i]])) missing.push(names[i]);
-    if (!o.force && !missing.length) return out;
+    /* refresh provenance even when nothing is fetched: that is what lets a
+     * stale record left by an older version heal on the next call */
+    if (!o.force && !missing.length) { writeProv(); return out; }
 
     /* size the prompt on what is actually missing, not the whole set */
     var total = 0;
@@ -843,25 +945,60 @@ function getOcr(name, entry, o) {
                         repo: x.repo }))
         return null;
 
-    /* sha256 comes from the repo tree (the catalog carries sizes, not hashes) */
-    var tree = repoTree(x.repo, rev, o.token) || [];
-    var sha = {};
-    for (i = 0; i < tree.length; i++) if (tree[i].sha256) sha[tree[i].path] = tree[i].sha256;
+    /* sha256 comes from the repo tree (the catalog carries sizes, not hashes);
+     * one tree per distinct repo, fetched once. */
+    var trees = {}, sha = {};
+    function shaFor(repo, revision, path) {
+        var key = repo + "@" + revision;
+        if (!trees[key]) {
+            trees[key] = {};
+            var t = repoTree(repo, revision, o.token) || [];
+            for (var j = 0; j < t.length; j++)
+                if (t[j].sha256) trees[key][t[j].path] = t[j].sha256;
+        }
+        return trees[key][path];
+    }
 
     var fetchList = o.force ? names : missing;
     for (i = 0; i < fetchList.length; i++) {
-        var f = roles[fetchList[i]].file;
-        fetchFile(resolveUrl(x.repo, rev, f), dir + "/" + f, {
-            size: roles[fetchList[i]].size, sha256: sha[f],
+        var role = roles[fetchList[i]];
+        var repo = role.repo || x.repo;
+        var rrev = role.revision || (role.repo ? "main" : rev);
+        var dst  = dir + "/" + localName(fetchList[i]);
+        /* PaddleOCR keeps the character list inside inference.yml; ocr.init
+         * wants a plain one-per-line file, so derive it here rather than make
+         * every caller parse YAML.  The yml lands under a temporary name: if
+         * extraction fails, the dictionary path stays ABSENT and the next call
+         * re-fetches, rather than leaving YAML parked where the dictionary
+         * should be, which nothing would ever retry. */
+        var tmp = role.dictFromYml ? dst + ".yml" : dst;
+        fetchFile(resolveUrl(repo, rrev, role.file), tmp, {
+            size: role.size, sha256: shaFor(repo, rrev, role.file),
             progress: o.progress, token: o.token, force: o.force,
-            label: name + "/" + f
+            label: name + "/" + localName(fetchList[i])
         });
+        if (role.dictFromYml) {
+            var y = u.readFile(tmp, true), lines = y.split("\n"), keep = [], on = false, c, k;
+            for (k = 0; k < lines.length; k++) {
+                if (/^\s*character_dict:\s*$/.test(lines[k])) { on = true; continue; }
+                if (!on) continue;
+                if (!/^\s*-\s/.test(lines[k])) break;
+                c = lines[k].replace(/^\s*-\s/, "");
+                if (c.length >= 2 && c.charAt(0) === c.charAt(c.length - 1) &&
+                    (c.charAt(0) === "'" || c.charAt(0) === '"'))
+                    c = c.substring(1, c.length - 1);
+                keep.push(c);
+            }
+            if (!keep.length) {
+                try { u.rmFile(tmp); } catch (e) {}
+                throwErr("%s: no character_dict in %s", name, role.file);
+            }
+            u.writeFile(dst, keep.join("\n") + "\n");
+            try { u.rmFile(tmp); } catch (e) {}
+        }
     }
 
-    var prov = { repo: x.repo, revision: rev, endpoint: HF, variant: variant, roles: {} };
-    for (i = 0; i < names.length; i++) prov.roles[names[i]] = roles[names[i]].file;
-    u.writeFile(dir + "/.source.json", u.sprintf("%4J", prov));
-
+    writeProv();
     return out;
 }
 
