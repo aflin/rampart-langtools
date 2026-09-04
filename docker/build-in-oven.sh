@@ -180,6 +180,8 @@ case "$STAGE" in
         done
         # clip-test.js's photos (mirror the CMake install(DIRECTORY test_images ...))
         [ -d "$LT/test_images" ] && { rm -rf "$PREFIX/test/test_images"; cp -R "$LT/test_images" "$PREFIX/test/"; }
+        # the script only -- rampart-models-catalog.json is fetched+cached at
+        # runtime and must not be shipped (see the CMake install rule)
         [ -f "$LT/rampart-models.js" ] && install -m 644 "$LT/rampart-models.js" "$PREFIX/modules/"
         # unified rampart-onnx: the module is UNSUFFIXED (one .so for cpu+gpu)...
         if [ -f "$BUILD/rampart-onnx.so" ]; then

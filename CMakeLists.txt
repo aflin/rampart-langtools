@@ -754,8 +754,18 @@ install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-fais
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-sentencepiece.so\")")
 install(CODE "execute_process(COMMAND strip -S \"${RP_PATH}/modules/rampart-clip${LT_NAME_SUFFIX}.so\")")
 
-# rampart-models: pure-JS model downloader/locator (single file, embedded
-# catalog).  Installed into modules/ so `require('rampart-models')` works.
+# rampart-models: pure-JS model downloader/locator.  Installed into modules/
+# so `require('rampart-models')` works.
+#
+# DELIBERATELY the script ONLY -- do NOT add rampart-models-catalog.json here.
+# The script carries a built-in catalog (clip/ocr/rerank + the stable embed and
+# gen workhorses) so it works with no network at all.  The JSON is the fetched
+# half: it turns over far faster than releases, so the script pulls it from the
+# project repo, caches it under ~/.rampart/models/, and revalidates it (ETag)
+# on load -- that is how a catalog we push reaches existing installs.
+# Installing a copy would shadow that cache forever (a catalog beside the
+# script wins -- see "The model catalog" in rampart-models.js) and freeze every
+# install at its release-day model list.
 install(FILES
   "${CMAKE_CURRENT_SOURCE_DIR}/rampart-models.js"
   DESTINATION "${RP_PATH}/modules"

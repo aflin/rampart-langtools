@@ -1,6 +1,8 @@
 /* gen-model-list.js -- DISCOVER models on HuggingFace and generate
- * rampart-models-list.js (the catalog rampart-models.js uses to resolve short
- * names like 'bge-m3' or 'qwen3-4b:q4_k_m' to canonical repos/files).
+ * rampart-models-catalog.json (the catalog rampart-models.js uses to resolve
+ * short names like 'bge-m3' or 'qwen3-4b:q4_k_m' to canonical repos/files).
+ * That file is NOT installed: installs fetch it from the project repo and
+ * cache it, so pushing a regenerated catalog updates them all.
  *
  * Discovery-driven: the catalog is built by sweeping the HF API --
  *   embed  : pipeline_tag=sentence-similarity (+ feature-extraction with
@@ -46,7 +48,14 @@ var curl = require("rampart-curl");
 
 var HF = getenv("HF_ENDPOINT") || "https://huggingface.co";
 var TOKEN = getenv("HF_TOKEN");
-var OUT = process.scriptPath + "/rampart-models.js";   /* catalog spliced between markers */
+/* The catalog is DATA, shipped separately from rampart-models.js: the
+ * script installs, this file does not.  Installs fetch it from the repo
+ * (raw.githubusercontent.com/.../rampart-models-catalog.json) and cache it,
+ * so pushing this file updates every install.  require()ing it yields the
+ * {version, generated, counts, catalog} envelope, hence require(OUT).catalog
+ * below.  OCR models are NOT swept -- they are hand-maintained in
+ * rampart-models.js's OCR_CATALOG and overlay this catalog at load. */
+var OUT = process.scriptPath + "/rampart-models-catalog.json";
 
 var CONFIG = {
     embedTop:  20,     /* how many models per category to keep, by downloads */
@@ -63,6 +72,53 @@ var CONVERTER_ORGS = [
     "second-state", "onnx-community", "Xenova", "CompendiumLabs", "cstr",
     "leliuga", "mradermacher", "TheBloke"
 ];
+
+/* ---- BUILT-IN vs FETCHED ------------------------------------------
+ * The catalog ships in two halves.
+ *
+ *   BUILT-IN  -- spliced into rampart-models.js between the GENERATED
+ *                BUILTIN CATALOG markers.  These resolve with no network
+ *                and no cache, so the model families that are stable and
+ *                that people reach for by name keep working even when
+ *                github is unreachable: clip, ocr and rerank entire, plus
+ *                the embed/gen workhorses named below.
+ *   FETCHED   -- rampart-models-catalog.json, downloaded and cached.  It
+ *                carries the WHOLE catalog, built-ins included, and each
+ *                entry OVERRIDES the built-in of the same name.  That is
+ *                what lets a moved repo, a re-pinned revision or a new
+ *                quant reach installed scripts without a release; new and
+ *                hand-added models arrive the same way.
+ *
+ * To promote a model to built-in, add its alias here and rerun.  Keep the
+ * list to things that are genuinely stable -- every entry is script weight
+ * that only a release can correct (until the fetched catalog overrides it).
+ * ------------------------------------------------------------------- */
+var BUILTIN_CATEGORIES = { clip: 1, ocr: 1, rerank: 1 };
+var BUILTIN_MODELS = {
+    /* embed: the long-lived workhorses */
+    "all-minilm-l6-v2": 1, "all-minilm-l12-v2": 1, "all-mpnet-base-v2": 1,
+    "bge-m3": 1, "bge-small-en-v1.5": 1, "bge-base-en-v1.5": 1, "bge-large-en-v1.5": 1,
+    "gte-multilingual-base": 1, "jina-embeddings-v3": 1,
+    "multilingual-e5-small": 1, "multilingual-e5-base": 1, "multilingual-e5-large": 1,
+    "mxbai-embed-large-v1": 1, "nomic-embed-text-v1.5": 1,
+    "qwen3-embedding-0.6b": 1, "snowflake-arctic-embed-m-v1.5": 1,
+    /* gen: popular, stable, still the common answer for their size tier */
+    "qwen3-0.6b": 1, "qwen3-1.7b": 1, "qwen3-4b": 1, "qwen3-8b": 1, "qwen3-14b": 1,
+    "qwen3-30b-a3b": 1, "qwen3-32b": 1, "qwen3-coder-30b-a3b-instruct": 1,
+    "qwen2.5-0.5b-instruct": 1, "qwen2.5-1.5b-instruct": 1, "qwen2.5-3b-instruct": 1,
+    "qwen2.5-7b-instruct": 1, "qwen2.5-14b-instruct": 1, "qwen2.5-32b-instruct": 1,
+    "qwen2.5-coder-7b-instruct": 1, "qwen2.5-coder-32b-instruct": 1,
+    "llama-3.2-1b-instruct": 1, "llama-3.2-3b-instruct": 1, "llama-3.1-8b-instruct": 1,
+    "gemma-2-2b-it": 1, "gemma-3-270m-it": 1, "gemma-3-1b-it": 1, "gemma-3-4b-it": 1,
+    "phi-3.5-mini-instruct": 1, "phi-4": 1, "phi-4-mini-instruct": 1,
+    "mistral-7b-instruct-v0.3": 1, "smollm2-1.7b-instruct": 1, "tinyllama-1.1b-chat": 1,
+    "granite-3.3-8b-instruct": 1,
+    "deepseek-r1-qwen-7b": 1, "deepseek-r1-0528-qwen3-8b": 1,
+    "gpt-oss-20b": 1, "gpt-oss-120b": 1
+};
+function isBuiltin(name, entry) {
+    return !!(BUILTIN_MODELS[name] || BUILTIN_CATEGORIES[entry.category]);
+}
 
 /* ---- human overrides: name -> 'skip' | { category?, onnx?, gguf? }
  * (repo string pins it; null drops that format; absent = discovered) ---- */
@@ -189,6 +245,122 @@ var OVERRIDES = {
     "clip-vit-l-14-laion": { category: "clip", gguf: "mys/ggml_CLIP-ViT-L-14-laion2B-s32B-b82K", onnx: null, dim: 768 },
     "clip-vit-l-14":       { category: "clip", gguf: "mys/ggml_clip-vit-large-patch14",          onnx: null, dim: 768 },
     "clip-vit-h-14-laion": { category: "clip", gguf: "mys/ggml_CLIP-ViT-H-14-laion2B-s32B-b79K", onnx: null, dim: 1024 },
+
+/* ------------------------------------------------------------------ *
+ * OCR models (hand-pinned, like CLIP: discovery cannot surface them and
+ * an OCR entry is a different shape -- a small SET of role-named files,
+ * not one model + tokenizer -- so the whole 'ocr' object is passed
+ * through verbatim by the ov.ocr handling below).
+ *
+ * PP-OCR is three graphs plus a character dictionary, so the entry names
+ * each file by ROLE (det / rec / cls / dict) and the fetcher pulls the
+ * set into one directory.  `variants` picks the accuracy/size tradeoff:
+ * `mobile` (~21 MB total) is the default and is what a page-at-a-time
+ * document pipeline wants; `server` (~172 MB) is more accurate on hard
+ * scans.  cls and dict are shared by both.
+ *
+ * Repo choice: bukuroo/PPOCRv5-ONNX is the only Apache-2.0 PP-OCRv5 ONNX
+ * conversion carrying ALL FOUR roles in one place (SWHL/RapidOCR -- the
+ * RapidOCR maintainer's own repo -- stops at v4 and ships no dictionary;
+ * webnn/PP-OCRv5-ONNX has no cls).  It is a third-party re-upload, so the
+ * revision is PINNED and every file is sha256-verified on download; the
+ * underlying PP-OCRv5 weights are Apache-2.0 from PaddlePaddle.
+ *
+ * The rec graph emits 18385 classes against a 18383-line dictionary:
+ * PP-OCR's character list is blank + dict + space (1+18383+1), which is
+ * what a CTC decoder must reconstruct.  Verified against the real graph,
+ * not assumed.
+ * ------------------------------------------------------------------ */
+    "ppocr-v5": {
+        category: "ocr",
+        ocr: {
+            repo: "bukuroo/PPOCRv5-ONNX",
+            revision: "47b3e1b4e90c79737cb71f562a6c85809067c7a5",
+            license: "apache-2.0",
+            /* Three variants, all PP-OCRv5, differing only in the
+             * recognition model.  Measured on OmniDocBench (block-level
+             * normalised edit distance, lower is better, 300 blocks per
+             * language, paired on identical crops):
+             *
+             *                  English   Chinese   size    speed
+             *   multi_mobile    0.0899    0.1602    21 MB   1.0x
+             *   multi_server    0.1094    0.1509   164 MB   0.55x
+             *   en_mobile       0.0954    0.9124    13 MB   1.16x
+             *
+             * multi_mobile is the default: best English, and the only one of
+             * the three that is strong on both languages.
+             *
+             * multi_server is NOT an upgrade, it is a language trade -- better
+             * Chinese, worse English.  PaddleOCR's own published per-scenario
+             * numbers agree (printed English 0.8679 server vs 0.8753 mobile;
+             * printed Chinese 0.9013 vs 0.8605): the server model is tuned for
+             * the multilingual average, which English does not benefit from.
+             *
+             * en_mobile is English-ONLY -- a 436-character Latin dictionary
+             * against 18383 -- so it cannot read Chinese at all, and it did
+             * not beat multi_mobile on English either (the model card's "11%
+             * better on English" did not reproduce here).  Kept because it is
+             * the smallest and fastest option at equal English accuracy, for
+             * a size-constrained English-only deployment.
+             */
+            defaultVariant: "multi_mobile",
+            common: {
+                cls:  { file: "ppocrv5-cls.onnx",  size: 582663 }
+            },
+            variants: {
+                multi_mobile: {
+                    det:  { file: "ppocrv5-mobile-det.onnx", size: 4748769  },
+                    rec:  { file: "ppocrv5-mobile-rec.onnx", size: 16517247 },
+                    dict: { file: "ppocrv5_dict.txt",        size: 92395    }
+                },
+                multi_server: {
+                    det:  { file: "ppocrv5-server-det.onnx", size: 87697340 },
+                    rec:  { file: "ppocrv5-server-rec.onnx", size: 84137438 },
+                    dict: { file: "ppocrv5_dict.txt",        size: 92395    }
+                },
+                en_mobile: {
+                    det:  { file: "ppocrv5-mobile-det.onnx", size: 4748769 },
+                    /* from PaddleOCR's own ONNX export: one model per repo,
+                     * every file called inference.onnx, dictionary inside the
+                     * accompanying yml -- hence `as` and `dictFromYml`. */
+                    rec:  { repo: "PaddlePaddle/en_PP-OCRv5_mobile_rec_onnx",
+                            revision: "3fafbc3b5dcf",
+                            file: "inference.onnx", as: "ppocrv5-en-rec.onnx",
+                            size: 7848423 },
+                    dict: { repo: "PaddlePaddle/en_PP-OCRv5_mobile_rec_onnx",
+                            revision: "3fafbc3b5dcf",
+                            file: "inference.yml", as: "ppocrv5-en-dict.txt",
+                            dictFromYml: true, size: 3964 }
+                }
+            }
+        }
+    },
+
+    /* Document layout analysis: regions (text, table, figure, header, ...) and
+     * a reading order for them.  A SEPARATE entry rather than a role of
+     * ppocr-v5 because it is 130 MB against that set's 21 MB, and only pages
+     * that are not a single column need it -- nobody should pay for it by
+     * merely asking for OCR.  Combine the two explicitly:
+     *
+     *     var m = models.ocrGet("ppocr-v5");
+     *     m.layout = models.ocrGet("ppocr-layout").layout;
+     *     var reader = ocr.init(m);
+     */
+    "ppocr-layout": {
+        category: "ocr",
+        ocr: {
+            repo: "alex-dinh/PP-DocLayoutV3-ONNX",
+            revision: "7952bce3e684c7aa90aa7bf47798e8efae3c0921",
+            license: "apache-2.0",
+            defaultVariant: "v3",
+            common: {},
+            variants: {
+                v3: {
+                    layout: { file: "PP-DocLayoutV3.onnx", size: 130502049 }
+                }
+            }
+        }
+    },
     /* --- junk / non-text models the sweeps surface --- */
     "w2v-bert-2.0": "skip",                    /* speech embedder, not text */
     "stories15m_moe": "skip",                  /* ggml-org test model */
@@ -668,12 +840,26 @@ if (PIN_IX !== -1) {
         var pname = pins[pi];
         var pov = OVERRIDES[pname];
         var pentry = catalog[pname];
-        if (!pentry || !pov || pov === "skip") {
-            printf("%-34s (not in catalog / no override -- skipped)\n", pname);
+        if (!pov || pov === "skip") {
+            printf("%-34s (no override -- skipped)\n", pname);
             failures.push(pname + ": nothing to pin");
             continue;
         }
-        printf("%-34s ", pname); fflush(stdout);
+        if (!pentry) {
+            /* not in the catalog yet: an override with a category can ADD it,
+             * so a single hand-picked model can be pinned in without paying
+             * for a full discovery sweep */
+            if (!pov.category) {
+                printf("%-34s (not in catalog and override sets no category -- skipped)\n", pname);
+                failures.push(pname + ": nothing to pin");
+                continue;
+            }
+            pentry = catalog[pname] = { category: pov.category };
+            printf("%-34s (new) ", pname); fflush(stdout);
+        } else
+            printf("%-34s ", pname);
+        fflush(stdout);
+        if (pov.ocr) pentry.ocr = pov.ocr;             /* whole OCR map, verbatim */
         if (pov.gguf === null) delete pentry.gguf;      /* format dropped */
         else if (pov.gguf) {
             var pg = resolveGguf(pname, pov.gguf, repoTree(pov.gguf), false);
@@ -735,7 +921,8 @@ for (var name in OVERRIDES) {
     if (ov.dim) entry.dim = ov.dim;    /* static dim for a gguf-only model (e.g. CLIP) */
     if (ov.license) entry.license = ov.license;  /* model license when the conversion
                                                     repo is untagged */
-    if (entry.onnx || entry.gguf) { attachPrompts(name, entry); catalog[name] = entry; printf("ok\n"); }
+    if (ov.ocr) entry.ocr = ov.ocr;    /* whole OCR role/variant map, verbatim */
+    if (entry.onnx || entry.gguf || entry.ocr) { attachPrompts(name, entry); catalog[name] = entry; printf("ok\n"); }
     else { printf("FAILED\n"); failures.push(name + ": override repos unusable"); }
 }
 
@@ -743,7 +930,10 @@ for (var name in OVERRIDES) {
 
 /* ------------------------- diff vs existing ------------------------- */
 var prior = null;
-try { prior = require(OUT).catalog; } catch (e) {}
+/* fresh parse, NOT require(): require caches, so in --pin/--prompts mode
+ * (where `catalog` IS the required object) prior would alias it and every
+ * diff would come out empty */
+try { prior = JSON.parse(readFile(OUT, true)).catalog; } catch (e) {}
 if (prior) {
     var added = [], removed = [], changed = [];
     for (var k in catalog) {
@@ -769,21 +959,63 @@ if (prior) {
     }
 }
 
-/* ------------------------------ emit: splice into rampart-models.js ---- */
-var names2 = Object.keys(catalog);
-var lines = [];
-for (var li = 0; li < names2.length; li++)
-    lines.push('    ' + JSON.stringify(names2[li]) + ': ' + sprintf("%J", catalog[names2[li]]) + (li < names2.length - 1 ? ',' : ''));
-var body = "var CATALOG = {\n" + lines.join("\n") + "\n};";
-var modsrc = readFile(OUT, true);
-var BM = "/* ==== BEGIN GENERATED CATALOG (do not edit; run gen-model-list.js) ==== */";
-var EM = "/* ==== END GENERATED CATALOG ==== */";
-var bi = modsrc.indexOf(BM), ei = modsrc.indexOf(EM);
-if (bi < 0 || ei < 0) { printf("ERROR: catalog markers not found in %s\n", OUT); process.exit(1); }
-modsrc = modsrc.substring(0, bi + BM.length) + "\n" + body + "\n" + modsrc.substring(ei);
-writeFile(OUT, modsrc);
+/* ------------------------------ emit ---------------------------------- *
+ * Two outputs from one sweep:
+ *   1. rampart-models-catalog.json -- the WHOLE catalog (built-ins too),
+ *      fetched at runtime; each entry overrides the built-in of the same
+ *      name, so a moved repo or new quant reaches installed scripts.
+ *   2. the BUILTIN block spliced into rampart-models.js -- the stable
+ *      subset, so clip/ocr/rerank + the named workhorses resolve with no
+ *      network and no cache.
+ * One entry per line (not %4J): a single-line blob is unreadable in a
+ * diff, and the per-model line is what review actually looks at. */
+function catalogLines(names, src) {
+    var out = [];
+    for (var i = 0; i < names.length; i++)
+        out.push('    ' + JSON.stringify(names[i]) + ': ' + sprintf("%J", src[names[i]]) +
+                 (i < names.length - 1 ? ',' : ''));
+    return out;
+}
 var counts = {};
 for (k in catalog) counts[catalog[k].category] = (counts[catalog[k].category] || 0) + 1;
+var names2 = Object.keys(catalog);
+writeFile(OUT,
+    '{\n  "version": 1,\n' +
+    '  "generated": "' + dateFmt("%Y-%m-%dT%H:%M:%SZ", new Date(), true) + '",\n' +
+    '  "counts": ' + sprintf("%J", counts) + ',\n' +
+    '  "catalog": {\n' + catalogLines(names2, catalog).join("\n") + '\n  }\n}\n');
+
+/* ---- the built-in subset, spliced into the script ---- */
+var MODJS = process.scriptPath + "/rampart-models.js";
+var bnames = [], bcounts = {}, bcat = {};
+for (var bi = 0; bi < names2.length; bi++) {
+    var bn = names2[bi];
+    if (!isBuiltin(bn, catalog[bn])) continue;
+    /* strip 'downloads': a popularity counter that moves on every sweep
+     * would churn the script diff without changing behavior (the fetched
+     * catalog keeps it; only live discovery ranking uses it) */
+    var e = {}, ek;
+    for (ek in catalog[bn]) {
+        if (ek === "onnx" || ek === "gguf") {
+            var f = {}, fk;
+            for (fk in catalog[bn][ek]) if (fk !== "downloads") f[fk] = catalog[bn][ek][fk];
+            e[ek] = f;
+        } else e[ek] = catalog[bn][ek];
+    }
+    bcat[bn] = e; bnames.push(bn);
+    bcounts[e.category] = (bcounts[e.category] || 0) + 1;
+}
+var body = "var BUILTIN_CATALOG = {\n" + catalogLines(bnames, bcat).join("\n") + "\n};";
+var modsrc = readFile(MODJS, true);
+var BM = "/* ==== BEGIN GENERATED BUILTIN CATALOG (do not edit; run gen-model-list.js) ==== */";
+var EM = "/* ==== END GENERATED BUILTIN CATALOG ==== */";
+var bidx = modsrc.indexOf(BM), eidx = modsrc.indexOf(EM);
+if (bidx < 0 || eidx < 0) {
+    printf("ERROR: builtin catalog markers not found in %s\n", MODJS);
+    process.exit(1);
+}
+writeFile(MODJS, modsrc.substring(0, bidx + BM.length) + "\n" + body + "\n" + modsrc.substring(eidx));
+printf("\nwrote %s  (%d built-in models: %s)\n", MODJS, bnames.length, sprintf("%J", bcounts));
 printf("\nwrote %s  (%d models: %s)\n", OUT, Object.keys(catalog).length, sprintf("%J", counts));
 
 if (report.length) {

@@ -26,8 +26,10 @@ returns the path.  If the model is already present under
 `~/.rampart/models/<category>/`, the path is returned immediately with no
 network access — so it is safe (and intended) to call at the top of any script.
 
-It is a single pure-JS file (`rampart-models.js`) with the curated model
-catalog embedded; it needs only `rampart-curl`.
+It is a single pure-JS file (`rampart-models.js`) that needs only
+`rampart-curl` and `rampart-crypto`.  The catalog comes in two halves: a
+stable set built into the script, and a fetched layer that overrides and
+extends it — see [The catalog](#the-catalog).
 
 ---
 
@@ -55,9 +57,10 @@ For a short name like `'bge-m3'`, in order:
 
 1. **Already on disk** — `~/.rampart/models/<category>/<name>` (onnx dir) or
    the known gguf filename: returned instantly.
-2. **The embedded catalog** — ~70 curated embedding / reranker / generation
+2. **The catalog** — ~100 curated embedding / reranker / generation / clip
    models with pinned repos, commit revisions, and full quant maps.
-   `models.list()` shows them; `models.catalog` is the raw data.
+   `models.list()` shows them; `models.catalog` is the raw data, and
+   `models.variants(name)` lists a model's quants with real file sizes.
 3. **`org/repo` passthrough** — a `/` in the name skips all lookup.
 4. **Live HuggingFace discovery** — for names the catalog doesn't know
    (including models released after the catalog was generated).  Ranked by
@@ -129,6 +132,7 @@ rampart rampart-models.js bge-m3 gguf q8_0       # format + quant
 rampart rampart-models.js Qwen/Qwen3-4B-GGUF:q4_k_m
 rampart rampart-models.js https://host/model.gguf
 rampart rampart-models.js --list                 # catalog by category
+rampart rampart-models.js --update               # refresh the catalog now
 ```
 
 The path is printed to stdout (progress goes to the same terminal), so it
@@ -140,15 +144,63 @@ composes: `rampart run-something.js $(rampart rampart-models.js bge-m3)`.
 models.resolve('some-model')   // -> catalog-shaped entry {category, onnx:{...}, gguf:{...}}
                                //    without downloading anything
 models.list()                  // -> { embed:[...], rerank:[...], gen:[...] }
-models.catalog                 // the embedded catalog object
+models.catalog                 // the catalog object (name -> entry)
+models.variants('qwen3-30b-a3b')// -> [{quant, bytes, files, installed}, ...] smallest first
+models.catalogInfo()           // -> {source, entries, generated, fetched, etag, error, ...}
+models.updateCatalog()         // force a catalog refresh now
 models.modelsDir               // "~/.rampart/models"
 models.pull(...)               // alias of get()
 ```
 
-## Updating the embedded catalog
+## The catalog
 
-The catalog section of `rampart-models.js` is generated — do not edit it by
-hand.  To refresh it (new models, new quants, moved repos):
+Models turn over much faster than this script, but some model families barely
+move at all.  The catalog is split accordingly:
+
+**Built in** — compiled into `rampart-models.js`: every `clip`, `ocr` and
+`rerank` model, plus the stable embedding and generation workhorses.  These
+resolve with **no network and no cache** — if github is unreachable, asking
+for `bge-m3` or `qwen3-4b` still works, from disk or by downloading straight
+from its pinned repo.  Only a release changes this set.
+
+**Fetched** — `rampart-models-catalog.json`, downloaded from the project repo
+and cached under the model store; deliberately *not* installed with the
+module.  It carries the **whole** catalog, built-ins included, and each entry
+**overrides the built-in of the same name**.  That is what lets a moved repo,
+a re-pinned revision or a new quant reach installed scripts without a release,
+and it is where newly discovered and hand-added models arrive.
+
+The fetched half is resolved in this order:
+
+1. `rampart-models-catalog.json` **beside the script** — a repo checkout, or a
+   file you place there to pin a catalog.  Never present in an installed tree,
+   so this is the development path: regenerate, test locally, then push.
+2. `~/.rampart/models/.rampart-models-catalog.json` — the cache, revalidated
+   against the repo with a conditional GET (`ETag`): `304` keeps it, `200`
+   replaces it.
+3. The network alone, on the very first run.
+
+So a catalog we push reaches every install on its next use.  A failed refresh
+is never fatal — the cache keeps working offline, and a download that is
+truncated, an error page, or implausibly small is rejected rather than allowed
+to replace a good cache.  With no catalog at all, the built-ins still resolve;
+anything else falls through to live HuggingFace search, and one warning is
+printed.
+
+| Environment variable | Effect |
+| --- | --- |
+| `RAMPART_MODELS_CATALOG_URL` | fetch from a different URL (a mirror, or a pinned raw URL) |
+| `RAMPART_MODELS_CATALOG_TTL` | seconds between revalidations (default `0` — check on every load) |
+| `RAMPART_MODELS_CATALOG_OFFLINE` | never touch the network; use the cache only |
+
+`models.catalogInfo()` reports which source is live, how many models it holds,
+when it was generated and last fetched, and why the last refresh failed if it
+did.  `rampart rampart-models.js --update` forces a refresh.
+
+## Regenerating the catalog
+
+`rampart-models-catalog.json` is generated — do not edit it by hand.  To
+refresh it (new models, new quants, moved repos):
 
 ```
 rampart gen-model-list.js
@@ -156,10 +208,25 @@ rampart gen-model-list.js
 
 `gen-model-list.js` (same directory) sweeps the HuggingFace API by category,
 resolves both formats per model with the same ranking heuristics the module
-uses at runtime, and splices the result between the
-`==== BEGIN/END GENERATED CATALOG ====` markers.  Its run report shows a diff
-against the previous catalog and every ranking choice with runners-up; pin
-corrections or add `"skip"` entries in its `OVERRIDES` table and rerun.
+uses at runtime, and writes `rampart-models-catalog.json` (one model per line,
+so the diff is reviewable).  Its run report shows a diff against the previous
+catalog and every ranking choice with runners-up; pin corrections or add
+`"skip"` entries in its `OVERRIDES` table and rerun.
+
+One sweep writes both halves: the full `rampart-models-catalog.json`, and the
+built-in subset spliced into `rampart-models.js` between the `==== BEGIN/END
+GENERATED BUILTIN CATALOG ====` markers.  Membership of the built-in set is
+the `BUILTIN_CATEGORIES` / `BUILTIN_MODELS` table at the top of
+`gen-model-list.js` — add an alias there to promote a model, and keep the list
+to things that are genuinely stable, since every entry is script weight.
+
+A regenerated catalog takes effect locally as soon as it is written (the file
+beside the script wins), and reaches other installs when it is **pushed** —
+that is the release step for models.  Models that discovery cannot surface
+(CLIP, OCR) are hand-pinned in the generator's `OVERRIDES`; an OCR entry
+carries its whole role/variant map verbatim via `ocr:`.  To add a single model
+without a full sweep, add its override and run
+`rampart gen-model-list.js --pin <alias>`.
 Repos are recorded with their commit sha, so catalog downloads use immutable
 `resolve/{sha}/` URLs.
 
