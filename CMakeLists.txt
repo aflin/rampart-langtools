@@ -50,6 +50,21 @@ endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/extern/extern.cmake)
 
+# Several ggml-cpu ISA tiers inside ONE module, picked by CPUID at runtime, so a
+# shipped CPU build runs on any x86-64 without giving up AVX2/AVX-512 speed on
+# hardware that has them.  Must come after extern.cmake (needs the ggml-cpu target).
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml-cpu-tiers.cmake)
+
+if(TARGET lt-ggml-cpu-tiers)
+    # the x64 tier IS libggml-cpu.a (namespaced), so the archive itself must leave the
+    # link line -- otherwise it would still define ggml_backend_cpu_reg and could
+    # satisfy that reference ahead of the dispatcher, depending on link order.
+    list(REMOVE_ITEM LIBS
+        ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml-cpu.a)
+    list(REMOVE_ITEM LLAMA_LIBS
+        ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/ggml/src/libggml-cpu.a)
+endif()
+
 # Resolve rampart's install prefix (its process.installPath; modules install to
 # <prefix>/modules, headers come from <prefix>/include).  Normally we ask the rampart
 # binary, but the cross-glibc ovens can't: they mount the host's rampart install into
@@ -710,6 +725,11 @@ set(LT_ENABLE_GPU_LAST "${LT_ENABLE_GPU}" CACHE INTERNAL "Previous value of LT_E
 # Link with all libs
 target_link_libraries(rampart-langtools PRIVATE ${LIBS})
 
+if(TARGET lt-ggml-cpu-tiers)
+    target_sources(rampart-langtools PRIVATE ${LT_GGML_CPU_TIER_SOURCES} $<TARGET_OBJECTS:lt-ggml-cpu-tiers>)
+    add_dependencies(rampart-langtools lt-cpu-tiers-gen)
+endif()
+
 # Link with selected libs
 # (stdc++ skipped on Darwin: the CXX driver already links libc++ and the
 #  SDK aliases libstdc++ to it -> ld warns "ignoring duplicate libraries")
@@ -718,12 +738,30 @@ target_link_libraries(rampart-llamacpp PRIVATE
     $<$<NOT:$<PLATFORM_ID:Darwin>>:stdc++>
 )
 
+if(TARGET lt-ggml-cpu-tiers)
+    target_sources(rampart-llamacpp PRIVATE ${LT_GGML_CPU_TIER_SOURCES} $<TARGET_OBJECTS:lt-ggml-cpu-tiers>)
+    add_dependencies(rampart-llamacpp lt-cpu-tiers-gen)
+endif()
+
 # Link with selected libs
 target_link_libraries(rampart-faiss PRIVATE ${FAISS_LIBS})
 
 target_link_libraries(rampart-sentencepiece PRIVATE
     ${SP_LIBS}
 )
+
+# Build-time guard: every ggml-cpu symbol is renamed per ISA tier and the dispatcher
+# re-exports only the two the rest of the build calls.  If an upgrade starts calling
+# another one, a `-shared` link would leave it undefined and it would only surface as
+# a dlopen failure at require() time -- so fail the build here instead.
+if(TARGET lt-ggml-cpu-tiers)
+    foreach(_m rampart-llamacpp rampart-clip)
+        add_custom_command(TARGET ${_m} POST_BUILD
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check-cpu-tier-symbols.sh
+                    $<TARGET_FILE:${_m}> $<TARGET_FILE:ggml-cpu>
+            COMMENT "checking ${_m} for unforwarded ggml-cpu symbols")
+    endforeach()
+endif()
 
 # clip needs only ggml (+ its deps).  Linking the full LLAMA_LIBS is safe: static
 # archives contribute only referenced objects, so libllama/-common add nothing,
@@ -732,6 +770,11 @@ target_link_libraries(rampart-clip PRIVATE
     ${LLAMA_LIBS}
     $<$<NOT:$<PLATFORM_ID:Darwin>>:stdc++>
 )
+
+if(TARGET lt-ggml-cpu-tiers)
+    target_sources(rampart-clip PRIVATE ${LT_GGML_CPU_TIER_SOURCES} $<TARGET_OBJECTS:lt-ggml-cpu-tiers>)
+    add_dependencies(rampart-clip lt-cpu-tiers-gen)
+endif()
 
 # rampart-langtools.so is the legacy combined module; its functionality is now
 # covered by the separate rampart-llamacpp / rampart-faiss / rampart-sentencepiece

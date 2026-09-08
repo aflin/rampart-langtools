@@ -75,6 +75,24 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
         "disabling GGML_NATIVE, using -march=${LT_ARM_ARCH}")
     endif()
   endif()
+elseif(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  # Linux x86: pin the BASELINE.  ggml defaults to GGML_NATIVE=ON -> -march=native,
+  # which welds the BUILD HOST's instruction set into a module we ship to arbitrary
+  # machines -- and it lands AVX in generic code like ggml_cpu_init, so a CPU without
+  # it dies with SIGILL on the first call rather than degrading.  The floor must be a
+  # decision, not an accident of whichever builder ran last.
+  #
+  # This target is the x86-64 baseline (SSE2 only), which runs on every x86-64 CPU
+  # ever made.  Speed on modern hardware comes back at RUNTIME: cmake/ggml-cpu-tiers
+  # compiles additional ISA tiers into the SAME module and picks the best one via
+  # CPUID (see LT_GGML_CPU_TIERS).  So this baseline is both the floor and the
+  # fallback tier -- it must stay free of every optional instruction set.
+  set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+  foreach(_feat SSE42 AVX AVX_VNNI AVX2 BMI2 FMA F16C AVX512 AVX512_VBMI AVX512_VNNI
+                AVX512_BF16 AMX_TILE AMX_INT8 AMX_BF16)
+    set(GGML_${_feat} OFF CACHE BOOL "" FORCE)
+  endforeach()
+  message(STATUS "rampart-langtools: portable x86 build -- ggml baseline is x86-64 (SSE2)")
 endif()
 
 # When llama.cpp is built as a subproject, its `common` subdirectory is OFF by
