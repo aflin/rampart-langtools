@@ -126,8 +126,8 @@ touches only 8 libcommon entry points and reads exactly one field of `common_cha
 `thinking_end_tag` -> `thinking_end_tags`, `message_spans` -> `message_delimiters`, plus
 +493/-94 across the in-tree jinja engine, which b9494 already had) missed us entirely.
 **As of 2026-08-17 that is no longer true, deliberately: the tool-calling +
-reasoning adapter widened this surface on purpose** (see
-`claude-work/llamacpp-tool-calling.md`). The shim now reads ~8 fields of
+reasoning adapter widened this surface on purpose**
+The shim now reads ~8 fields of
 `common_chat_params` and calls `common_chat_parse`,
 `common_chat_msg_diff::compute_diffs`, the three `*_parse_oaicompat` helpers,
 `common_chat_templates_support_enable_thinking` and `common_cpu_get_num_math`.
@@ -396,14 +396,13 @@ noted above, these are not patches to llama.cpp — they are how *we* build and 
   Uncapped, bge-m3 measured **0.65x — slower than unbatched** on an RTX 4070 Ti (0.64x at b10446).
   Note flash attention is auto-probed per (model x backend) and changes this cost curve: on one
   4070 Ti / cu12 build, nomic and bge-m3 resolved FA **on** while bge-small (head_dim 32) resolved
-  **off**. Re-measure the optimum after an upgrade or on new hardware; `claude-work/gpu-batch-test/`
-  (`sweep.js`, `TOKENS=1`) does exactly that. *b10446 sweep reproduced the b9494 curve; 512 stands.*
+  **off**. Re-measure the optimum after an upgrade or on new hardware.
 
 ### Known non-issues (don't chase on upgrade)
 - **`toolChoice:"required"` is not enforced by b10446.** Upstream builds the correct
   non-lazy tool-calls grammar (2000 bytes, 0 triggers) and hands it to
   `common_sampler_init`, but generation comes out unconstrained. Reproduced with zero
-  rampart code in `claude-work/probe2.cc`, with and without `grammar_first`, on two
+  rampart code, with and without `grammar_first`, on two
   models. We pass the choice through correctly. `llamacpp-test.js` asserts only that
   the request is accepted, so it will start failing usefully if upstream fixes this —
   at which point tighten the test.
