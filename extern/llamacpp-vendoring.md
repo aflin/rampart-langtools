@@ -4,11 +4,85 @@
 
 | | |
 |---|---|
-| **Upstream tag** | `b10446` |
-| **Upstream commit** | `adb55e5148dc93bcdca7212a2d1df3ccc422959a` |
-| **Tag date** | 2026-08-15 |
-| **ggml version** | 0.20.0 |
+| **Upstream tag** | `b11349` |
+| **Upstream commit** | `(tag b11349; extracted via `git archive` from a local clone)` |
+| **Tag date** | 2026-10-02 |
+| **ggml version** | 0.25.3 |
 | **Source** | https://github.com/ggml-org/llama.cpp |
+
+### b10446 -> b11349 (2026-10-02): three breaks, all in the gen shim
+
+`rampart-llamacpp.c` compiled **clean** — the module API and the whole
+embed/chunk-batching path were untouched, because the C-level `llama_batch`,
+`llama_batch_init/free`, `llama_decode` and `llama_get_embeddings_seq` are all
+unchanged. The new `llama_batch_ext` is purely additive. Metal patches reapplied
+with offsets only (+21, +479/+481). All four batching invariants and all four
+chat-adapter traps held, and every libcommon symbol the adapter needs survived.
+
+The three breaks, all in `llama_gen_shim.cc`:
+
+1. **The `json` alias is gone.** The common headers no longer define `json`, and
+   **re-aliasing it to nlohmann does not work** — it errors inside llama.cpp's own
+   `common/json.h`, because of (3).
+2. **`common_batch_clear` / `common_batch_add` removed**, replaced by methods on a
+   `common_batch` class wrapping `llama_batch_ext`. Fixed by filling `llama_batch`
+   directly (`lg_batch_clear` / `lg_batch_add`), the same lines the embed path
+   already hand-rolls — which drops two more libcommon dependencies.
+3. **The oaicompat interface moved from `nlohmann::ordered_json` to `common_json`**,
+   a pimpl wrapper that deliberately hides the backing library; `chat.h` no longer
+   mentions nlohmann at all. Nearly 1:1 for us: `parse_no_throw` replaces
+   `parse(text, nullptr, false)`, and `is_discarded` / `is_array` / `array()` /
+   `dump()` all carry the same names. We only move JSON across that boundary as
+   text, so the dependency is just parse-from-string / dump-to-string.
+
+**Verified on moe (DGX Spark GB10, aarch64) 2026-10-02, main branch, uncommitted:**
+
+| check | result |
+|---|---|
+| oven builds (ARM: cpu, cpu_2_28, cu12, cu13) | **4/4 clean, 0 errors** |
+| `llamacpp-test.js` on CPU | **37/37** |
+| `llamacpp-test.js` on cu13 / GB10 GPU | **37/37** |
+| embed vector parity vs b10446, 4 models | **PASS** — identical k/spans, 0 row misassignments |
+| batching still correct under b11349 | **PASS** on all 4 models |
+| GPU actually exercised | yes, 1206 MiB VRAM during gen |
+
+**Also verified on `en` (Mac Studio, arm64, macOS 15, Metal) 2026-10-02:**
+
+| check | result |
+|---|---|
+| cmake build with Metal | clean, 0 errors |
+| Metal patches | all 3 markers in place after reapply |
+| `llamacpp-test.js` | **37/37** |
+| embed parity vs b10446 (MiniLM f16, bge-m3 Q8_0) | **BIT-IDENTICAL** — drift 0.0000e+00, cosine 1.000000000 |
+| batching correct under b11349 | PASS (8.6e-5 / 2.0e-4) |
+
+The bit-identical Metal result repeats what CUDA did across b9494 -> b10446: a
+GPU backend produces the same vectors before and after, while the CPU backend
+drifts with quantization. **The drift is a CPU-backend phenomenon, not a general
+property of upgrading.** Useful operationally: a GPU-served index survives an
+upgrade unchanged; a CPU-built low-bit one does not.
+
+Upstream drift vs b10446 (batching off, CPU) tracks quantization exactly as the
+b9494 -> b10446 upgrade did: f16 6.1e-5, bge-small q4_k_m 2.1e-3, bge-m3 Q8_0
+2.8e-3, nomic Q4_K_M 1.4e-2 (cos 0.9908 — the usual low-bit outlier). A
+CPU-built Q4_K_M index is still not bit-comparable across an upgrade.
+
+**`batchTokens` re-swept on firefly (RTX 4070 Ti, cu12, driver 570.211.01)
+2026-10-02: 512 still correct, no retune needed.** Five ggml minors did not move
+the cost curve -- every cell is within noise of the b10446 measurement on the
+same box:
+
+| batchTokens | bge-small q8_0 | nomic Q4_K_M | bge-m3 Q8_0 |
+|---|---|---|---|
+| 256 | 1.79 -> 1.82 | 1.45 -> 1.49 | 1.12 -> 1.13 |
+| **512 (default)** | 2.21 -> **2.23** | 1.73 -> **1.75** | 1.15 -> **1.17** |
+| 1024 | 2.19 -> 2.24 | 1.79 -> **1.86** | 0.99 -> 1.00 |
+| 2048 | 2.19 -> 2.23 | 1.26 -> 1.23 | 0.90 -> 0.91 |
+| 8192 | 2.21 -> 2.23 | 1.27 -> 1.30 | 0.65 -> **0.65** |
+
+512 remains the largest value that never regresses. nomic still peaks at 1024
+(1.86x), but that setting costs bge-m3 (1.00x, and falling to 0.65x by 8192), so
+512 is still the right compromise rather than the per-model optimum.
 
 Previous: `b9494` / `c8d6a0063613ebd359b0030273746e05658dd605` / 2026-06-03 / ggml 0.13.1.
 That upgrade spanned 647 tagged releases and cost **two struct fields at three call
@@ -314,6 +388,49 @@ noted above, these are not patches to llama.cpp — they are how *we* build and 
 - The generation shim is an OBJECT lib and MUST be consumed via
   `$<TARGET_OBJECTS:llama_gen_shim_obj>` in BOTH `add_library` targets (a plain target
   name does not pull an OBJECT lib's objects on macOS -> missing `lgen_*` at dlopen).
+
+### GPU detection: IGPU is a GPU (unified-memory parts)
+
+`ggml_backend_cuda_device_get_type()` returns `GGML_BACKEND_DEVICE_TYPE_IGPU`
+rather than `..._GPU` whenever `cudaDeviceProp.integrated` is set -- i.e. on
+every unified-memory CUDA part: **DGX Spark (GB10), Jetson**. Verified on moe:
+
+    ggml_backend_dev_count = 2
+      dev[0] CUDA0   type=2 (IGPU)
+      dev[1] CPU     type=0 (CPU)
+
+`lt_gpu_in_use()` originally matched `..._GPU` only, so on the Spark it returned
+0 despite a fully working CUDA backend (1206 MiB in use during gen). That was
+wrong in three ways, in descending order of seriousness:
+
+1. **It skipped the post-fork refusal.** `LT_FORK_REFUSAL` is gated on this
+   predicate at four call sites. On a Spark/Jetson a pre-fork handle was USED in
+   the child rather than refused -- crashing the CUDA runtime instead of raising
+   a clean error. This is the reason the fix matters: a correctness hole on
+   exactly the hardware people run `rampart-server` daemon mode on.
+2. It left embed chunk batching off (auto resolves on this predicate).
+3. It misreported `embedDefaults().gpuInUse`.
+
+**The fix splits the predicate, because the callers do not all want the same
+question answered.** `lt_gpu_in_use()` now counts GPU **or** IGPU -- used by fork
+safety and reporting. A second `lt_dedicated_gpu_in_use()` (GPU only) drives the
+chunk-batching auto-default, because that is a performance question whose answer
+depends on memory architecture:
+
+| model | discrete (RTX 4070 Ti) | unified (GB10) |
+|---|---|---|
+| bge-small | 2.2x faster | **0.89x (slower)** |
+| nomic | 1.7x faster | 1.02x |
+| bge-m3 | 1.2x faster | **0.89x (slower)** |
+
+Batching amortizes per-decode launch/transfer overhead, which a discrete part
+pays over PCIe; a unified-memory part pays neither, so the packed batch's
+quadratic attention cost dominates and batching becomes a small net LOSS.
+Auto-on therefore follows **dedicated VRAM**, not merely "has a GPU". Confirmed
+on the GB10: auto 809 ms == explicit false 812 ms, vs explicit true 928 ms.
+
+(llama.cpp's own `llama-bench` tests `GPU || IGPU`, which is precedent for
+counting IGPU -- but note it is not making a batching decision.)
 
 ### Thread defaults — `lgen_default_n_threads()` in the shim
 - Gen resolves its default thread count through libcommon's `common_cpu_get_num_math()`

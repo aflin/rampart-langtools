@@ -20,7 +20,7 @@
 #include "common.h"
 #include "sampling.h"
 #include "chat.h"
-#include "nlohmann/json.hpp"   /* full definition (common headers only fwd-declare `json`) */
+#include "json.h"              /* common_json: llama.cpp's own JSON wrapper (b11349+) */
 
 #include <string>
 #include <string_view>
@@ -40,7 +40,13 @@
 
 #include "llama_gen_shim.h"
 
-/* llama.cpp's common headers already define `json` as nlohmann::ordered_json. */
+/* Up to b10446 the common headers aliased `json` to nlohmann::ordered_json and
+ * the oaicompat helpers took it.  b11349 replaced that with common_json, a pimpl
+ * wrapper that deliberately hides the backing library; re-aliasing `json` to
+ * nlohmann instead breaks inside common/json.h.  We only ever move JSON across
+ * this boundary as text (duktape hands us strings and parses them back), so the
+ * whole dependency is parse-from-string / dump-to-string. */
+using json = common_json;
 
 #ifdef __APPLE__
 /* defined in llama_gen_macos.mm — flips Cocoa/Foundation to multithreaded mode */
@@ -157,6 +163,25 @@ struct lgen_engine {
 };
 
 /* ============================== small helpers ============================== */
+
+/* b11349 turned libcommon's batch helpers into a common_batch class over the new
+ * llama_batch_ext.  The C-level llama_batch + llama_decode are unchanged and
+ * still supported, so fill the batch directly -- the same few lines the
+ * embedding path already hand-rolls (rampart-llamacpp.c, ll_decode_pooled_batch).
+ * This also drops two more libcommon dependencies, which is the direction
+ * extern/llamacpp-vendoring.md asks for. */
+static inline void lg_batch_clear(llama_batch &b) { b.n_tokens = 0; }
+
+static inline void lg_batch_add(llama_batch &b, llama_token id, llama_pos pos,
+                                llama_seq_id seq_id, bool output) {
+    const int t = b.n_tokens;
+    b.token[t]     = id;
+    b.pos[t]       = pos;
+    b.n_seq_id[t]  = 1;
+    b.seq_id[t][0] = seq_id;
+    b.logits[t]    = output ? 1 : 0;
+    b.n_tokens     = t + 1;
+}
 
 static void set_err(char *errbuf, size_t errlen, const std::string &msg) {
     if (errbuf && errlen) { std::strncpy(errbuf, msg.c_str(), errlen - 1); errbuf[errlen - 1] = '\0'; }
@@ -354,7 +379,7 @@ static applied_prompt apply_templates(lgen_engine *e, const gen_request *req) {
         if (req->thinking >= 0) in.enable_thinking = req->thinking != 0;
 
         if (req->has_messages) {
-            json arr = json::parse(req->messages_json, nullptr, false);
+            json arr = common_json::parse_no_throw(req->messages_json);
             if (arr.is_discarded()) { out.err = "messages is not valid JSON"; return out; }
             /* Prefer the upstream OpenAI-shape parser: it round-trips tool_calls,
              * tool_call_id, tool_name and reasoning_content, which an agent loop
@@ -378,7 +403,7 @@ static applied_prompt apply_templates(lgen_engine *e, const gen_request *req) {
         if (want_tools) {
             if (!e->use_jinja) { out.err = "tools require the Jinja chat template path (useJinja must be on)"; return out; }
             if (!e->supports_tools) { out.err = "this model's chat template does not support tools"; return out; }
-            json tj = json::parse(req->tools_json, nullptr, false);
+            json tj = common_json::parse_no_throw(req->tools_json);
             if (tj.is_discarded()) { out.err = "tools is not valid JSON"; return out; }
             try {
                 in.tools = common_chat_tools_parse_oaicompat(tj);
@@ -643,12 +668,12 @@ static void engine_step(lgen_engine *e) {
         }
     }
 
-    common_batch_clear(e->batch);
+    lg_batch_clear(e->batch);
 
     for (auto &slot : e->slots) {
         if (slot.state != SLOT_GENERATING) continue;
         slot.i_batch = e->batch.n_tokens;
-        common_batch_add(e->batch, slot.sampled, slot.n_past, { slot.id }, true);
+        lg_batch_add(e->batch, slot.sampled, slot.n_past, slot.id, true);
         slot.n_past++;
     }
 
@@ -656,7 +681,7 @@ static void engine_step(lgen_engine *e) {
         if (slot.state != SLOT_STARTED && slot.state != SLOT_PROMPT) continue;
         if (slot.state == SLOT_STARTED) slot.state = SLOT_PROMPT;
         while (slot.n_prompt_done < slot.prompt_tokens.size() && (uint32_t) e->batch.n_tokens < e->n_batch) {
-            common_batch_add(e->batch, slot.prompt_tokens[slot.n_prompt_done], slot.n_past, { slot.id }, false);
+            lg_batch_add(e->batch, slot.prompt_tokens[slot.n_prompt_done], slot.n_past, slot.id, false);
             slot.n_past++; slot.n_prompt_done++;
         }
         if (slot.n_prompt_done == slot.prompt_tokens.size()) {
@@ -874,8 +899,8 @@ static bool build_context(lgen_engine *e, char *err, size_t errlen) {
     {
         llama_token bos = llama_vocab_bos(e->vocab);
         if (bos == LLAMA_TOKEN_NULL) bos = (llama_token) 0;
-        common_batch_clear(e->batch);
-        common_batch_add(e->batch, bos, 0, { 0 }, true);
+        lg_batch_clear(e->batch);
+        lg_batch_add(e->batch, bos, 0, 0, true);
         /* The warm-up is the first graph run, so it is where a context that
            cannot actually compute -- weights fit, compute buffers do not --
            first fails.  Reporting success here defers that to the reader's
@@ -889,7 +914,7 @@ static bool build_context(lgen_engine *e, char *err, size_t errlen) {
             return false;
         }
         llama_memory_clear(llama_get_memory(e->ctx), true);
-        common_batch_clear(e->batch);
+        lg_batch_clear(e->batch);
     }
     return true;
 }

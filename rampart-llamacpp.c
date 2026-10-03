@@ -246,18 +246,48 @@ static void lt_errmsg_clear(duk_context *ctx)
  * GPU-backed handle is REFUSED with a clear error.  CPU-only operation is
  * allowed to continue after a fork (contexts are rebuilt per pid).
  *
- * lt_gpu_in_use(): true iff ggml has a GPU-class backend device registered
- * (CUDA on Linux, Metal on macOS).  Registration happens at model load, so by
- * the time a post-fork check runs (a model existed before the fork), the
- * inherited registry answers correctly.  Pure-CPU builds compile no GPU
- * backends and always return 0. */
+ * The two predicates below split this by what each caller needs: fork safety
+ * and reporting want ANY GPU-class backend (lt_gpu_in_use), while the
+ * chunk-batching default wants dedicated VRAM specifically
+ * (lt_dedicated_gpu_in_use).  See each one's comment. */
+static int lt_gpu_backend_kind(void)
+{
+    int kind = 0;   /* 0 = none, 1 = integrated, 2 = dedicated */
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        enum ggml_backend_dev_type t = ggml_backend_dev_type(ggml_backend_dev_get(i));
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU)  return 2;
+        if (t == GGML_BACKEND_DEVICE_TYPE_IGPU) kind = 1;
+    }
+    return kind;
+}
+
+/* lt_gpu_in_use(): true iff ggml has ANY GPU-class backend registered --
+ * dedicated OR integrated.  ggml reports a CUDA device as IGPU rather than GPU
+ * whenever cudaDeviceProp.integrated is set, i.e. on every unified-memory part
+ * (DGX Spark GB10, Jetson).  Those run a full CUDA backend, so an IGPU must
+ * count here: this predicate gates the post-fork refusal, and missing it meant
+ * a pre-fork handle was used in the child instead of refused, crashing the CUDA
+ * runtime rather than raising.  (llama.cpp's own llama-bench likewise tests
+ * GPU || IGPU.)  Registration happens at model load, so a post-fork check sees
+ * the inherited registry correctly.  Pure-CPU builds always return 0. */
 static int lt_gpu_in_use(void)
 {
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
-        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU)
-            return 1;
-    return 0;
+    return lt_gpu_backend_kind() != 0;
 }
+
+/* lt_dedicated_gpu_in_use(): true only for a DISCRETE GPU.  Used for the
+ * chunk-batching auto-default, which is a performance question rather than a
+ * correctness one, and the answer differs by memory architecture: batching
+ * amortizes per-decode launch/transfer overhead, which is what a discrete part
+ * pays over PCIe (measured 2.2x / 1.7x / 1.2x on an RTX 4070 Ti).  A
+ * unified-memory part pays neither, so the packed batch's quadratic attention
+ * cost dominates instead -- measured 0.89x / 1.02x / 0.89x on a GB10, i.e. a
+ * small net LOSS.  So auto-on follows dedicated VRAM, not merely "has a GPU". */
+static int lt_dedicated_gpu_in_use(void)
+{
+    return lt_gpu_backend_kind() == 2;
+}
+
 
 /* ---- embed defaults, settable from JS via llamacpp.embedDefaults() -------
  * These are the defaults for initEmbed()'s options AND the only way to
@@ -291,7 +321,7 @@ static int ll_resolve_batch(struct llama_context *lctx, int setting)
 {
     int cap = lctx ? (int)llama_n_seq_max(lctx) : 1;
     if (cap < 1) cap = 1;
-    if (setting < 0) setting = lt_gpu_in_use() ? cap : 1;   /* auto */
+    if (setting < 0) setting = lt_dedicated_gpu_in_use() ? cap : 1;   /* auto; see lt_dedicated_gpu_in_use */
     if (setting <= 1) return 1;
     return setting < cap ? setting : cap;
 }
