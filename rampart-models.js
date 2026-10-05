@@ -1125,7 +1125,16 @@ function entryFromRepo(repo, o, tree) {
      * `tree` optional: a caller that already fetched the repo tree
      * (discover) passes it in to avoid a second API call. */
     if (!tree) tree = repoTree(repo, o.revision, o.token);
-    if (!tree) throwErr("cannot list %s (typo? gated? set HF_TOKEN)", repo);
+    if (!tree) {
+        var ci = repo.indexOf(":");
+        /* a ':' this far in means the suffix did not parse as a quant, so it
+         * was sent to HF as part of the repo name (which 401s, not 404s) */
+        if (ci !== -1)
+            throwErr("cannot list %s -- ':%s' is not a usable quant suffix, " +
+                     "so it was read as part of the repo name",
+                     repo, repo.substring(ci + 1));
+        throwErr("cannot list %s (typo? gated? set HF_TOKEN)", repo);
+    }
     var entry = { category: o.category || "embed" };
     if (!o.category) {
         /* no caller-pinned category: take it from the repo's pipeline tag
@@ -1178,7 +1187,13 @@ function entryFromRepo(repo, o, tree) {
     }
     if (Object.keys(quants).length) entry.gguf = { repo: repo, revision: o.revision, quants: quants };
     if (model) entry.onnx = { repo: repo, revision: o.revision, model: model };
-    if (!entry.gguf && !entry.onnx) throwErr("%s has no .gguf or .onnx files", repo);
+    if (!entry.gguf && !entry.onnx) {
+        /* a safetensors release usually keeps its quants in a '-GGUF' sibling */
+        if (!/-GGUF$/i.test(repo) &&
+            apiGet("/api/models/" + encodeURI(repo + "-GGUF"), o.token))
+            throwErr("%s has no .gguf or .onnx files -- try %s-GGUF", repo, repo);
+        throwErr("%s has no .gguf or .onnx files", repo);
+    }
     if (entry.category === "embed") {
         var p = fetchPrompts(repo, o.token);
         if (p) entry.prompts = p;
@@ -1310,7 +1325,7 @@ function get(name, o) {
     if (/^https?:\/\//i.test(name)) return urlGet(name, o);
 
     /* name:quant shorthand (quant implies gguf) */
-    var m = /^(.*):([A-Za-z0-9_.]+)$/.exec(name);
+    var m = /^(.*):([A-Za-z0-9_.-]+)$/.exec(name);
     if (m && !/^https?$/i.test(m[1])) {
         name = m[1];
         o.quant = o.quant || m[2];
