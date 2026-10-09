@@ -51,7 +51,8 @@ function loadModels() {
 var models = loadModels();
 var MODELS = {
     embed: { name: 'all-minilm-l6-v2',      quant: 'F16',    what: 'embedding test' },
-    gen:   { name: 'qwen2.5-0.5b-instruct', quant: 'Q4_K_M', what: 'generation / inference test' }
+    gen:   { name: 'qwen2.5-0.5b-instruct', quant: 'Q4_K_M', what: 'generation / inference test' },
+    media: { name: 'embeddinggemma-2',      quant: 'Q8_0',   what: 'multimodal (image/audio) embedding test' }
 };
 
 /* ================================================================
@@ -153,6 +154,138 @@ function runEmbedTest() {
     });
     try { emb.destroy(); } catch(e) {}
     testFeature("embed destroy", true);
+}
+
+/* ================================================================
+   Test: MULTIMODAL EMBEDDING (initEmbed {mmproj} + embedMedia*)
+   Media are generated here (solid-colour PPM images, a WAV tone), so the
+   only downloads are the model and its projector.  Also covers the handle
+   in a worker thread and after fork(): on CPU the child gets the same
+   vector; with a GPU backend the child must get the fork refusal, never hang.
+   ================================================================ */
+function ppm(r, g, b) {                 /* 64x64 solid-colour binary PPM */
+    var hdr = "P6\n64 64\n255\n", n = 64 * 64, a = new Uint8Array(hdr.length + n * 3);
+    for (var i = 0; i < hdr.length; i++) a[i] = hdr.charCodeAt(i);
+    for (i = 0; i < n; i++) { a[hdr.length + i*3] = r; a[hdr.length + i*3 + 1] = g; a[hdr.length + i*3 + 2] = b; }
+    return a;
+}
+function wavTone(hz, secs) {            /* 16 kHz mono 16-bit PCM sine */
+    var sr = 16000, n = sr * secs, a = new Uint8Array(44 + n * 2), dv = new DataView(a.buffer);
+    function str(o, s) { for (var i = 0; i < s.length; i++) a[o + i] = s.charCodeAt(i); }
+    str(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); str(8, "WAVEfmt ");
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true);
+    dv.setUint16(34, 16, true); str(36, "data"); dv.setUint32(40, n * 2, true);
+    for (var i = 0; i < n; i++) dv.setInt16(44 + i * 2, Math.round(12000 * Math.sin(2 * Math.PI * hz * i / sr)), true);
+    return a;
+}
+function dot(a, b) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+
+function runMediaTest() {
+    printf("\n--- multimodal embedding (initEmbed mmproj + embedMedia) ---\n");
+    var path = obtain(MODELS.media);
+    if (!path) { printf("- skipped\n"); return; }
+    var mmproj = null;
+    try {
+        mmproj = models.mmprojGet(MODELS.media.name, {
+            confirm: function(info) {
+                var r = ask(sprintf("Download %s projector %s (%s) for the %s?\n  -> %s  [y/N]: ",
+                                    info.name, info.quant, info.size, MODELS.media.what, info.dest));
+                return r === 'y' || r === 'yes';
+            }
+        });
+    } catch(e) { printf("  fetch failed: %s\n", e.message || e); }
+    if (!mmproj) { printf("- skipped\n"); return; }
+
+    var Q = "task: search result | query: ";
+    var red = ppm(220, 20, 20), blue = ppm(20, 40, 220);
+    var e = null, vred = null;
+    testFeature("initEmbed loads model + projector", function() {
+        /* imageTokens 70 (the model's minimum; default 280) keeps the CPU run short --
+         * these tests check mechanics and red-vs-blue, not fine detail */
+        e = llamacpp.initEmbed(path, {mmproj: mmproj, imageTokens: 70});
+        return !!(e && e.media && e.media.vision && e.media.audio && e.media.imageTokens === 70);
+    });
+    if (!e) return;
+    testFeature("image (Buffer) -> 768d unit vector", function() {
+        var r = e.embedMediaToNumbers({image: red});
+        vred = r.avgVec;
+        return vred.length === 768 && Math.abs(dot(vred, vred) - 1) < 1e-3 && r.nTokens > 0;
+    });
+    testFeature("image by path == same image as Buffer", function() {
+        var f = "/tmp/llamacpp-test-red-" + process.getpid() + ".ppm";
+        writeFile(f, red);
+        var v = e.embedMediaToNumbers({image: f}).avgVec;
+        try { rmFile(f); } catch(x) {}
+        return dot(v, vred) > 0.9999;
+    });
+    testFeature("image <-> caption: red and blue each nearest their own caption", function() {
+        var vb = e.embedMediaToNumbers({image: blue}).avgVec;
+        var cr = e.embedTextToNumbers(Q + "a solid red image").avgVec;
+        var cb = e.embedTextToNumbers(Q + "a solid blue image").avgVec;
+        return dot(vred, cr) > dot(vred, cb) && dot(vb, cb) > dot(vb, cr);
+    });
+    testFeature("audio (WAV Buffer) -> 768d vector", function() {
+        var r = e.embedMediaToNumbers({audio: wavTone(440, 2)});
+        return r.avgVec.length === 768 && r.nTokens > 0;
+    });
+    testFeature("text with <|image|> placeholder + image", function() {
+        var r = e.embedMediaToNumbers({text: "A colour swatch: <|image|>", image: red});
+        return r.avgVec.length === 768 && dot(r.avgVec, vred) < 0.9999;
+    });
+    testFeature("Fp32Buf / Fp16Buf sizes", function() {
+        return e.embedMediaToFp32Buf({image: red}).avgVec.byteLength === 3072 &&
+               e.embedMediaToFp16Buf({image: red}).avgVec.byteLength === 1536;
+    });
+    testFeature("error: placeholder count != media count", function() {
+        try { e.embedMediaToNumbers({text: "<|image|> <|image|>", image: red}); return false; }
+        catch(x) { return /placeholder/.test(x.message); }
+    });
+    testFeature("error: audio given as an image", function() {
+        try { e.embedMediaToNumbers({image: wavTone(440, 1)}); return false; }
+        catch(x) { return /decodes as audio/.test(x.message); }
+    });
+    /* fork: the child may continue on CPU; with a GPU backend it must refuse
+     * (both a pre-fork handle and a new load), never hang */
+    var gpu = !!llamacpp.embedDefaults().gpuInUse;
+    var ff = "/tmp/llamacpp-test-fork-" + process.getpid();
+    writeFile(ff, "");
+    var pid = -1;
+    for (var w = 0; w < 50 && pid < 0; w++) {   /* rampart won't fork while the worker above is still closing */
+        try { pid = fork(); } catch(x) { if (!/active threads/.test(x.message)) throw x; sleep(0.1); }
+    }
+    if (pid < 0) { testFeature("fork child (could not fork: worker thread still active)", false); try { e.destroy(); } catch(x) {} return; }
+    if (pid === 0) {
+        var out = [];
+        try { out.push(Math.abs(e.embedMediaToNumbers({image: red}).avgVec[0] - vred[0]) < 1e-5 ? "same" : "different"); }
+        catch(x) { out.push(/fork/.test(x.message) ? "refused" : "threw " + x.message); }
+        try { out.push(llamacpp.initEmbed(path, {mmproj: mmproj, imageTokens: 70}).embedMediaToNumbers({image: red}).avgVec.length === 768 ? "loaded" : "bad"); }
+        catch(x) { out.push(/fork/.test(x.message) ? "refused" : "threw " + x.message); }
+        writeFile(ff, out.join(","));
+        process.exit(0);
+    }
+    var res = "";
+    for (var i = 0; i < 60 && !res; i++) { sleep(0.25); try { res = readFile(ff, true); } catch(x) {} }
+    if (!res) kill(pid, 9);
+    try { rmFile(ff); } catch(x) {}
+    testFeature("fork child: " + (gpu ? "GPU -> refused, no hang" : "CPU -> same vector, new load ok"), function() {
+        return res === (gpu ? "refused,refused" : "same,loaded") || (printf("    child: %s\n", res || "HUNG"), false);
+    });
+    /* the worker test runs AFTER the fork: a just-closed worker can still hold
+     * rampart's thread lock while fork() already allows forking, and the child
+     * would inherit it locked (see rampart/claude-work/fork-thread-lock-race.md) */
+    testFeature("handle used in a worker thread: same vector", function() {
+        var t = new rampart.thread();
+        t.exec(function(a) {
+            try { rampart.thread.put("mt", a.h.embedMediaToNumbers({image: a.img}).avgVec[0]); }
+            catch(x) { rampart.thread.put("mt", "threw: " + x.message); }
+        }, {h: e, img: red});
+        var r = rampart.thread.get("mt", 60000);
+        t.close();
+        return typeof r === 'number' && Math.abs(r - vred[0]) < 1e-5;
+    });
+    try { e.destroy(); } catch(x) {}
+    testFeature("media handle destroy", true);
 }
 
 /* ================================================================
@@ -389,6 +522,7 @@ function finish() {
 }
 
 runEmbedTest();
+runMediaTest();
 runGenTest(function(){ runToolTest(finish); });
                       // when gen is skipped/unavailable, done() runs now; otherwise
                       // it runs from the streaming callback after the loop drains.

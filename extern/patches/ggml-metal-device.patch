@@ -1,6 +1,6 @@
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -1863,6 +1863,18 @@
+@@ -2340,6 +2340,18 @@
                                                                options:MTLResourceStorageModeShared
                                                            deallocator:nil];
  
@@ -19,7 +19,7 @@
          GGML_ASSERT(buf_src);
  
          // dst
-@@ -1920,6 +1932,34 @@
+@@ -2399,6 +2411,34 @@
                                                                options:MTLResourceStorageModeShared
                                                            deallocator:nil];
  

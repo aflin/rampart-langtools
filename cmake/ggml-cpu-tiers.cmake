@@ -103,7 +103,11 @@ foreach(_tier ${LT_TIERS})
                 ${CMAKE_CURRENT_SOURCE_DIR}/cmake/namespace-tier.sh
                 ${_tier} ${_tier_obj}
                 $<TARGET_OBJECTS:lt-cpu-${_tier}> $<TARGET_OBJECTS:lt-cpu-${_tier}-feats>
+        # The target names give ordering only: an OBJECT library has no output file,
+        # so without the object files listed this never reran after a re-vendor and
+        # shipped the old tier code (stale vtables -> segfault in the repack buft).
         DEPENDS lt-cpu-${_tier} lt-cpu-${_tier}-feats
+                $<TARGET_OBJECTS:lt-cpu-${_tier}> $<TARGET_OBJECTS:lt-cpu-${_tier}-feats>
                 ${CMAKE_CURRENT_SOURCE_DIR}/cmake/namespace-tier.sh
         COMMAND_EXPAND_LISTS
         COMMENT "namespacing ggml-cpu tier ${_tier}")
@@ -136,7 +140,7 @@ set(_x64_feats_obj "${CMAKE_CURRENT_BINARY_DIR}/lt-cpu-tier-x64-feats.o")
 add_custom_command(OUTPUT ${_x64_feats_obj}
     COMMAND ${CMAKE_OBJCOPY} --redefine-sym ggml_backend_score=ggml_backend_score_x64
             $<TARGET_OBJECTS:lt-cpu-x64-feats> ${_x64_feats_obj}
-    DEPENDS lt-cpu-x64-feats
+    DEPENDS lt-cpu-x64-feats $<TARGET_OBJECTS:lt-cpu-x64-feats>   # see the tier loop
     COMMAND_EXPAND_LISTS
     COMMENT "namespacing ggml-cpu tier x64 scorer")
 list(APPEND LT_CPU_TIER_OBJECTS ${_x64_feats_obj})

@@ -103,6 +103,14 @@ endif()
 # Without this a fresh configure fails: "target llama-common does not exist".
 set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
 
+# Multimodal embedding (images/audio through a projector, e.g. embeddinggemma-2's
+# mmproj): upstream's standalone hook adds ONLY the mtmd library (+ vendor-hash),
+# no tools or CLIs, because LLAMA_BUILD_TOOLS stays off.  Linked into
+# rampart-llamacpp alone (never LLAMA_LIBS: rampart-clip carries its own clip code).
+# Video OFF: upstream's video path shells out to an ffmpeg binary.
+set(LLAMA_BUILD_MTMD ON  CACHE BOOL "" FORCE)
+set(MTMD_VIDEO       OFF CACHE BOOL "" FORCE)
+
 # Pin CUDA architectures BEFORE adding llama.cpp (and faiss below). ggml and faiss
 # each fall back to their own default arch list when CMAKE_CUDA_ARCHITECTURES is
 # unset, and ggml's default leaves common GPUs (V100/T4/A100) as PTX-only. Setting

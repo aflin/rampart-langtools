@@ -1,6 +1,6 @@
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
 +++ b/ggml/src/ggml-metal/ggml-metal-context.m
-@@ -356,8 +356,6 @@
+@@ -377,8 +377,6 @@
                                                           options:MTLResourceStorageModeShared
                                                       deallocator:nil];
  
@@ -9,7 +9,7 @@
          struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
          if (bid_src.metal == nil) {
              GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
-@@ -371,6 +369,33 @@
+@@ -392,6 +390,33 @@
          id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
          id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
  

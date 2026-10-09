@@ -183,6 +183,12 @@ var OVERRIDES = {
      * untitled-document prefix) */
     "embeddinggemma-300m":  { category: "embed", gguf: "unsloth/embeddinggemma-300m-GGUF", onnx: null,
                               prompts: { query: "task: search result | query: ", document: "title: none | text: " } },
+    /* text + image + audio in one 768d space; the mmproj carries the vision
+     * and audio encoders (models.mmprojGet / initEmbed({mmproj})).  Apache-2.0,
+     * ungated.  Prompts are text-only by design (media take none). */
+    "embeddinggemma-2":     { category: "embed", gguf: "unsloth/embeddinggemma-2-GGUF", onnx: null,
+                              mmproj: true,
+                              prompts: { query: "task: search result | query: ", document: "title: none | text: " } },
     "qwen3.5-0.8b":           { category: "gen", gguf: "unsloth/Qwen3.5-0.8B-GGUF" },
     "qwen3.5-2b":             { category: "gen", gguf: "unsloth/Qwen3.5-2B-GGUF" },
     "qwen3.5-27b":            { category: "gen", gguf: "unsloth/Qwen3.5-27B-GGUF" },
@@ -517,7 +523,33 @@ function repoPrompts(repo) {
 /* set entry.prompts for an embed model: OVERRIDES wins, else the published
  * config (original/onnx repo first, then the gguf repo).  Returns the source
  * ('override' | 'config') or null. */
+/* projector files (mmproj) for a model whose media path needs them -- opt-in
+ * per override ({mmproj: true}), so no other entry changes.  Recorded as
+ * gguf.mmproj = {QUANT: {file, size}} from the model's own pinned gguf repo;
+ * ggufQuants() drops these on purpose so they never win a model quant slot. */
+function mmprojQuants(tree) {
+    var q = {};
+    for (var i = 0; i < tree.length; i++) {
+        var p = tree[i].path;
+        if (!/\.gguf$/i.test(p) || !/mmproj/i.test(p)) continue;
+        var m = QUANT_RE.exec(p);
+        var k = m ? m[1].toUpperCase() : "DEFAULT";
+        if (!q[k] || tree[i].size < q[k].size) q[k] = { file: p, size: tree[i].size };
+    }
+    return Object.keys(q).length ? q : null;
+}
+
+function attachMmproj(alias, entry) {
+    var ov = OVERRIDES[alias];
+    if (!ov || ov === "skip" || !ov.mmproj || !entry.gguf) return;
+    var tree = repoTree(entry.gguf.repo);
+    var q = tree && mmprojQuants(tree);
+    if (q) entry.gguf.mmproj = q;
+    else failures.push(alias + ": override asks for mmproj but " + entry.gguf.repo + " has none");
+}
+
 function attachPrompts(alias, entry) {
+    attachMmproj(alias, entry);   /* every path finishes an entry here */
     if (entry.category !== "embed") return null;
     var ov = OVERRIDES[alias];
     var p = (ov && ov !== "skip" && ov.prompts) || null;

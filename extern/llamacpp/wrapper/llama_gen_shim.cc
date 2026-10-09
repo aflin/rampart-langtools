@@ -506,7 +506,7 @@ static void stream_deltas(gen_slot &slot, std::string &content, std::string &rea
     reasoning.clear();
     common_chat_msg msg;
     try {
-        msg = common_chat_parse(slot.generated, /*is_partial=*/true, slot.parser_params);
+        msg = common_chat_parse(common_chat_input(slot.generated), /*is_partial=*/true, slot.parser_params);
     } catch (const std::exception &) {
         return;   /* mid-token garbage; wait for more */
     }
@@ -529,7 +529,7 @@ static void parse_final(gen_slot &slot, std::string &content,
     content.clear(); tool_calls_json.clear(); reasoning.clear();
     common_chat_msg msg;
     try {
-        msg = common_chat_parse(slot.generated, /*is_partial=*/false, slot.parser_params);
+        msg = common_chat_parse(common_chat_input(slot.generated), /*is_partial=*/false, slot.parser_params);
     } catch (const std::exception &) {
         content = slot.generated;   /* unparseable: hand back the raw text */
         return;

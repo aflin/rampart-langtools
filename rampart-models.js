@@ -882,6 +882,39 @@ function getGguf(name, entry, o) {
     return dest;
 }
 
+/* A model's projector (mmproj): the vision/audio encoders a multimodal model
+ * loads beside its text weights -- e.g. initEmbed(model, {mmproj: path}).
+ * Default F16: projectors are small and the full-precision one is what parity
+ * was measured with; 8-bit projectors cost accuracy the 8-bit text weights
+ * don't.  Saved as <alias>-<file> because every repo names its projector
+ * mmproj-F16.gguf and two models would otherwise overwrite each other. */
+function getMmproj(name, entry, o) {
+    var g = entry.gguf;
+    if (!g || !g.mmproj)
+        throwErr("'%s' has no projector (mmproj) in the catalog", name);
+    var q = o.quant ? pickQuant(g.mmproj, o.quant, o.allowVariant)
+                    : (g.mmproj.F16 ? "F16" : g.mmproj.BF16 ? "BF16" : pickQuant(g.mmproj));
+    var qi = g.mmproj[q];
+    var cat = o.category || entry.category || "embed";
+    var base = qi.file.split("/").pop();
+    if (base.toLowerCase().indexOf(name.toLowerCase()) !== 0) base = name + "-" + base;
+    var dest = o.dest ? (isDir(o.dest) ? o.dest + "/" + base : o.dest)
+                      : modelsDir() + "/" + cat + "/" + base;
+    if (!o.force && isFile(dest) && (qi.size <= 0 || fsize(dest) === qi.size))
+        return dest;
+    if (!confirmed(o, { name: name, format: "mmproj", quant: q, dest: dest,
+                       bytes: qi.size, size: sizeStr(qi.size), repo: g.repo, files: 1 }))
+        return null;
+    var sha = null, tree = repoTree(g.repo, o.revision || g.revision, o.token);
+    if (tree)
+        for (var ti = 0; ti < tree.length; ti++)
+            if (tree[ti].path === qi.file) sha = tree[ti].sha256;
+    fetchFile(resolveUrl(g.repo, o.revision || g.revision, qi.file), dest, {
+        size: qi.size, sha256: sha, progress: o.progress, token: o.token, force: o.force
+    });
+    return dest;
+}
+
 function getOnnx(name, entry, o) {
     var x = entry.onnx;
     if (!x) throwErr("'%s' has no onnx source (formats: %s)", name,
@@ -1331,6 +1364,7 @@ function get(name, o) {
         o.quant = o.quant || m[2];
     }
     if (o.quant && !o.format) o.format = "gguf";
+    var wantMmproj = o.format === "mmproj";   /* the quant names the projector's */
 
     var entry, alias;
     if (name.indexOf("/") !== -1) {
@@ -1358,6 +1392,7 @@ function get(name, o) {
                    : (entry.onnx && (entry.category === "embed" || entry.category === "rerank") ? "onnx"
                      : (entry.gguf ? "gguf" : "onnx")));
     if (format === "ocr")  return getOcr(alias, entry, o);
+    if (wantMmproj)        return getMmproj(alias, entry, o);
     return format === "gguf" ? getGguf(alias, entry, o)
                              : getOnnx(alias, entry, o);
 }
@@ -1493,6 +1528,8 @@ function variants(name, o) {
  */
 function ggufGet(name, o) { o = o ? Object.assign({}, o) : {}; o.format = "gguf"; return get(name, o); }
 function onnxGet(name, o) { o = o ? Object.assign({}, o) : {}; o.format = "onnx"; return get(name, o); }
+/* the model's projector file (see getMmproj); {quant} picks among its F16/BF16/Q8_0 */
+function mmprojGet(name, o) { o = o ? Object.assign({}, o) : {}; o.format = "mmproj"; return get(name, o); }
 /* NB: returns an OBJECT of role paths ({dir,det,rec,cls,dict,variant}), not a
  * single path -- an OCR model is a set.  Feed it straight to ocr.init(). */
 function ocrGet(name, o)  { o = o ? Object.assign({}, o) : {}; o.format = "ocr";  return get(name, o); }
@@ -1505,6 +1542,7 @@ if (module && module.exports) {
         pull: get,             /* alias */
         ggufGet: ggufGet,
         onnxGet: onnxGet,
+        mmprojGet: mmprojGet,
         ocrGet: ocrGet,
         url: urlGet,
         resolve: resolve,

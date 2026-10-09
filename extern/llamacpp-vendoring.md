@@ -4,11 +4,113 @@
 
 | | |
 |---|---|
-| **Upstream tag** | `b11349` |
-| **Upstream commit** | `(tag b11349; extracted via `git archive` from a local clone)` |
-| **Tag date** | 2026-10-02 |
-| **ggml version** | 0.25.3 |
+| **Upstream tag** | `b11479` |
+| **Upstream commit** | `42c787e8c191d49c01c757f4b7029d69ec0bf2c8` (tag b11479; extracted via `git archive` from a local clone) |
+| **Tag date** | 2026-10-07 |
+| **ggml version** | 0.26.0 |
 | **Source** | https://github.com/ggml-org/llama.cpp |
+
+### libmtmd is now linked (2026-10-07): multimodal embedding, Phase 1
+
+`tools/mtmd` is built, using upstream's own `LLAMA_BUILD_MTMD` hook (library only;
+`LLAMA_BUILD_TOOLS` stays off). It is linked into **rampart-llamacpp and the umbrella
+only**, never through `LLAMA_LIBS`: rampart-clip links `LLAMA_LIBS` and carries its own
+(monatis) clip code. Its symbols are hidden with `-Wl,--exclude-libs,libmtmd.a:libvendor-hash.a`
+(0 `clip_`/`mtmd_` exports). `MTMD_VIDEO` is OFF because upstream's video path shells out to ffmpeg.
+The umbrella defines `LANGTOOLS_MAIN_INCLUDE`, so `rampart-llamacpp.c` skips its own
+includes there and `rampart-langtools.c` must `#include "mtmd.h"` itself.
+
+**Phase 2 (same day): `initEmbed(model, {mmproj, imageTokens})` + `embedMediaToNumbers/Fp32Buf/Fp16Buf({text, image, audio})`.**
+It builds one pooled vector from one mixed batch: `mtmd_helper_bitmap_init_from_file/_buf`,
+then `mtmd_tokenize` (add_special/parse_special true, as llama-server), then
+`mtmd_encode_chunk` under a mutex, then `llama_batch_ext_add_token/_add_embd` +
+`_set_pos` + `_set_output_embd`, then `llama_process(DECODE)`, then
+`llama_get_embeddings_seq`. Media rows are `llama_model_n_embd_inp()` wide. The
+projector is a refcounted shared entry (`lt_mproj_*`, keyed by path, model, gpu and
+imageTokens), referenced per context like the model (checked addref on a thread
+rebuild, released in `emb_free` before the model). The **silent traps on a re-vendor**
+are: the media-row width (`n_embd_inp`, not `n_embd`), and `mtmd_get_output_embd()`
+being reused by the next encode (copy it out under the lock).
+Parity (firefly): equal to upstream llama-server to 4 decimals on every item, CPU and
+cu13. Vs Google's reference: text 1.0, audio >=0.9988, images mean 0.9865 (budget
+280), interleaved 0.956-0.988; retrieval identical. Speed: about 0.1 s/image on a
+4070 Ti; on CPU 3.8 s/image at the default 4 threads, 1.8 s at `threadsBatch: 16`.
+
+**On every re-vendor, `mtmd.h` is now a contact surface too.** Today we use
+`mtmd_context_params_default`, `mtmd_init_from_file`, `mtmd_free`,
+`mtmd_support_vision/audio`, `mtmd_get_audio_sample_rate` and `mtmd_log_set`. Add the
+`-fsyntax-only` probe's `-I.../tools/mtmd` include path.
+
+The first consumer is `llamacpp.mediaInfo(model, mmproj[, opts])`, which is stateless
+(load, report, free). Static archive members link only when referenced, so nothing
+proves the link until something calls in.
+
+Verified on firefly (cpu_2_28 and cu13 ovens, 6/6 clean): mediaInfo on embeddinggemma-2
+reports vision, audio and 16 kHz on CPU and GPU. Error paths (missing mmproj, wrong
+text model) throw without crashing. 5 load/free cycles and two threads at once both
+pass. rampart-clip still works in the same process. `llamacpp-test.js` passes 37/37 on
+both builds. Text vectors for 4 models are **bit-identical** to the pre-mtmd build.
+Size cost: about +22 MB CPU (208 -> 231 MB unstripped), +24 MB cu13.
+Not yet built: macOS, FreeBSD, ARM ovens, cu11/cu12.
+
+### b11349 -> b11479 (2026-10-07): embeddinggemma-2, one API break, two real bugs
+
+The reason for this upgrade: `gemma-embedding2` (EmbeddingGemma 2) landed upstream in
+b11452 (PR #30054). b11349 rejects the GGUF with "unknown model architecture".
+
+**Source break (one, in the gen shim):** `common_chat_parse()` takes a
+`common_chat_input` (text + token ids aligned byte-for-byte) instead of a string
+(upstream #29876). Fixed by wrapping: `common_chat_parse(common_chat_input(slot.generated), ...)`.
+That constructor is upstream's own "plain text, no tokens" path. **Today it parses
+identically**: `common_peg_parse_context` stores the tokens, but no parser reads them.
+**If a future version starts matching special tokens by id**, accumulate a
+`common_chat_input` with `append(piece, token)` the way `tools/server` does. Note that our
+pieces use `special=false`, and `append` drops empty pieces.
+
+Metal patches reapplied with offsets only (+21 / +477/+479) and were re-anchored. The round trip is silent.
+
+**Two bugs found while testing, both fixed:**
+
+1. **Embedding width: `llama_model_n_embd()` -> `llama_model_n_embd_out()`**
+   (`rampart-llamacpp.c`, both `vec_dim` sites). embeddinggemma-2 has a 512 -> 768
+   projection head, and every llama.cpp output buffer is sized by `n_embd_out`. We read
+   only the first 512 of 768 values: unit-normalized, retrieval still "worked", and the
+   vectors were silently wrong. `modelInfo()` already read `embedding_length_out`, so
+   `embedDim` reported 768 while `initEmbed` returned 512. For every model without a
+   projection head, `n_embd_out == n_embd`, so vectors are unchanged (verified bit-identical below).
+2. **Stale CPU tier objects (`cmake/ggml-cpu-tiers.cmake`).** The namespaced
+   `lt-cpu-tier-{haswell,skylakex,sse42}.o` and `x64-feats.o` rules had
+   `DEPENDS <OBJECT library target>`. An OBJECT library has no output file, so that is
+   ordering only, never a rerun. An incremental oven build after a re-vendor therefore
+   linked **b11349 tier code into a b11479 ggml**. upstream #23671 inserted two slots into
+   `ggml_backend_buffer_type_i`, so every Q4_K model segfaulted in the loader: the old
+   repack buffer type's vtable was read with the new layout. (`x64` was fine because it
+   depends on `ggml-cpu`, a real `.a`.) Fixed by adding `$<TARGET_OBJECTS:...>` to
+   `DEPENDS`. **This bug predates b11479**: any earlier incremental re-vendor could have
+   shipped stale tiers. Clean `build/oven-*` dirs never hit it.
+
+**Verified on firefly (x86_64, RTX 4070 Ti, driver 580) 2026-10-07; 2_28 ovens:**
+
+| check | result |
+|---|---|
+| oven builds `cpu_2_28`, `cu13` (llamacpp, clip, umbrella) | **6/6 clean, 0 errors** |
+| `llamacpp-test.js` CPU / cu13 GPU | **37/37 / 37/37** |
+| parity vs installed b11349 modules, 4 models (MiniLM f16, bge-m3 Q8_0, bge-base Q4_K_M, bge-small Q8_0), short + 6.3k-token doc | **bit-identical on CPU AND cu13** (maxdiff 0, same chunk counts) |
+| Q4_K models after the tier fix (MiniLM, bge-m3, bge-base) | load + embed (were rc 139) |
+| embeddinggemma-2 Q8_0 vs upstream `llama-embedding` b11479 (CPU) | **cos 1.00000000**, short and long doc |
+| embeddinggemma-2 BF16 / UD-Q4_K_XL vs Q8_0 reference | cos 0.99989 / 0.995 |
+| embeddinggemma-2 on cu13 | 768d, cos 0.9999 vs CPU ref, retrieval 3/3 |
+
+**embeddinggemma-2 notes:**
+- GGUF says `context_length = 262144` (the model card says 8K, shared across modalities). The
+  existing 8192 auto-cap in both embed paths handles this; no special case needed.
+- Uses the same prompts as embeddinggemma-300m: `task: search result | query: ` / `title: none | text: `.
+- 768 output dims; Matryoshka 512/256/128 per the card. Truncate, then re-normalize.
+- Slow for its size: 6.3k tokens = ~17 s CPU, ~7 s on a 4070 Ti. Upstream CUDA matches
+  (6.4 s with flash attention, 4.6 s with `-fa off`). Cause: head dims 512 global / 256 SWA,
+  where the CUDA flash-attention kernels are slow. This is upstream, not offload: 25/25 layers on GPU.
+- Text only. Image/audio need mtmd + the `mmproj` GGUF, which the embed path doesn't do.
+- Not tested: Metal, FreeBSD, ARM ovens, cu11/cu12.
 
 ### b10446 -> b11349 (2026-10-02): three breaks, all in the gen shim
 

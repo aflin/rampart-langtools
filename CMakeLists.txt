@@ -131,6 +131,13 @@ set(LLAMA_LIBS
     -lm
 )
 
+# mtmd (multimodal projector) -- rampart-llamacpp ONLY, and ahead of LLAMA_LIBS
+# on the link line (it depends on libllama/libggml).  See extern/extern.cmake.
+set(MTMD_LIBS
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/tools/mtmd/libmtmd.a
+    ${CMAKE_CURRENT_BINARY_DIR}/extern/llama.cpp/vendor/hash/libvendor-hash.a
+)
+
 set(FAISS_LIBS
     ${CMAKE_CURRENT_BINARY_DIR}/extern/faiss/c_api/libfaiss_c.a
     ${CMAKE_CURRENT_BINARY_DIR}/extern/faiss/faiss/libfaiss.a
@@ -511,11 +518,15 @@ else()
   target_link_options(rampart-langtools PRIVATE
     "-Wl,-soname,@rpath/rampart-langtools${LT_NAME_SUFFIX}.so"
     "-Wl,-Bsymbolic-functions"
+    "-Wl,--exclude-libs,libmtmd.a:libvendor-hash.a"   # as rampart-llamacpp, below
   )
 
+  # mtmd's clip_*/mtmd_* stay private to this module (rampart dlopens RTLD_GLOBAL,
+  # and rampart-clip exports its own clip_* API); the rest is exported as before.
   target_link_options(rampart-llamacpp PRIVATE
     "-Wl,-soname,@rpath/rampart-llamacpp${LT_NAME_SUFFIX}.so"
     "-Wl,-Bsymbolic-functions"
+    "-Wl,--exclude-libs,libmtmd.a:libvendor-hash.a"
   )
 
   target_link_options(rampart-faiss PRIVATE
@@ -723,7 +734,10 @@ endif()
 set(LT_ENABLE_GPU_LAST "${LT_ENABLE_GPU}" CACHE INTERNAL "Previous value of LT_ENABLE_GPU")
 
 # Link with all libs
-target_link_libraries(rampart-langtools PRIVATE ${LIBS})
+# the umbrella #includes rampart-llamacpp.c, so it needs mtmd exactly as rampart-llamacpp does
+target_link_libraries(rampart-langtools PRIVATE ${MTMD_LIBS} ${LIBS})
+target_include_directories(rampart-langtools PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/tools/mtmd)
+add_dependencies(rampart-langtools mtmd)
 
 if(TARGET lt-ggml-cpu-tiers)
     target_sources(rampart-langtools PRIVATE ${LT_GGML_CPU_TIER_SOURCES} $<TARGET_OBJECTS:lt-ggml-cpu-tiers>)
@@ -734,9 +748,12 @@ endif()
 # (stdc++ skipped on Darwin: the CXX driver already links libc++ and the
 #  SDK aliases libstdc++ to it -> ld warns "ignoring duplicate libraries")
 target_link_libraries(rampart-llamacpp PRIVATE
+    ${MTMD_LIBS}
     ${LLAMA_LIBS}
     $<$<NOT:$<PLATFORM_ID:Darwin>>:stdc++>
 )
+target_include_directories(rampart-llamacpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama.cpp/tools/mtmd)
+add_dependencies(rampart-llamacpp mtmd)
 
 if(TARGET lt-ggml-cpu-tiers)
     target_sources(rampart-llamacpp PRIVATE ${LT_GGML_CPU_TIER_SOURCES} $<TARGET_OBJECTS:lt-ggml-cpu-tiers>)

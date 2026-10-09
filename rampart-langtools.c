@@ -61,6 +61,8 @@
  * the shared chunker header here for rampart-llamacpp.c's embed path */
 #include "rp-chunker.h"
 #include "rp-embed-cache.h"
+#include "mtmd.h"             /* rampart-llamacpp.c's multimodal projector calls */
+#include "mtmd-helper.h"
 
 /* *******************************************************
                 LLAMACPP INCLUDE

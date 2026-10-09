@@ -22,6 +22,8 @@
 #include "llama.h"
 #include "ggml-backend.h"     /* ggml_backend_dev_by_type: CPU-only context fallback */
 #include "llama_gen_shim.h"   /* C ABI for the multi-session generation engine */
+#include "mtmd.h"             /* multimodal projector (images/audio -> embeddings) */
+#include "mtmd-helper.h"      /* bitmap decode from file/buffer (stb_image, miniaudio) */
 #include "rp-chunker.h"        /* structure-aware embed chunking (shared with rampart-onnx) */
 #include "rp-embed-cache.h"    /* content-keyed doc-result LRU (shared with rampart-onnx) */
 #include "rampart.h"
@@ -40,6 +42,28 @@
  * for the rp_embed_* C API still loads and runs -- there lt_thr_ctx() below
  * returns NULL instead of faulting on the call. */
 #pragma weak get_current_thread
+#pragma weak set_thread_fin_cb      /* same: rampart-thread.c's thread-exit hook */
+
+/* ---- per-thread resources freed when their rampart thread exits -------------
+ * A handle copied into a rampart thread builds that thread's own llama context
+ * (embed/rerank) or generation engine on first use.  Thread copies carry no
+ * finalizer, so before this nothing freed them when the thread ended: each
+ * short-lived worker leaked a context (~1-1.5 GB VRAM at an 8192 window).
+ * rampart-thread.c runs set_thread_fin_cb() callbacks when a thread closes,
+ * after its JS heaps are destroyed, on that thread.  One record per rebuilt
+ * copy; the copy's explicit destroy() frees the resources itself and NULLs
+ * them here, so the callback only frees what is still live.  The record itself
+ * is freed by rampart (set_thread_fin_cb takes malloc'd data). */
+typedef struct {
+    struct llama_context *lctx;     /* embed/rerank: context + one model ref */
+    struct llama_model   *lmodel;
+    void                 *mproj;    /* lt_mproj*: one projector ref, or NULL */
+    void                 *toks;     /* rerank: this copy's rp_rerank_toks */
+    void                 *ginfo;    /* gen: this copy's rp_llama_info */
+} lt_thr_fin;
+
+static lt_thr_fin *lt_thr_fin_register(void);   /* defined after the free functions */
+static lt_thr_fin *lt_thr_fin_get(duk_context *ctx, duk_idx_t obj);
 
 /* ---- this.errMsg: warnings + non-fatal errors ------------------------------
  * Three rules: a failure throws a JS error; a warning goes to this.errMsg; NOTHING
@@ -250,14 +274,21 @@ static void lt_errmsg_clear(duk_context *ctx)
  * and reporting want ANY GPU-class backend (lt_gpu_in_use), while the
  * chunk-batching default wants dedicated VRAM specifically
  * (lt_dedicated_gpu_in_use).  See each one's comment. */
+/* The process in which ggml first reported a GPU backend, i.e. the one that
+ * initialized the GPU runtime (registration enumerates the devices).  A forked
+ * child inherits the value, which is how lt_gpu_forked() knows its parent's GPU
+ * state is unusable here. */
+static pid_t g_gpu_pid = 0;
+
 static int lt_gpu_backend_kind(void)
 {
     int kind = 0;   /* 0 = none, 1 = integrated, 2 = dedicated */
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         enum ggml_backend_dev_type t = ggml_backend_dev_type(ggml_backend_dev_get(i));
-        if (t == GGML_BACKEND_DEVICE_TYPE_GPU)  return 2;
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU)  { kind = 2; break; }
         if (t == GGML_BACKEND_DEVICE_TYPE_IGPU) kind = 1;
     }
+    if (kind && !g_gpu_pid) g_gpu_pid = getpid();
     return kind;
 }
 
@@ -286,6 +317,26 @@ static int lt_gpu_in_use(void)
 static int lt_dedicated_gpu_in_use(void)
 {
     return lt_gpu_backend_kind() == 2;
+}
+
+/* The post-fork refusal for NEW loads.  The per-handle refusals (LT_FORK_REFUSAL)
+ * only catch handles made before the fork; a child that loads a model of its own
+ * after its parent initialized the GPU used to HANG in the GPU runtime.  Checked
+ * at the top of every load path; lt_gpu_note() after each load makes sure the
+ * parent's g_gpu_pid is set even on a path that never asked lt_gpu_in_use(). */
+#define LT_FORK_REFUSAL_LOAD "llama.cpp: a GPU backend (CUDA/Metal) was initialized " \
+    "before this process was forked -- loading a model in the child would hang or " \
+    "crash the GPU runtime. Fork before loading models (rampart-server daemon mode + " \
+    "postForkFunc), or use a CPU-only build."
+
+static int lt_gpu_forked(void)
+{
+    return g_gpu_pid && g_gpu_pid != getpid();
+}
+
+static void lt_gpu_note(void)
+{
+    (void)lt_gpu_backend_kind();
 }
 
 
@@ -611,8 +662,13 @@ static duk_ret_t lg_load_progress(duk_context *ctx)
 
 static rp_llama_info *lg_new_info_e(const lgen_engine_params *p, char *err, size_t errlen)
 {
+    if (lt_gpu_forked()) {
+        if (err && errlen) snprintf(err, errlen, "%s", LT_FORK_REFUSAL_LOAD);
+        return NULL;
+    }
     lgen_engine *eng = lgen_engine_create(p, err, errlen);
     if (!eng) return NULL;
+    lt_gpu_note();
     rp_llama_info *info = NULL;
     CALLOC(info, sizeof(rp_llama_info));
     info->thr = get_current_thread();
@@ -689,6 +745,11 @@ static rp_llama_info *lg_get_info(duk_context *ctx)
     duk_pop_2(ctx); // tmpl, path -> [this]
 
     duk_push_pointer(ctx, ninfo); duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rp_llama_info"));
+    {   /* free this copy's engine when its thread exits (see lt_thr_fin) */
+        lt_thr_fin *f = lt_thr_fin_register();
+        if (f) f->ginfo = ninfo;
+        duk_push_pointer(ctx, f); duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("thr_fin"));
+    }
     duk_push_int(ctx, cur_thr);   duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_thr"));
     duk_push_int(ctx, cur_pid);   duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("lg_pid"));
     duk_pop(ctx); // this
@@ -1033,6 +1094,13 @@ static duk_ret_t lg_destroy_(duk_context *ctx)
     // A copy whose info still points at another thread's engine (never used
     // here) must not free it — that thread's own copy owns and frees it.
     if (info && owner_thr == get_thread_num() && owner_pid == (int)getpid()) {
+    /* this copy tears its engine down (now or deferred to the pump): the
+     * thread-exit callback (lt_thr_fin) must not free it again */
+    {
+        lt_thr_fin *f = lt_thr_fin_get(ctx, -1);
+        if (f) f->ginfo = NULL;
+        duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("thr_fin"));
+    }
     if (info->armed) {
         // A step-pump timeout is mid-flight — and we may be INSIDE it right now
         // (destroy() called from a predictAsync callback runs nested under
@@ -1219,6 +1287,7 @@ static duk_ret_t lg_init_gen(duk_context *ctx)
 {
     lt_errmsg_clear(ctx);   /* errMsg reflects THIS call */
     const char *model_path = REQUIRE_STRING(ctx, 0, "initGen: first argument must be a String (path to .gguf)");
+    if (lt_gpu_forked()) RP_THROW(ctx, "%s: %s", "initGen", LT_FORK_REFUSAL_LOAD);   /* before any GPU call */
     duk_idx_t o = duk_is_object(ctx, 1) ? 1 : -1;
 
     /* defaults: one slot, one CPU thread (the GPU does the math), n_ctx 0 => the
@@ -1628,6 +1697,142 @@ static duk_ret_t lg_init_gen_batched(duk_context *ctx)
 
 // LLAMA.CPP EMBEDDING MODELS
 
+/* ---- multimodal projector (mmproj) shared state ------------------------------
+ * One mtmd_context per (mmproj path, text model, gpu, imageTokens), refcounted the
+ * same way as the text model (lgen_model_*): every per-thread embed context holds
+ * one CHECKED reference, taken in initEmbed / emb_resolve's rebuild and released
+ * in emb_free alongside the model's.  A copy whose origin was destroyed before its
+ * first use fails cleanly instead of touching a freed projector.
+ * mtmd's encoder is not thread-safe, so encodes serialize on the entry's mutex;
+ * bitmap decode and tokenize are thread-safe upstream and run unlocked. */
+typedef struct lt_mproj {
+    struct lt_mproj    *next;
+    char               *path;
+    struct llama_model *model;
+    int                 gpu;
+    int                 image_tokens;   /* min = max; 0 = the projector's own sizing */
+    int                 refs;
+    mtmd_context       *mctx;
+    pthread_mutex_t     enc_mu;
+} lt_mproj;
+
+static pthread_mutex_t g_mproj_mu = PTHREAD_MUTEX_INITIALIZER;
+static lt_mproj       *g_mproj    = NULL;
+
+static lt_mproj *lt_mproj_acquire(const char *path, struct llama_model *model,
+                                  int gpu, int image_tokens, int n_threads)
+{
+    lt_mproj *p;
+    pthread_mutex_lock(&g_mproj_mu);
+    for (p = g_mproj; p; p = p->next)
+        if (p->model == model && p->gpu == gpu && p->image_tokens == image_tokens &&
+            !strcmp(p->path, path))
+        {
+            p->refs++;
+            pthread_mutex_unlock(&g_mproj_mu);
+            return p;
+        }
+
+    struct mtmd_context_params mtp = mtmd_context_params_default();
+    mtp.use_gpu       = gpu ? true : false;
+    mtp.print_timings = false;
+    mtp.warmup        = false;
+    mtp.n_threads     = n_threads > 0 ? n_threads : GGML_DEFAULT_N_THREADS;   /* -1: as llama.cpp does */
+    if (image_tokens > 0) {
+        mtp.image_min_tokens = image_tokens;
+        mtp.image_max_tokens = image_tokens;
+    }
+    mtmd_context *mctx = mtmd_init_from_file(path, model, mtp);
+    if (!mctx) {
+        pthread_mutex_unlock(&g_mproj_mu);
+        return NULL;
+    }
+    p = (lt_mproj *)calloc(1, sizeof *p);
+    p->path         = strdup(path);
+    p->model        = model;
+    p->gpu          = gpu;
+    p->image_tokens = image_tokens;
+    p->refs         = 1;
+    p->mctx         = mctx;
+    pthread_mutex_init(&p->enc_mu, NULL);
+    p->next = g_mproj;
+    g_mproj = p;
+    pthread_mutex_unlock(&g_mproj_mu);
+    return p;
+}
+
+/* take a reference only if p is still live (its last holder may have released it) */
+static int lt_mproj_addref_checked(lt_mproj *p)
+{
+    lt_mproj *q;
+    pthread_mutex_lock(&g_mproj_mu);
+    for (q = g_mproj; q && q != p; q = q->next) ;
+    if (q) q->refs++;
+    pthread_mutex_unlock(&g_mproj_mu);
+    return q != NULL;
+}
+
+static void lt_mproj_release(lt_mproj *p)
+{
+    lt_mproj **pp, *dead = NULL;
+    pthread_mutex_lock(&g_mproj_mu);
+    for (pp = &g_mproj; *pp; pp = &(*pp)->next)
+        if (*pp == p) {
+            if (--p->refs == 0) { *pp = p->next; dead = p; }
+            break;
+        }
+    pthread_mutex_unlock(&g_mproj_mu);
+    if (dead) {
+        mtmd_free(dead->mctx);
+        pthread_mutex_destroy(&dead->enc_mu);
+        free(dead->path);
+        free(dead);
+    }
+}
+
+static void lt_thr_fin_cb(void *arg)
+{
+    lt_thr_fin *f = (lt_thr_fin *)arg;
+    if (f->lctx) {
+        if (f->mproj) lt_mproj_release((lt_mproj *)f->mproj);   /* references the model */
+        llama_free(f->lctx);
+        lgen_model_release(f->lmodel);
+    }
+    if (f->toks) free(f->toks);
+    if (f->ginfo) {
+        rp_llama_info *info = (rp_llama_info *)f->ginfo;
+        /* Only an idle engine: freeing one with queued requests fires their
+         * on_done into JS, and this thread's heap is already gone.  A request
+         * still in flight when its thread was terminated is leaked instead. */
+        if (!info->armed && !(info->eng && lgen_engine_has_active(info->eng)))
+            lg_info_free(info);
+    }
+    /* f itself is freed by rampart-thread.c */
+}
+
+/* Register this thread's cleanup for a copy that just rebuilt here.  NULL in a
+ * non-rampart host (no threads there to exit). */
+static lt_thr_fin *lt_thr_fin_register(void)
+{
+    if (!set_thread_fin_cb || !get_current_thread) return NULL;
+    RPTHR *t = get_current_thread();
+    if (!t) return NULL;
+    lt_thr_fin *f = (lt_thr_fin *)calloc(1, sizeof *f);
+    if (!f) return NULL;
+    set_thread_fin_cb(t, lt_thr_fin_cb, f);
+    return f;
+}
+
+/* the copy's own record (if it rebuilt on this thread), from hidden "thr_fin" */
+static lt_thr_fin *lt_thr_fin_get(duk_context *ctx, duk_idx_t obj)
+{
+    lt_thr_fin *f = NULL;
+    if (duk_get_prop_string(ctx, obj, DUK_HIDDEN_SYMBOL("thr_fin")))
+        f = (lt_thr_fin *)duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+    return f;
+}
+
 // Tear down an embed/rerank handle. A handle may be COPIED across threads (each
 // copy rebuilds its own per-thread llama_ctx from the shared model). So free each
 // resource by its correct owner, or copies will double-free:
@@ -1678,6 +1883,14 @@ static duk_ret_t emb_free_(duk_context *ctx)
     int own_context = (lctx && ctx_thr == cur_thr && ctx_pid == cur_pid);
     int is_origin   = (org_thr == cur_thr && org_pid == cur_pid);
 
+    /* this copy frees its own per-thread resources below: the thread-exit
+     * callback (lt_thr_fin) must not free them again */
+    if (own_context) {
+        lt_thr_fin *f = lt_thr_fin_get(ctx, -1);
+        if (f) { f->lctx = NULL; f->mproj = NULL; f->toks = NULL; }
+        duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("thr_fin"));
+    }
+
     // rerank_toks: the origin copy owns the one made at init; a copy that
     // REBUILT on its own thread (own_context, not origin) replaced its pointer
     // with a private struct at rebuild -- it owns that one.  A copy that never
@@ -1699,6 +1912,11 @@ static duk_ret_t emb_free_(duk_context *ctx)
     // per-context resources: only the copy that built this context frees them
     if (own_context)
     {
+        /* the projector references the model: release it first */
+        if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("mproj")) && duk_get_pointer(ctx, -1))
+            lt_mproj_release((lt_mproj *)duk_get_pointer(ctx, -1));
+        duk_pop(ctx);
+        duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("mproj"));
         llama_free(lctx);
         lgen_model_release(lmodel); // refcount--, model freed by cache at zero
         duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("model"));
@@ -2271,6 +2489,25 @@ static struct llama_context *emb_resolve(duk_context *ctx, const char *what,
             RP_THROW(ctx, "rampart-llama-cpp:%s - failed to create llama context on this thread", what);
         }
 
+        /* this copy's projector reference, checked like the model's */
+        lt_mproj *pj = NULL;
+        if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("mproj")))
+            pj = (lt_mproj *)duk_get_pointer(ctx, -1);
+        duk_pop(ctx);
+        if (pj && !lt_mproj_addref_checked(pj))
+        {
+            llama_free(lctx);
+            lgen_model_release(lmodel);
+            RP_THROW(ctx, "rampart-llama-cpp:%s - mmproj was destroyed "
+                          "(the originating handle was destroy()ed); create a new handle", what);
+        }
+
+        /* free this copy's context when its thread exits (see lt_thr_fin) */
+        lt_thr_fin *f = lt_thr_fin_register();
+        if (f) { f->lctx = lctx; f->lmodel = lmodel; f->mproj = pj; }
+        duk_push_pointer(ctx, f);
+        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("thr_fin"));
+
         duk_push_pointer(ctx, lctx);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
 
@@ -2575,6 +2812,314 @@ static duk_ret_t embed_texts_to_numbers(duk_context *ctx)
     return 1;
 }
 
+/* ---- multimodal embedding: embedMedia*({text, image, audio}) -------------------
+ *
+ * ONE pooled vector for the whole input -- text and media share the model's single
+ * window, so nothing is chunked: the input fits in one micro-batch or is refused.
+ * text may interleave media with the model card's placeholders, "<|image|>" and
+ * "<|audio|>", filled in order from the image / audio lists.  Without text, the
+ * media are embedded alone (images, then audio).  Task prefixes are text-only by
+ * the model's design: media take none. */
+
+#define LT_MEDIA_MAX 256
+
+typedef struct {
+    int                  audio;     /* 0 = image, 1 = audio */
+    const char          *path;      /* file, or NULL for a buffer */
+    const unsigned char *buf;
+    size_t               len;
+} lt_media_in;
+
+/* Gather input[key] (a path, a Buffer, or an Array of those) into items[].
+ * Pointers stay valid while `input` is on the stack.  Returns the count. */
+static int lt_media_collect(duk_context *ctx, duk_idx_t input, const char *key, int audio,
+                            lt_media_in *items, int n, const char *what)
+{
+    if (!duk_get_prop_string(ctx, input, key)) { duk_pop(ctx); return n; }
+    int is_arr = duk_is_array(ctx, -1);
+    duk_uarridx_t len = is_arr ? (duk_uarridx_t)duk_get_length(ctx, -1) : 1;
+    for (duk_uarridx_t i = 0; i < len; i++) {
+        if (is_arr) duk_get_prop_index(ctx, -1, i);
+        if (n >= LT_MEDIA_MAX)
+            RP_THROW(ctx, "rampart-llama-cpp:%s - more than %d media items", what, LT_MEDIA_MAX);
+        lt_media_in *m = &items[n];
+        memset(m, 0, sizeof *m);
+        m->audio = audio;
+        if (duk_is_string(ctx, -1))
+            m->path = duk_get_string(ctx, -1);
+        else if (duk_is_buffer_data(ctx, -1)) {
+            duk_size_t bl = 0;
+            m->buf = (const unsigned char *)duk_get_buffer_data(ctx, -1, &bl);
+            m->len = (size_t)bl;
+            if (!m->len)
+                RP_THROW(ctx, "rampart-llama-cpp:%s - %s[%lu] is an empty Buffer", what, key, (unsigned long)i);
+        } else
+            RP_THROW(ctx, "rampart-llama-cpp:%s - %s must be a path String, a Buffer, or an Array of those",
+                     what, key);
+        n++;
+        if (is_arr) duk_pop(ctx);   /* the element; its string/buffer is kept alive by the array */
+    }
+    /* leave the property value on the stack: it keeps the strings/buffers alive */
+    return n;
+}
+
+/* The whole C side: decode, tokenize, encode, one mixed batch, pool.  Returns 0 and
+ * fills out[vec_dim] (unit length), or -1 with err set.  Frees everything it made. */
+static int ll_embed_media(struct llama_context *lctx, struct llama_model *lmodel, lt_mproj *pj,
+                          int vec_dim, const char *prompt, const lt_media_in *items, int n_items,
+                          float *out, int *out_ntok, char *err, size_t errlen)
+{
+    mtmd_bitmap        *bitmaps[LT_MEDIA_MAX];
+    float              *mbuf[LT_MEDIA_MAX];          /* encoded rows per media chunk */
+    mtmd_input_chunks  *chunks = NULL;
+    struct llama_batch_ext *batch = NULL;
+    int nb = 0, nm = 0, rc = -1, i;
+    const int n_embd_inp = llama_model_n_embd_inp(lmodel);
+    struct mtmd_helper_init_opt hopt = mtmd_helper_init_opt_default();
+
+    memset(mbuf, 0, sizeof mbuf);
+
+    for (i = 0; i < n_items; i++) {
+        const lt_media_in *m = &items[i];
+        struct mtmd_helper_bitmap_wrapper w = m->path
+            ? mtmd_helper_bitmap_init_from_file(pj->mctx, m->path, false, hopt)
+            : mtmd_helper_bitmap_init_from_buf (pj->mctx, m->buf, m->len, false, hopt);
+        if (w.video_ctx) mtmd_helper_video_free(w.video_ctx);
+        if (!w.bitmap) {
+            snprintf(err, errlen, "could not decode %s %d%s%s (unsupported format?)",
+                     m->audio ? "audio" : "image", i, m->path ? " " : "", m->path ? m->path : "");
+            goto done;
+        }
+        bitmaps[nb++] = w.bitmap;
+        if (mtmd_bitmap_is_audio(w.bitmap) != (bool)m->audio) {
+            snprintf(err, errlen, "%s%s was given as %s but decodes as %s",
+                     m->path ? m->path : "a Buffer", "", m->audio ? "audio" : "an image",
+                     m->audio ? "an image" : "audio");
+            goto done;
+        }
+        if (m->audio ? !mtmd_support_audio(pj->mctx) : !mtmd_support_vision(pj->mctx)) {
+            snprintf(err, errlen, "this mmproj has no %s encoder", m->audio ? "audio" : "vision");
+            goto done;
+        }
+    }
+    if (mtmd_decode_use_mrope(pj->mctx)) {
+        snprintf(err, errlen, "M-RoPE projectors are not supported for embedding");
+        goto done;
+    }
+
+    chunks = mtmd_input_chunks_init();
+    {
+        /* add_special/parse_special as llama-server's multimodal path (Phase 0 parity) */
+        mtmd_input_text txt = { prompt, strlen(prompt), true, true };
+        int t = mtmd_tokenize(pj->mctx, chunks, &txt, (const mtmd_bitmap **)bitmaps, (size_t)nb);
+        if (t != 0) {
+            snprintf(err, errlen, t == 1 ? "placeholder count does not match the media given"
+                                         : "media preprocessing failed (code %d)", t);
+            goto done;
+        }
+    }
+
+    {
+        size_t ntok  = mtmd_helper_get_n_tokens(chunks);
+        uint32_t lim = llama_n_ubatch(lctx) < llama_n_batch(lctx) ? llama_n_ubatch(lctx) : llama_n_batch(lctx);
+        *out_ntok = (int)ntok;
+        if (ntok == 0) { snprintf(err, errlen, "empty input"); goto done; }
+        if (ntok > lim) {
+            snprintf(err, errlen, "input is %lu tokens; the limit is %u (one window: text and media "
+                     "are embedded together, never chunked -- lower imageTokens or send less)",
+                     (unsigned long)ntok, lim);
+            goto done;
+        }
+    }
+
+    /* encode every media chunk; mtmd reuses its output buffer, so copy each out */
+    size_t nch = mtmd_input_chunks_size(chunks);
+    for (size_t c = 0; c < nch; c++) {
+        const mtmd_input_chunk *ch = mtmd_input_chunks_get(chunks, c);
+        if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_TEXT) continue;
+        size_t n = mtmd_input_chunk_get_n_tokens(ch);
+        float *dst = (float *)malloc(n * (size_t)n_embd_inp * sizeof(float));
+        if (!dst) { snprintf(err, errlen, "out of memory"); goto done; }
+        mbuf[nm++] = dst;
+        pthread_mutex_lock(&pj->enc_mu);
+        int e = mtmd_encode_chunk(pj->mctx, ch);
+        if (e == 0) memcpy(dst, mtmd_get_output_embd(pj->mctx), n * (size_t)n_embd_inp * sizeof(float));
+        pthread_mutex_unlock(&pj->enc_mu);
+        if (e != 0) { snprintf(err, errlen, "media encode failed (code %d)", e); goto done; }
+    }
+
+    /* one batch, sequence 0: text tokens and media rows in order, every entry an
+     * output (cparams.embeddings requires it, as in ll_decode_pooled_batch) */
+    batch = llama_batch_ext_init(lctx);
+    if (!batch) { snprintf(err, errlen, "llama_batch_ext_init failed"); goto done; }
+    {
+        llama_pos pos = 0;
+        int mi = 0;
+        for (size_t c = 0; c < nch; c++) {
+            const mtmd_input_chunk *ch = mtmd_input_chunks_get(chunks, c);
+            if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                size_t n = 0;
+                const llama_token *tk = mtmd_input_chunk_get_tokens_text(ch, &n);
+                for (size_t k = 0; k < n; k++, pos++) {
+                    int32_t ix = llama_batch_ext_add_token(batch, 0, tk[k]);
+                    if (ix < 0 || !llama_batch_ext_set_pos(batch, ix, &pos) ||
+                        !llama_batch_ext_set_output_embd(batch, ix, true))
+                    { snprintf(err, errlen, "batch add failed (text, %d)", ix); goto done; }
+                }
+            } else {
+                size_t n = mtmd_input_chunk_get_n_tokens(ch);
+                const float *rows = mbuf[mi++];
+                for (size_t k = 0; k < n; k++) {
+                    struct llama_embd e = { rows + k * (size_t)n_embd_inp, 1, (size_t)n_embd_inp };
+                    llama_pos p = pos + (llama_pos)k;
+                    int32_t ix = llama_batch_ext_add_embd(batch, 0, e);
+                    if (ix < 0 || !llama_batch_ext_set_pos(batch, ix, &p) ||
+                        !llama_batch_ext_set_output_embd(batch, ix, true))
+                    { snprintf(err, errlen, "batch add failed (media, %d)", ix); goto done; }
+                }
+                pos += mtmd_input_chunk_get_n_pos(ch);
+            }
+        }
+    }
+
+    llama_memory_clear(llama_get_memory(lctx), /*clear_kv=*/true);
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch) != 0) {
+        snprintf(err, errlen, "decode failed (%d tokens)", *out_ntok);
+        goto done;
+    }
+    {
+        const float *emb = llama_get_embeddings_seq(lctx, 0);
+        if (!emb) { snprintf(err, errlen, "no pooled embedding returned"); goto done; }
+        double norm2 = 0.0;
+        for (i = 0; i < vec_dim; ++i) norm2 += (double)emb[i] * (double)emb[i];
+        float inv = norm2 > 0.0 ? (float)(1.0 / sqrt(norm2)) : 1.0f;
+        for (i = 0; i < vec_dim; ++i) out[i] = emb[i] * inv;
+    }
+    rc = 0;
+
+done:
+    if (batch) llama_batch_ext_free(batch);
+    for (i = 0; i < nm; i++) free(mbuf[i]);
+    if (chunks) mtmd_input_chunks_free(chunks);
+    for (i = 0; i < nb; i++) mtmd_bitmap_free(bitmaps[i]);
+    return rc;
+}
+
+/* Build mtmd's prompt: the user's text with "<|image|>"/"<|audio|>" replaced by the
+ * mtmd marker, and items[] reordered to match the placeholders.  With no text, the
+ * media alone (images, then audio).  Returns malloc'd text, or NULL with err set. */
+static char *lt_media_prompt(const char *text, const lt_media_in *in, int n_in,
+                             lt_media_in *ordered, char *err, size_t errlen)
+{
+    static const char *PH_I = "<|image|>", *PH_A = "<|audio|>";
+    const char *mk = mtmd_default_marker();
+    size_t mkl = strlen(mk);
+    int ni = 0, na = 0, n = 0, k;
+    for (k = 0; k < n_in; k++) in[k].audio ? na++ : ni++;
+
+    if (!text || !*text) {
+        char *s = (char *)malloc((size_t)n_in * mkl + 1);
+        s[0] = 0;
+        for (k = 0; k < n_in; k++) if (!in[k].audio) { ordered[n++] = in[k]; strcat(s, mk); }
+        for (k = 0; k < n_in; k++) if ( in[k].audio) { ordered[n++] = in[k]; strcat(s, mk); }
+        return s;
+    }
+    if (strstr(text, "<|video|>")) { snprintf(err, errlen, "<|video|> is not supported yet"); return NULL; }
+
+    size_t tl = strlen(text);
+    char *s = (char *)malloc(tl + (size_t)(n_in + 1) * mkl + 1), *o = s;
+    const char *p = text;
+    int ui = 0, ua = 0;
+    while (*p) {
+        int isi = !strncmp(p, PH_I, 9), isa = !strncmp(p, PH_A, 9);
+        if (isi || isa) {
+            int want = isi ? 0 : 1, idx = isi ? ui++ : ua++, seen = 0;
+            for (k = 0; k < n_in; k++)
+                if (in[k].audio == want && seen++ == idx) { ordered[n++] = in[k]; break; }
+            if (k == n_in) {
+                snprintf(err, errlen, "text has more %s placeholders than %s given",
+                         isi ? "<|image|>" : "<|audio|>", isi ? "images" : "audio clips");
+                free(s); return NULL;
+            }
+            memcpy(o, mk, mkl); o += mkl; p += 9;
+        } else
+            *o++ = *p++;
+    }
+    *o = 0;
+    if (ui != ni || ua != na) {
+        snprintf(err, errlen, n == 0 && n_in ?
+                 "text has no <|image|>/<|audio|> placeholders for the media given (omit text to embed media alone)" :
+                 "placeholders (%d <|image|>, %d <|audio|>) do not match the media given (%d images, %d audio)",
+                 ui, ua, ni, na);
+        free(s); return NULL;
+    }
+    return s;
+}
+
+static duk_ret_t embed_media_to_(duk_context *ctx, int pack)
+{
+    const char *what = pack == PACK32 ? "embedMediaToFp32Buf" : pack == PACK16 ? "embedMediaToFp16Buf"
+                                                                                : "embedMediaToNumbers";
+    if (!duk_is_object(ctx, 0) || duk_is_array(ctx, 0) || duk_is_buffer_data(ctx, 0))
+        RP_THROW(ctx, "rampart-llama-cpp:%s - argument must be an Object: {text, image, audio}", what);
+
+    int vec_dim = 0, split = 0, minTok = 0, packPara = 0, sentSpl = 0, maxBatch = 1, maxBTok = 0;
+    struct llama_model *lmodel = NULL;
+    struct llama_context *lctx = emb_resolve(ctx, what, &lmodel, &vec_dim, &split, &minTok,
+                                             &packPara, &sentSpl, &maxBatch, &maxBTok);
+    /* `this` is on top */
+    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("mproj"));
+    lt_mproj *pj = (lt_mproj *)duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+    if (!pj)
+        RP_THROW(ctx, "rampart-llama-cpp:%s - this handle has no projector: initEmbed(model, {mmproj: path})", what);
+
+    const char *text = NULL;
+    if (duk_get_prop_string(ctx, 0, "text") && !duk_is_undefined(ctx, -1) && !duk_is_null(ctx, -1)) {
+        if (!duk_is_string(ctx, -1))
+            RP_THROW(ctx, "rampart-llama-cpp:%s - text must be a String", what);
+        text = duk_get_string(ctx, -1);
+    }
+    /* (left on the stack: keeps text alive) */
+
+    lt_media_in in[LT_MEDIA_MAX], ord[LT_MEDIA_MAX];
+    int n = lt_media_collect(ctx, 0, "image", 0, in, 0, what);
+    n     = lt_media_collect(ctx, 0, "audio", 1, in, n, what);
+    if (!n && (!text || !*text))
+        RP_THROW(ctx, "rampart-llama-cpp:%s - nothing to embed: give image, audio and/or text", what);
+
+    char err[512] = {0};
+    char *prompt = lt_media_prompt(text, in, n, ord, err, sizeof err);
+    if (!prompt)
+        RP_THROW(ctx, "rampart-llama-cpp:%s - %s", what, err);
+
+    float *vec = (float *)malloc((size_t)vec_dim * sizeof(float));
+    int ntok = 0;
+    int rc = ll_embed_media(lctx, lmodel, pj, vec_dim, prompt, ord, n, vec, &ntok, err, sizeof err);
+    free(prompt);
+    if (rc != 0) {
+        free(vec);
+        RP_THROW(ctx, "rampart-llama-cpp:%s - %s", what, err);
+    }
+
+    duk_push_object(ctx);
+    ll_push_vec(ctx, vec, vec_dim, pack);
+    duk_dup_top(ctx);
+    duk_put_prop_string(ctx, -3, "avgVec");
+    duk_push_array(ctx);
+    duk_swap_top(ctx, -2);
+    duk_put_prop_index(ctx, -2, 0);
+    duk_put_prop_string(ctx, -2, "vecs");
+    duk_push_int(ctx, ntok);
+    duk_put_prop_string(ctx, -2, "nTokens");
+    free(vec);
+    return 1;
+}
+
+static duk_ret_t embed_media_to_numbers(duk_context *ctx) { return embed_media_to_(ctx, NOPACK); }
+static duk_ret_t embed_media_to_buf32(duk_context *ctx)   { return embed_media_to_(ctx, PACK32); }
+static duk_ret_t embed_media_to_buf16(duk_context *ctx)   { return embed_media_to_(ctx, PACK16); }
+
 static duk_ret_t embed_text_to_buf32(duk_context *ctx)
 {
     return embed_text_to_(ctx, PACK32);
@@ -2739,6 +3284,12 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
     rp_embed_handle_t *h = rp_embed_cache_get(path);
     if (h) return h;
 
+    /* before anything that touches the GPU runtime (incl. the kernel check) */
+    if (lt_gpu_forked()) {
+        if (err && errlen) snprintf(err, errlen, "rp_embed_load: %s", LT_FORK_REFUSAL_LOAD);
+        return NULL;
+    }
+
     h = (rp_embed_handle_t *)calloc(1, sizeof(*h));
     if (!h) {
         if (err && errlen) snprintf(err, errlen, "rp_embed_load: oom");
@@ -2763,6 +3314,7 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
     }
 #endif
     h->lmodel = llama_model_load_from_file(path, mp);
+    if (h->lmodel) lt_gpu_note();
     if (!h->lmodel) {
         if (err && errlen)
             snprintf(err, errlen, "rp_embed_load: could not load '%s': %s",
@@ -2774,7 +3326,7 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
         return NULL;
     }
 
-    h->vec_dim = llama_model_n_embd(h->lmodel);
+    h->vec_dim = llama_model_n_embd_out(h->lmodel);   /* output width: != n_embd under a projection head */
     if (h->vec_dim <= 0) {
         if (err && errlen)
             snprintf(err, errlen, "rp_embed_load: bad vec dim %d", h->vec_dim);
@@ -3170,6 +3722,8 @@ static duk_ret_t llamacpp_model_info(duk_context *ctx)
     lt_errmsg_clear(ctx);   /* errMsg reflects THIS call */
     const char *path = REQUIRE_STRING(ctx, 0,
         "modelInfo: argument 1 must be a String (path to .gguf)");
+    /* even a vocab-only, zero-GPU-layer load hangs in a forked child of a GPU parent */
+    if (lt_gpu_forked()) RP_THROW(ctx, "%s: %s", "modelInfo", LT_FORK_REFUSAL_LOAD);
 
     struct llama_model_params mp = llama_model_default_params();
     mp.vocab_only   = true;   /* metadata + vocab only -- no weights, no GPU upload */
@@ -3178,6 +3732,7 @@ static duk_ret_t llamacpp_model_info(duk_context *ctx)
     struct llama_model *m = llama_model_load_from_file(path, mp);
     if (!m)
         RP_THROW(ctx, "modelInfo: could not load '%s'", path);
+    lt_gpu_note();
 
     char arch[128] = {0};
     if (llama_model_meta_val_str(m, "general.architecture", arch, sizeof arch) < 0)
@@ -3247,11 +3802,61 @@ static duk_ret_t llamacpp_model_info(duk_context *ctx)
     return 1;
 }
 
+/* llamacpp.mediaInfo(modelPath, mmprojPath[, opts])
+ *
+ * Load a multimodal projector (mmproj GGUF) against its text model, report what it
+ * can encode, and free both.  Stateless: nothing outlives the call, so it is safe
+ * from any thread.  It is the first consumer of libmtmd in this module (Phase 1 of
+ * multimodal embedding), and it is what makes the linker pull mtmd in at all --
+ * static archive members are only linked to satisfy a reference. */
+static duk_ret_t llamacpp_media_info(duk_context *ctx)
+{
+    lt_errmsg_clear(ctx);
+    const char *model  = REQUIRE_STRING(ctx, 0, "mediaInfo: argument 1 (model path) must be a string");
+    const char *mmproj = REQUIRE_STRING(ctx, 1, "mediaInfo: argument 2 (mmproj path) must be a string");
+    if (lt_gpu_forked()) RP_THROW(ctx, "%s: %s", "mediaInfo", LT_FORK_REFUSAL_LOAD);   /* before any GPU call */
+
+    struct llama_model_params   mp = llama_model_default_params();
+    struct llama_context_params cp = llama_context_default_params();
+    if (duk_is_object(ctx, 2))
+        parse_common_opts(ctx, 2, &mp, &cp);
+
+    char lerr[256] = {0};
+    struct llama_model *lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
+    if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
+    if (!lmodel)
+        RP_THROW(ctx, "mediaInfo: could not load model '%s': %s", model, lerr[0] ? lerr : strerror(errno));
+
+    struct mtmd_context_params mtp = mtmd_context_params_default();
+    mtp.use_gpu       = lt_gpu_in_use() && mp.n_gpu_layers != 0;
+    mtp.print_timings = false;
+    mtp.warmup        = false;
+    mtp.n_threads     = cp.n_threads_batch > 0 ? cp.n_threads_batch : 4;
+
+    mtmd_context *mctx = mtmd_init_from_file(mmproj, lmodel, mtp);
+    if (!mctx) {
+        lgen_model_release(lmodel);
+        RP_THROW(ctx, "mediaInfo: could not load mmproj '%s' for model '%s' (see errMsg)", mmproj, model);
+    }
+
+    duk_push_object(ctx);
+    duk_push_boolean(ctx, mtmd_support_vision(mctx)); duk_put_prop_string(ctx, -2, "vision");
+    duk_push_boolean(ctx, mtmd_support_audio(mctx));  duk_put_prop_string(ctx, -2, "audio");
+    duk_push_int(ctx, mtmd_support_audio(mctx) ? mtmd_get_audio_sample_rate(mctx) : 0);
+    duk_put_prop_string(ctx, -2, "audioSampleRate");
+    duk_push_boolean(ctx, mtp.use_gpu);               duk_put_prop_string(ctx, -2, "gpu");
+
+    mtmd_free(mctx);
+    lgen_model_release(lmodel);
+    return 1;
+}
+
 static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 {
     lt_errmsg_clear(ctx);   /* errMsg reflects THIS call */
     lt_disable_cuda_graphs_for_batched();
     const char *model = REQUIRE_STRING(ctx, 0, "init: argument 1 must be a string");
+    if (lt_gpu_forked()) RP_THROW(ctx, "%s: %s", "initEmbed", LT_FORK_REFUSAL_LOAD);   /* before any GPU call */
     duk_idx_t obj_idx = -1;
 
     if (duk_is_object(ctx, 1))
@@ -3310,11 +3915,12 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     // double-free and shares weights across threads.
     char lerr[256] = {0};
     lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
+    if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
 
     if (!lmodel)
         RP_THROW(ctx, "rampart-llama-cpp:init - Could not load ggml file '%s': %s", model, lerr[0] ? lerr : strerror(errno));
 
-    int vec_dim = llama_model_n_embd(lmodel);
+    int vec_dim = llama_model_n_embd_out(lmodel);   /* output width: != n_embd under a projection head */
 
     if (vec_dim <= 0)
     {
@@ -3344,6 +3950,7 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
             mp.devices      = devs;    /* force CPU-only: no Metal/GPU backend */
             lt_warn("rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
             lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
+            if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
             if (lmodel)
                 lctx = new_embed_context(ctx, lmodel, &cp);
         }
@@ -3369,6 +3976,39 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
         if (l2) { llama_free(lctx); lctx = l2; }
     }
 
+    /* { mmproj: path, imageTokens: N } -- a multimodal projector for embedMedia*().
+       imageTokens pins every image to N tokens (min = max).  Default 280: the
+       reference implementation's budget (see claude-work/eg2-phase0 results:
+       llama.cpp's own resolution-based sizing agreed less with it).  0 = the
+       projector's own sizing. */
+    lt_mproj *pj = NULL;
+    if (obj_idx > -1 && duk_get_prop_string(ctx, obj_idx, "mmproj") &&
+        !duk_is_undefined(ctx, -1) && !duk_is_null(ctx, -1))
+    {
+        const char *mmproj = duk_get_string(ctx, -1);
+        if (!mmproj) {
+            llama_free(lctx); lgen_model_release(lmodel);
+            RP_THROW(ctx, "initEmbed: mmproj must be a path String");
+        }
+        int image_tokens = 280;
+        if (duk_get_prop_string(ctx, obj_idx, "imageTokens")) {
+            if (!duk_is_number(ctx, -1) || duk_get_int(ctx, -1) < 0) {
+                llama_free(lctx); lgen_model_release(lmodel);
+                RP_THROW(ctx, "initEmbed: imageTokens must be a non-negative integer (0 = projector default)");
+            }
+            image_tokens = duk_get_int(ctx, -1);
+        }
+        duk_pop(ctx);
+        int gpu = lt_gpu_in_use() && mp.n_gpu_layers != 0;
+        pj = lt_mproj_acquire(mmproj, lmodel, gpu, image_tokens,
+                              (int)llama_n_threads_batch(lctx));   /* the text side's count; -1 = ggml's 4, as there */
+        if (!pj) {
+            llama_free(lctx); lgen_model_release(lmodel);
+            RP_THROW(ctx, "initEmbed: could not load mmproj '%s' for model '%s' (see errMsg)", mmproj, model);
+        }
+    }
+    if (obj_idx > -1) duk_pop(ctx);   /* mmproj */
+
     duk_push_pointer(ctx, lmodel);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("model"));
 
@@ -3380,6 +4020,17 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 
     duk_push_int(ctx, vec_dim);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("vec_dim"));
+
+    duk_push_pointer(ctx, pj);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("mproj"));
+    if (pj) {
+        duk_push_object(ctx);
+        duk_push_boolean(ctx, mtmd_support_vision(pj->mctx)); duk_put_prop_string(ctx, -2, "vision");
+        duk_push_boolean(ctx, mtmd_support_audio(pj->mctx));  duk_put_prop_string(ctx, -2, "audio");
+        duk_push_int(ctx, pj->image_tokens);                  duk_put_prop_string(ctx, -2, "imageTokens");
+        duk_push_boolean(ctx, pj->gpu);                       duk_put_prop_string(ctx, -2, "gpu");
+        duk_put_prop_string(ctx, -2, "media");
+    }
 
     /* structure-aware chunking options (rp-chunker; mirrors rampart-onnx):
      * split:'auto'(default)|'window', minTokens (paragraph fragment
@@ -3438,6 +4089,13 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
 
     duk_push_c_function(ctx, embed_text_to_buf32, 1);
     duk_put_prop_string(ctx, -2, "embedTextToFp32Buf");
+
+    duk_push_c_function(ctx, embed_media_to_numbers, 1);
+    duk_put_prop_string(ctx, -2, "embedMediaToNumbers");
+    duk_push_c_function(ctx, embed_media_to_buf32, 1);
+    duk_put_prop_string(ctx, -2, "embedMediaToFp32Buf");
+    duk_push_c_function(ctx, embed_media_to_buf16, 1);
+    duk_put_prop_string(ctx, -2, "embedMediaToFp16Buf");
 
     duk_push_c_function(ctx, embed_text_to_buf16, 1);
     duk_put_prop_string(ctx, -2, "embedTextToFp16Buf");
@@ -3736,6 +4394,14 @@ static duk_ret_t rerank_text(duk_context *ctx)
             duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rerank_toks"));
         }
 
+        /* free this copy's context + toks when its thread exits (see lt_thr_fin) */
+        {
+            lt_thr_fin *f = lt_thr_fin_register();
+            if (f) { f->lctx = lctx; f->lmodel = lmodel; f->toks = toks; }
+            duk_push_pointer(ctx, f);
+            duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("thr_fin"));
+        }
+
         duk_push_pointer(ctx, lctx);
         duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
 
@@ -3847,6 +4513,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     lt_errmsg_clear(ctx);   /* errMsg reflects THIS call */
     lt_disable_cuda_graphs_for_batched();
     const char *model = REQUIRE_STRING(ctx, 0, "init: argument 1 must be a string");
+    if (lt_gpu_forked()) RP_THROW(ctx, "%s: %s", "initRerank", LT_FORK_REFUSAL_LOAD);   /* before any GPU call */
     duk_idx_t obj_idx = -1;
 
     if (duk_is_object(ctx, 1))
@@ -3881,6 +4548,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     // shared, refcounted load (one refcount per context; released in emb_free)
     char lerr[256] = {0};
     lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
+    if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
 
     if (!lmodel)
         RP_THROW(ctx, "rampart-llama-cpp:initRerank - Could not load ggml file '%s': %s", model, lerr[0] ? lerr : strerror(errno));
@@ -3930,6 +4598,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
             mp.devices      = devs;
             lt_warn("rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
             lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
+            if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
             if (lmodel)
                 lctx = llama_init_from_model(lmodel, cp);
         }
@@ -4332,6 +5001,7 @@ duk_ret_t duk_open_module(duk_context *ctx)
         CALLOC(cap, sizeof(struct llog_cap));
         pthread_mutex_init(&cap->mutex, NULL);
         llama_log_set(llamacpp_logger, cap);
+        mtmd_log_set(llamacpp_logger, cap);   /* mtmd + its clip encoder log separately */
 
         /* fatal ggml errors log their reason to `cap` and then abort; this
          * hook flushes it to stderr so it is not lost.  See llamacpp_on_abort. */
@@ -4349,6 +5019,9 @@ duk_ret_t duk_open_module(duk_context *ctx)
 
     duk_push_c_function(ctx, llamacpp_model_info, 1);
     duk_put_prop_string(ctx, -2, "modelInfo");     // read dim/ctx/arch w/o loading weights
+
+    duk_push_c_function(ctx, llamacpp_media_info, 3);
+    duk_put_prop_string(ctx, -2, "mediaInfo");     // load an mmproj, report vision/audio, free it
 
     duk_push_c_function(ctx, llamacpp_embed_defaults, 1);
     duk_put_prop_string(ctx, -2, "embedDefaults"); // batchChunks/threads/threadsBatch (also the sql path)
