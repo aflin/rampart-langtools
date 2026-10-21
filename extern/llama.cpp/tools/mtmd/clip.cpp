@@ -3859,6 +3859,15 @@ struct clip_model_loader {
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            if (!ctx_clip.buf) {
+                // rampart-langtools: upstream passes the NULL straight to
+                // ggml_backend_buffer_set_usage(), whose GGML_ASSERT aborts the whole
+                // process when the projector weights don't fit (32-bit address space,
+                // a full GPU).  Throw instead: clip_init() catches it and
+                // mtmd_init_from_file() returns NULL, so the caller gets an error.
+                throw std::runtime_error(string_format("%s: failed to allocate %zu bytes for the projector weights\n",
+                                                       __func__, total_data_size));
+            }
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
             if (!ctx_clip.no_alloc) {

@@ -258,7 +258,7 @@ That upgrade spanned 647 tagged releases and cost **two struct fields at three c
 sites** — see "What the b9494 -> b10446 upgrade actually cost" below, which is the
 best available estimate of what the *next* one will cost.
 
-## `extern/llama.cpp` is upstream + a few small Metal patches
+## `extern/llama.cpp` is upstream + a few small patches
 
 We keep llama.cpp as close to upstream as possible — **almost all** customization lives
 *outside* `extern/llama.cpp`:
@@ -267,15 +267,23 @@ We keep llama.cpp as close to upstream as possible — **almost all** customizat
 - `rampart-llamacpp.c` (the module: API usage + runtime env workarounds)
 
 But we **do** carry a small set of **source patches inside `extern/llama.cpp`** — the
-older-macOS Metal fixes below. They are Objective-C changes in ggml-metal, so they
-cannot live outside the vendored tree. **These MUST be reapplied after re-vendoring.**
+older-macOS Metal fixes and one mtmd allocation fix below. They change code paths we
+cannot reach from outside the vendored tree. **These MUST be reapplied after re-vendoring.**
 
 ### Vendored patches — now kept as files in `extern/patches/`
 
 ```
 extern/patches/ggml-metal-context.patch    ggml_metal_get_tensor_async
 extern/patches/ggml-metal-device.patch     ggml_metal_buffer_{set,get}_tensor  (2 hunks)
+extern/patches/mtmd-clip-alloc.patch       clip_model_loader::load_tensors: NULL weight buffer
 ```
+
+**mtmd-clip-alloc.patch** (added with b11798): when the projector's weight buffer can't be
+allocated, upstream hands the NULL to `ggml_backend_buffer_set_usage()`, whose
+`GGML_ASSERT` aborts the process. Found on the 32-bit Pi, where embeddinggemma-2's F16
+projector (~1 GB) doesn't fit in the address space; a GPU too full for the projector takes
+the same path. The patch throws instead, which `clip_init()` already catches, so
+`mtmd_init_from_file()` returns NULL and `initEmbed({mmproj})` throws a JS error.
 
 All three hunks are the same fix: on macOS 11, `newBufferWithBytesNoCopy` returns nil for
 non-page-aligned host memory (macOS 12+ tolerates it), which upstream then `GGML_ASSERT`s
@@ -285,12 +293,13 @@ Each is marked in-source with `// rampart-langtools:`.
 Apple Silicon takes the `is_shared` memcpy path in the two `device.m` functions, so it
 only needs the `context.m` one; **Intel Macs (non-unified memory) need all three.**
 
-Apply after replacing the tree:
+The Metal ones:
 
 ```sh
 cd extern/llama.cpp
-for p in ../patches/ggml-metal-*.patch; do patch -p1 --no-backup-if-mismatch < "$p"; done
+for p in ../patches/*.patch; do patch -p1 --no-backup-if-mismatch < "$p"; done
 grep -rn "rampart-langtools:" ggml/src/ggml-metal/    # expect 3 hits
+grep -rn "rampart-langtools:" tools/mtmd/             # expect 1 hit
 ```
 
 **Both the patched tree and the patch files are committed. That is not redundant.** The
@@ -309,6 +318,9 @@ for f in ggml/src/ggml-metal/ggml-metal-context.m ggml/src/ggml-metal/ggml-metal
     diff -u "$P/$f" "extern/llama.cpp/$f" \
       | sed -e "1s|^--- .*|--- a/$f|" -e "2s|^+++ .*|+++ b/$f|" > "extern/patches/$(basename $f .m).patch"
 done
+f=tools/mtmd/clip.cpp
+diff -u "$P/$f" "extern/llama.cpp/$f" \
+  | sed -e "1s|^--- .*|--- a/$f|" -e "2s|^+++ .*|+++ b/$f|" > extern/patches/mtmd-clip-alloc.patch
 ```
 
 Then round-trip them — this proves the patch set fully reproduces the vendored tree:
@@ -317,6 +329,7 @@ Then round-trip them — this proves the patch set fully reproduces the vendored
 rm -rf /tmp/rt && cp -a "$P" /tmp/rt && rm -rf /tmp/rt/.git
 cd /tmp/rt && for p in .../extern/patches/*.patch; do patch -p1 < "$p"; done
 diff -rq /tmp/rt/ggml/src/ggml-metal .../extern/llama.cpp/ggml/src/ggml-metal   # must be silent
+cmp /tmp/rt/tools/mtmd/clip.cpp .../extern/llama.cpp/tools/mtmd/clip.cpp        # must be silent
 ```
 
 They are deliberately kept as **files, not in-tree edits you have to go find**. Across
@@ -330,8 +343,8 @@ Hunk #1 succeeded at 1863 (offset 157 lines).
 Hunk #2 succeeded at 1932 (offset 157 lines).
 ```
 
-If upstream ever fixes the `newBufferWithBytesNoCopy`-nil behavior, delete the patch files
-and this section. Better still: upstream them (cf. #16266) and the burden goes to zero.
+If upstream ever fixes the `newBufferWithBytesNoCopy`-nil behavior, delete the Metal patch
+files; likewise mtmd-clip-alloc.patch once clip.cpp checks that buffer. Better still: upstream them (cf. #16266) and the burden goes to zero.
 
 ### Verify the version / find our patches
 

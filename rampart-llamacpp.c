@@ -365,6 +365,13 @@ static int g_embed_batch_tokens  = 512;
 static int g_embed_threads       = 1;
 static int g_embed_threads_batch = -1;
 
+/* Cap on the auto-sized embed context (n_ctx 0 => the model's trained window).
+ * The context's buffers grow with the window (one ubatch spans it): at 8192 an
+ * embeddinggemma-2 handle (trained 262144) takes ~1.8GB of address space, so on
+ * a 32-bit build no second context -- a worker thread's, a fork child's load --
+ * fits in the ~3GB a process gets.  An explicit nCtx is honored either way. */
+#define LT_EMBED_AUTO_CTX_CAP (sizeof(void *) < 8 ? 2048 : 8192)
+
 /* Resolve a batchChunks setting against a live context: returns the max
  * sequences per decode, where 1 means "one chunk per decode" (identical to
  * the pre-batching code path). */
@@ -1990,7 +1997,7 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
     if (cp.n_ctx <= 0)
     {
         int n_train = llama_model_n_ctx_train(lmodel);
-        if (n_train > 8192) n_train = 8192;
+        if (n_train > (int)LT_EMBED_AUTO_CTX_CAP) n_train = (int)LT_EMBED_AUTO_CTX_CAP;
         if (n_train > 0) cp.n_ctx = n_train;
     }
 
@@ -3353,7 +3360,7 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
     h->batch_chunks       = g_embed_batch_chunks;
     h->batch_tokens       = g_embed_batch_tokens;
     int n_train = llama_model_n_ctx_train(h->lmodel);
-    if (n_train > 8192) n_train = 8192;
+    if (n_train > (int)LT_EMBED_AUTO_CTX_CAP) n_train = (int)LT_EMBED_AUTO_CTX_CAP;
     h->cp.n_ctx     = n_train > 0 ? n_train : 0;
     h->cp.n_ubatch  = h->cp.n_ctx > 0 ? h->cp.n_ctx : 0;
     h->cp.n_batch   = h->cp.n_ubatch;

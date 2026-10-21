@@ -248,6 +248,7 @@ function runMediaTest() {
     /* fork: the child may continue on CPU; with a GPU backend it must refuse
      * (both a pre-fork handle and a new load), never hang */
     var gpu = !!llamacpp.embedDefaults().gpuInUse;
+    var STEP_WAIT = 300;   /* seconds */
     var ff = "/tmp/llamacpp-test-fork-" + process.getpid();
     writeFile(ff, "");
     var pid = -1;
@@ -257,16 +258,24 @@ function runMediaTest() {
     if (pid < 0) { testFeature("fork child (could not fork: worker thread still active)", false); try { e.destroy(); } catch(x) {} return; }
     if (pid === 0) {
         var out = [];
+        /* each step's result is written as it lands, so the parent can tell slow from hung */
         try { out.push(Math.abs(e.embedMediaToNumbers({image: red}).avgVec[0] - vred[0]) < 1e-5 ? "same" : "different"); }
         catch(x) { out.push(/fork/.test(x.message) ? "refused" : "threw " + x.message); }
+        writeFile(ff, out.join(","));
         try { out.push(llamacpp.initEmbed(path, {mmproj: mmproj, imageTokens: 70}).embedMediaToNumbers({image: red}).avgVec.length === 768 ? "loaded" : "bad"); }
         catch(x) { out.push(/fork/.test(x.message) ? "refused" : "threw " + x.message); }
         writeFile(ff, out.join(","));
         process.exit(0);
     }
-    var res = "";
-    for (var i = 0; i < 60 && !res; i++) { sleep(0.25); try { res = readFile(ff, true); } catch(x) {} }
-    if (!res) kill(pid, 9);
+    /* STEP_WAIT per step, not per test: on a CPU without AVX/F16C (e.g. Westmere)
+     * one image embed through the F16 projector takes ~80s */
+    var res = "", last = "", waited = 0;
+    while (res.split(",").length < 2 && waited < STEP_WAIT) {
+        sleep(0.25); waited += 0.25;
+        try { res = readFile(ff, true) || ""; } catch(x) {}
+        if (res !== last) { last = res; waited = 0; }
+    }
+    if (res.split(",").length < 2) { kill(pid, 9); res = res ? res + ",HUNG" : ""; }
     try { rmFile(ff); } catch(x) {}
     testFeature("fork child: " + (gpu ? "GPU -> refused, no hang" : "CPU -> same vector, new load ok"), function() {
         return res === (gpu ? "refused,refused" : "same,loaded") || (printf("    child: %s\n", res || "HUNG"), false);
@@ -280,7 +289,7 @@ function runMediaTest() {
             try { rampart.thread.put("mt", a.h.embedMediaToNumbers({image: a.img}).avgVec[0]); }
             catch(x) { rampart.thread.put("mt", "threw: " + x.message); }
         }, {h: e, img: red});
-        var r = rampart.thread.get("mt", 60000);
+        var r = rampart.thread.get("mt", STEP_WAIT * 1000);
         t.close();
         return typeof r === 'number' && Math.abs(r - vred[0]) < 1e-5;
     });

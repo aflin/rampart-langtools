@@ -892,8 +892,12 @@ function getMmproj(name, entry, o) {
     var g = entry.gguf;
     if (!g || !g.mmproj)
         throwErr("'%s' has no projector (mmproj) in the catalog", name);
+    /* default F16 (closest to the reference); a 32-bit build can't fit a
+       ~1GB F16 projector beside its model in the address space, so Q8_0 there */
+    var bits32 = /armv[67]|i[3-6]86/.test(rampart.buildPlatform);
     var q = o.quant ? pickQuant(g.mmproj, o.quant, o.allowVariant)
-                    : (g.mmproj.F16 ? "F16" : g.mmproj.BF16 ? "BF16" : pickQuant(g.mmproj));
+          : (bits32 && g.mmproj.Q8_0) ? "Q8_0"
+          : (g.mmproj.F16 ? "F16" : g.mmproj.BF16 ? "BF16" : pickQuant(g.mmproj));
     var qi = g.mmproj[q];
     var cat = o.category || entry.category || "embed";
     var base = qi.file.split("/").pop();
