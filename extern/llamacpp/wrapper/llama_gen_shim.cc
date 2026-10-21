@@ -160,6 +160,12 @@ struct lgen_engine {
     uint32_t n_ctx = 0;
     uint32_t n_batch = 0;
     std::deque<gen_request*> waitq;   /* pending requests waiting for a free slot */
+
+    /* texts of the tokens parse_special turns into control tokens (attr CONTROL |
+     * UNKNOWN; user-defined tokens are matched regardless), built on first use:
+     * what tokenize_prompt() looks for inside user input.  See there. */
+    std::vector<std::string> control_texts[256];   /* bucketed by first byte */
+    bool control_texts_built = false;
 };
 
 /* ============================== small helpers ============================== */
@@ -362,7 +368,7 @@ static void msgs_parse_lenient(const json &arr, std::vector<common_chat_msg> &ou
 struct applied_prompt {
     bool                ok = false;
     std::string         err;
-    std::string         prompt;
+    common_chat_prompt  prompt;   /* template parts + user-input parts (b11798+) */
     common_chat_params  params;
     bool                parsing = false;  /* run the chat parser over the output */
 };
@@ -479,14 +485,12 @@ static void apply_constraints(lgen_engine *e, gen_slot &slot,
     slot.parsing = ap.parsing;
     if (slot.parsing) {
         slot.parser_params = common_chat_parser_params(p);  /* copies format + generation_prompt ONLY */
-        slot.parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-        /* The converting ctor does NOT carry the serialized PEG parser.  Without
-         * this load, every PEG-format model silently degrades to content-only
-         * parsing: no error, no tool calls. */
-        if (!p.parser.empty()) {
-            try { slot.parser_params.parser.load(p.parser); }
-            catch (const std::exception &) { slot.parsing = false; }
-        }
+        /* The converting ctor does NOT carry the PEG parser.  Without this copy,
+         * every PEG-format model silently degrades to content-only parsing: no
+         * error, no tool calls.  (b11798: the parser is the arena itself, no
+         * longer a serialized string to load().  reasoning_format moved to the
+         * template inputs -- set in apply_templates -- and is built into it.) */
+        slot.parser_params.parser = p.parser;
         slot.prev_msg = common_chat_msg();
     }
 }
@@ -585,7 +589,7 @@ static void probe_tool_support(lgen_engine *e) {
         common_chat_params withtool = common_chat_templates_apply(e->templates.get(), in);
         /* A template that understands tools either names the probe in the
          * rendered prompt or switches to a tool-aware format/grammar. */
-        e->supports_tools = withtool.prompt.find("rampart_probe") != std::string::npos
+        e->supports_tools = withtool.prompt.str().find("rampart_probe") != std::string::npos
                          || withtool.format != plain.format
                          || !withtool.grammar.empty();
     } catch (const std::exception &) {
@@ -595,6 +599,73 @@ static void probe_tool_support(lgen_engine *e) {
     }
 }
 
+/* Tokenize the rendered prompt so that USER INPUT cannot produce control tokens:
+ * a message containing "<|im_start|>", "[INST]", "<start_of_turn>" (any control
+ * token's text) must stay plain text, or a user can forge turns, roles or tool
+ * results.  The template marks which parts are input (b11798 prompt parts).
+ *
+ * Deliberately NOT "tokenize each part separately": measured on 9 tokenizers
+ * (claude-work tokcheck), that changes ordinary prompts -- Llama-style
+ * SentencePiece adds a space prefix to every fragment (" user" for "user"), and
+ * BPE merges across a part boundary (gpt-oss ".\n\n").  So: tokenize the whole
+ * string exactly as llama-server does, and split ONLY at control-token texts
+ * found inside an input part, which are tokenized without special parsing.  An
+ * ordinary prompt is byte-for-byte upstream's tokenization; only a forged token
+ * (and at most its immediate neighbours) differs. */
+static const std::vector<std::string> *control_texts(lgen_engine *e) {
+    if (!e->control_texts_built) {
+        const int n = llama_vocab_n_tokens(e->vocab);
+        for (llama_token t = 0; t < n; t++) {
+            if (!(llama_vocab_get_attr(e->vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN)))
+                continue;
+            const char *s = llama_vocab_get_text(e->vocab, t);
+            if (s && *s) e->control_texts[(unsigned char)s[0]].emplace_back(s);
+        }
+        e->control_texts_built = true;
+    }
+    return e->control_texts;
+}
+
+static std::vector<llama_token> tokenize_prompt(lgen_engine *e, const common_chat_prompt &p) {
+    const std::string whole = p.str();
+    const std::vector<std::string> *ctl = control_texts(e);
+
+    /* [start, end) byte spans of forged control-token texts inside input parts */
+    std::vector<std::pair<size_t, size_t>> forged;
+    size_t off = 0;
+    for (const common_chat_prompt_part &part : p.parts) {
+        if (part.is_input) {
+            const std::string &s = part.text;
+            for (size_t i = 0; i < s.size(); ) {
+                size_t best = 0;
+                for (const std::string &c : ctl[(unsigned char)s[i]])
+                    if (c.size() > best && s.compare(i, c.size(), c) == 0) best = c.size();
+                if (best) { forged.emplace_back(off + i, off + i + best); i += best; }
+                else i++;
+            }
+        }
+        off += part.text.size();
+    }
+    if (forged.empty())
+        return common_tokenize(e->vocab, whole, true, true);   /* == llama-server */
+
+    std::vector<llama_token> out;
+    size_t pos = 0;
+    auto add = [&](size_t a, size_t b, bool special) {
+        if (b <= a) return;
+        std::vector<llama_token> t = common_tokenize(e->vocab, whole.substr(a, b - a),
+                                                     /*add_special*/ out.empty() && a == 0, special);
+        out.insert(out.end(), t.begin(), t.end());
+    };
+    for (const auto &f : forged) {
+        add(pos, f.first, true);
+        add(f.first, f.second, false);
+        pos = f.second;
+    }
+    add(pos, whole.size(), true);
+    return out;
+}
+
 /* start a request on a free slot; consumes (frees) req on success or failure */
 static void start_slot(lgen_engine *e, gen_slot &slot, gen_request *req) {
     applied_prompt ap = apply_templates(e, req);
@@ -602,9 +673,9 @@ static void start_slot(lgen_engine *e, gen_slot &slot, gen_request *req) {
     const char *err = nullptr;
     std::vector<llama_token> toks;
     if (!ap.ok) { err = ap.err.empty() ? "failed to apply chat template" : ap.err.c_str(); }
-    else if (ap.prompt.empty()) { err = "empty prompt"; }
+    else if (ap.prompt.str().empty()) { err = "empty prompt"; }
     else {
-        toks = common_tokenize(e->vocab, ap.prompt, true, true);
+        toks = tokenize_prompt(e, ap.prompt);
         if ((int) toks.size() >= slot.n_ctx_slot) { snprintf(errbuf, sizeof errbuf, "prompt longer than slot context (%d >= %d)", (int)toks.size(), slot.n_ctx_slot); err = errbuf; }
     }
     if (err) {

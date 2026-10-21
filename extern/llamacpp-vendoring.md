@@ -4,11 +4,78 @@
 
 | | |
 |---|---|
-| **Upstream tag** | `b11479` |
-| **Upstream commit** | `42c787e8c191d49c01c757f4b7029d69ec0bf2c8` (tag b11479; extracted via `git archive` from a local clone) |
-| **Tag date** | 2026-10-07 |
-| **ggml version** | 0.26.0 |
+| **Upstream tag** | `b11798` |
+| **Upstream commit** | (tag b11798; extracted via `git archive` from a local clone) |
+| **Tag date** | 2026-10-21 |
+| **ggml version** | 0.27.0 |
 | **Source** | https://github.com/ggml-org/llama.cpp |
+
+### b11479 -> b11798 (2026-10-21): chat API refactor; prompt-injection guard; big embedding speedup
+
+`rampart-llamacpp.c`, `rampart-langtools.c` and the mtmd calls compiled **unchanged**.
+The Metal patches reapplied with +4 offsets, were re-anchored, and round-trip clean.
+
+**The chat adapter (`llama_gen_shim.cc`) had four breaks**, all from upstream #30210
+and #30389:
+- `common_chat_params.prompt` is now a `common_chat_prompt` (a list of parts, each
+  flagged `is_input` for user text). `.str()` gives the old string.
+- `common_chat_params.parser` is the `common_peg_arena` itself. The old
+  `parser.load(serialized)` is replaced by copying it into
+  `slot.parser_params.parser`. **Trap 2 still applies**: the converting ctor
+  doesn't copy it.
+- `common_chat_parser_params.reasoning_format` is gone. It now lives on
+  `common_chat_templates_inputs` (we already set it there) and is built into the parser.
+- A `.find()` on the probe prompt became `.str().find()`.
+
+**New: user input can no longer forge control tokens** (`tokenize_prompt()`).
+llama-server tokenizes `prompt.str()` whole with `parse_special=true`, so a user
+message containing `<|im_start|>` / `[INST]` / `<start_of_turn>` becomes a real
+control token. That allows forged turns, and it also corrupts innocent questions
+*about* those tokens. With b11479, "What does <|im_start|> mean?" came back as
+"The token icense means...".
+- **Rejected: tokenizing each part separately.** Measured with `claude-work tokcheck`
+  on 9 tokenizers, it changes ordinary prompts. Llama-style SentencePiece adds a
+  space prefix per fragment (`' user'`), and gpt-oss BPE merges `.\n\n` across a
+  part boundary.
+- **Shipped: tokenize the whole string like upstream**, and split only at
+  control-token texts (attr CONTROL|UNKNOWN, the only kinds `parse_special=false`
+  suppresses; user-defined tokens are always matched) found *inside* an input
+  part. Control texts are bucketed by first byte per engine.
+- **Result:** all 32 benign cases on 8 tokenizers are **identical** to upstream, and
+  forged control tokens drop to the template's own count (Gemma 5→4, Mistral
+  6→5, Nemotron 9→6, Hermes 7→5).
+- **Limit:** gpt-oss's Harmony turn tokens are user-defined, not control, so
+  llama.cpp parses them regardless. That can't be protected here, and upstream
+  doesn't either.
+
+**Verified on firefly (2_28 ovens, 6/6 clean; RTX 4070 Ti + new RTX 3060):**
+
+| check | result |
+|---|---|
+| `llamacpp-test.js` | 49/49: CPU 13.8 s, cu13 3.5 s, cu13 with **both GPUs** visible 4.0 s |
+| text vectors vs b11479 (4 models, short + 6.3k doc) | CPU **bit-identical**. cu13: bge-m3 and bge-base identical; MiniLM and bge-small cos ≥ 0.99986, same chunk counts (new GPU kernels) |
+| embeddinggemma-2 6.3k-token doc, cu13 | **0.5 s** (b11479: 7–10 s) |
+| bge-m3 long doc, cu13 | 1.1 s (b11479: 3.3 s) |
+| multimodal: rampart vs llama-server b11798 | 1.0000 on every item |
+| multimodal vs Google reference | unchanged (images 0.9863, audio 0.9996) |
+| image vectors vs b11479 | cos 0.9996+ (mtmd #30882: Gemma 4 vision now uses real GELU, not gelu_quick) |
+| p2-api, p1-test | 21/21, 9/9 |
+| thread/fork comparison, fork guard, per-thread leak | identical to b11479 results |
+
+**Also verified on en (Mac Studio arm64, macOS 15.6.1, Metal), 2026-10-21:** clean build
+(0 errors, 44 s). `llamacpp-test.js` 49/49 in 21 s. Text vectors vs b11479 Metal are
+**bit-identical** on 5 models (MiniLM f16 and Q4_K_M, bge-m3 Q8_0 and Q4_K_M, bge-small
+Q4_K_M), with the same chunk counts. Multimodal Metal vs rampart b11798 CUDA and vs
+upstream llama-server is 0.9999+ on every item, and unchanged vs Google's reference.
+p2-api 21/21 and p1 9/9. The thread/fork comparison is identical across modes, the fork
+guard refuses all 6 loads, and the per-thread leak test is flat (footprint). The prompt
+guard works. Speed: embeddinggemma-2 6.3k-token doc 2.2 s → **1.0 s**; bge-m3 long doc
+2.9 s → 1.3 s; MiniLM Q4_K_M 257 → 79 ms.
+
+**Build note:** an upstream test build for bare `CMAKE_CUDA_ARCHITECTURES=89` failed
+with "no kernel image" in `ggml_cuda_kernel_can_use_pdl`. With our
+`<arch>-real;...;89-virtual` style it runs on both sm_86 and sm_89, so it is not
+our concern.
 
 ### libmtmd is now linked (2026-10-07): multimodal embedding, Phase 1
 
