@@ -29,6 +29,7 @@
 #                           more just swaps and gets SLOWER (memory-bound).
 #      ONNX_NVCC_THREADS    per-nvcc arch-compile threads          (ORT default ~4)
 #      ONNX_FLASH_NVCC_THREADS  same, for flash-attn files ONLY (the RAM monsters)
+#                           (default: 1 if the builder has < 12GB RAM, else ORT's)
 #                           Set these =1 on a RAM-tight builder: the default runs 4
 #                           arch-compiles of one .cu at once (~4GB each) -> OOM even
 #                           at PARALLEL=1.  FLASH-only recompiles just the flash files.

@@ -118,6 +118,15 @@ case "$STAGE" in
     # without cuDNN and cuDNN-less deploy targets (e.g. Jetson without JetPack's
     # cuDNN installed).
     [ -n "${ONNX_CUDA_MINIMAL:-}" ]  && ONNX_FLAGS="$ONNX_FLAGS -DONNX_CUDA_MINIMAL=$ONNX_CUDA_MINIMAL"
+    # Small-RAM builders: ORT compiles each flash-attention .cu for every arch at
+    # once (~4 GB per arch), which hangs an 8 GB Jetson into a watchdog reset.
+    # Below 12 GB, default to one arch at a time.  rampart-build-cuda.sh reads
+    # this from the environment; an explicit value from build.sh still wins.
+    _mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+    if [ -z "${ONNX_FLASH_NVCC_THREADS:-}" ] && [ "${_mem_kb:-0}" -lt 12582912 ]; then
+        export ONNX_FLASH_NVCC_THREADS=1
+        echo "==> $((_mem_kb / 1024)) MB RAM < 12 GB: ONNX_FLASH_NVCC_THREADS=1 (flash-attn arches compiled serially)"
+    fi
     # -DSUFFIX="" (empty variant) -> unsuffixed; cpu/cuNN -> _cpu/_cuNN.
     # Pass RP_PATH (rampart's install prefix) directly instead of letting CMake run the
     # mounted rampart to query it: this oven's glibc can be OLDER than the host's, and a

@@ -262,6 +262,9 @@ function runMediaTest() {
         try { out.push(Math.abs(e.embedMediaToNumbers({image: red}).avgVec[0] - vred[0]) < 1e-5 ? "same" : "different"); }
         catch(x) { out.push(/fork/.test(x.message) ? "refused" : "threw " + x.message); }
         writeFile(ff, out.join(","));
+        /* 32-bit: the inherited handle plus its new context already fill most of
+         * the ~3GB address space, so a second model+projector+context can't fit */
+        if (/armv[67]|i[3-6]86/.test(rampart.buildPlatform)) try { e.destroy(); } catch(x) {}
         try { out.push(llamacpp.initEmbed(path, {mmproj: mmproj, imageTokens: 70}).embedMediaToNumbers({image: red}).avgVec.length === 768 ? "loaded" : "bad"); }
         catch(x) { out.push(/fork/.test(x.message) ? "refused" : "threw " + x.message); }
         writeFile(ff, out.join(","));
