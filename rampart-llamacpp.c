@@ -2028,8 +2028,8 @@ static struct llama_context *new_embed_context(duk_context *ctx, struct llama_mo
  * Structure-aware document embedding (rp-chunker.c, shared source with
  * rampart-onnx).  Text is chunked at semantic boundaries -- one vector per
  * blank-line paragraph (fragments under min_tokens merged), single-newline
- * lines greedily packed to the window, sliding token window with 1/8 overlap
- * as the no-structure / oversized-paragraph fallback -- then each chunk is
+ * lines greedily packed to the window, an over-window piece split at
+ * sentences, then at words with 1/8 overlap -- then each chunk is
  * decoded and pooled.  Used by embedTextTo* (JS) and rp_embed_text (C ABI).
  * ============================================================ */
 
@@ -2160,7 +2160,8 @@ static int ll_decode_pooled_batch(struct llama_context *lctx,
  *   *out_vecs = malloc'd float[k*vec_dim]   unit chunk vectors, row-major
  *   *out_k    = k
  *   *out_spans= malloc'd ll_chunk_span[k]   byte span of each chunk in text
- *               (+ its decoded token count; window sub-chunks share a span)
+ *               (+ its decoded token count; windows cut from an over-window
+ *               region carry their own ranges and overlap their neighbours)
  *   *out_avg  = malloc'd float[vec_dim]     normalize(mean of unit chunk vecs)
  *   *out_coh  = avg pairwise cosine between unit chunk vecs, [0,1]; 1.0 when k==1
  * Returns 0 with err[0]==0 for empty/whitespace text; err set on real errors. */
@@ -2359,7 +2360,16 @@ static int ll_embed_doc(struct llama_context *lctx, const struct llama_vocab *vo
                 pend_ntok += m;
                 free(tmp);
             }
-            vspans[k] = (ll_chunk_span){ spans[si].start, spans[si].end, (size_t)n };
+            {
+                /* the chunker emits only spans that fit; a span that still
+                 * tokenizes past the window here gets its windows' own
+                 * byte ranges, not the whole span */
+                size_t ws = spans[si].start, we = spans[si].end;
+                if (nw > chunk_tokens)
+                    rp_chunk_window_span(text, spans[si].start, spans[si].end,
+                                         (size_t)start, (size_t)n, (size_t)nw, &ws, &we);
+                vspans[k] = (ll_chunk_span){ ws, we, (size_t)n };
+            }
             k++;
             if (start + chunk_tokens >= nw) break;
         }
@@ -2752,12 +2762,10 @@ static duk_ret_t embed_text_to_(duk_context *ctx, int pack)
         duk_push_lstring(ctx, text + spans[i].start,
                          (duk_size_t)(spans[i].end - spans[i].start));
         duk_put_prop_string(ctx, -2, "text");
-        /* oversized: one of several token windows over a span that exceeded
-         * the model window (sub-windows share their span) */
-        if ((i > 0 && spans[i-1].start == spans[i].start
-                   && spans[i-1].end   == spans[i].end)
-            || (i + 1 < k && spans[i+1].start == spans[i].start
-                          && spans[i+1].end   == spans[i].end)) {
+        /* oversized: one of several windows cut from a span that exceeded
+         * the model window -- the only chunks that overlap a neighbour */
+        if ((i > 0 && spans[i].start < spans[i-1].end)
+            || (i + 1 < k && spans[i+1].start < spans[i].end)) {
             duk_push_true(ctx);
             duk_put_prop_string(ctx, -2, "oversized");
         }
@@ -4065,7 +4073,7 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
                 packPara = duk_to_boolean(ctx, -1);
             duk_pop(ctx);
             if (duk_get_prop_string(ctx, obj_idx, "sentenceSplit"))
-                sentSpl = duk_to_boolean(ctx, -1);
+                sentSpl = duk_to_boolean(ctx, -1) ? 1 : -1;   /* unset: 0 = on */
             duk_pop(ctx);
         }
         /* Resolve batchChunks ONCE, here: lt_gpu_in_use() is only meaningful

@@ -152,6 +152,53 @@ function runEmbedTest() {
         for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return true;
         return false;
     });
+
+    /* chunking: every chunk's span is exactly the bytes it was embedded
+     * from.  A paragraph over the window is split at sentences (default),
+     * and text with no sentence ends -- or sentenceSplit:false -- into
+     * overlapping word windows flagged oversized. */
+    var mon = [], sen = [];
+    for (var i = 0; i < 900; i++) mon.push("token" + (i % 50) + " word" + i);
+    for (i = 0; i < 150; i++) sen.push("Sentence number " + i + " talks about ovens and bread.");
+    var monp = mon.join(" "), senp = sen.join(" ");
+    var doc = "First short paragraph about ovens.\n\n" + monp + "\n\n" + senp +
+              "\n\nClosing short paragraph about bread.";
+    var mps = doc.indexOf(monp), sps = doc.indexOf(senp);
+    function inPara(c, ps, p) { return c.start >= ps && c.end <= ps + p.length; }
+    function exactSpans(rd) {
+        return rd.chunks.length === rd.vecs.length && rd.chunks.every(function(c) {
+            return doc.slice(c.start, c.end) === c.text; });
+    }
+    function windowsOk(w, ps, p) {          /* ascending, overlapping, end to end */
+        return w.length >= 2 && w[0].start === ps && w[w.length - 1].end === ps + p.length &&
+               w.every(function(c, i) {
+                   return c.oversized && (i === 0 || (c.start > w[i-1].start && c.start < w[i-1].end)); });
+    }
+    var rd = null;
+    testFeature("chunk spans are the embedded bytes", function() {
+        rd = emb.embedTextToNumbers(doc);
+        return exactSpans(rd);
+    });
+    testFeature("no-sentence paragraph -> overlapping word windows", function() {
+        return windowsOk(rd.chunks.filter(function(c) { return inPara(c, mps, monp); }), mps, monp);
+    });
+    testFeature("prose paragraph -> whole sentences, unflagged", function() {
+        var s = rd.chunks.filter(function(c) { return inPara(c, sps, senp); });
+        return s.length >= 2 && s[0].start === sps && s[s.length - 1].end === sps + senp.length &&
+               s.every(function(c, i) {
+                   return !c.oversized && /\.$/.test(c.text) && (i === 0 || c.start >= s[i-1].end); });
+    });
+    testFeature("short paragraphs unflagged", function() {
+        return !rd.chunks[0].oversized && !rd.chunks[rd.chunks.length - 1].oversized;
+    });
+    testFeature("sentenceSplit:false -> word windows for prose too", function() {
+        var e2 = llamacpp.initEmbed(path, {sentenceSplit: false});
+        var r2 = e2.embedTextToNumbers(doc);
+        try { e2.destroy(); } catch(e) {}
+        return exactSpans(r2) &&
+               windowsOk(r2.chunks.filter(function(c) { return inPara(c, sps, senp); }), sps, senp);
+    });
+
     try { emb.destroy(); } catch(e) {}
     testFeature("embed destroy", true);
 }

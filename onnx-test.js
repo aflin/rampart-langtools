@@ -279,8 +279,15 @@ function runEmbedTest(minilm) {
                doc.slice(rd.chunks[0].start, rd.chunks[0].end) === rd.chunks[0].text;
     });
     testFeature("oversized paragraph flagged on its sub-windows", function() {
+        /* each window has its own byte range: ascending, overlapping its
+         * neighbour, its text the matching slice, together the paragraph */
+        var p = mon.join(" "), ps = doc.indexOf(p);
         return over.length >= 2 &&
-               over.every(function(c) { return c.start === over[0].start; });
+               over[0].start === ps && over[over.length - 1].end === ps + p.length &&
+               over.every(function(c, i) {
+                   return doc.slice(c.start, c.end) === c.text &&
+                          (i === 0 || (c.start > over[i-1].start && c.start < over[i-1].end));
+               });
     });
     testFeature("normal paragraphs unflagged", function() { return norm.length === 2; });
     testFeature("coherence in [0,1]", function() {

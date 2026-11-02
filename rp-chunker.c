@@ -93,6 +93,22 @@ static size_t piece_count(cctx *c, size_t s, size_t e)
     return n;
 }
 
+/* sentence_split: 0 = default (on), 1 = on, -1 = off */
+static int sent_on(const cctx *c) { return c->o.sentence_split >= 0; }
+
+static void split_sentences(cctx *c, size_t s, size_t e);
+static void split_words(cctx *c, size_t s, size_t e);
+
+/* A piece over win_tokens with no finer text structure left: sentence-pack
+ * it (default), else cut it at word boundaries. */
+static void split_over(cctx *c, size_t s, size_t e)
+{
+    if (sent_on(c) && c->o.mode != RP_CHUNK_WINDOW)
+        split_sentences(c, s, e);
+    else
+        split_words(c, s, e);
+}
+
 /* Emit pending same-level units [u0..un) as chunks.
  *
  * level >= 2 (blank-line paragraphs), default: one chunk per paragraph, but a
@@ -290,9 +306,7 @@ static void split_sentences(cctx *c, size_t s, size_t e)
         u[nu++] = (rp_chunk_span){ as, ae, n, 0 };
     }
     if (nu == 0) {                       /* no units at all */
-        size_t n = piece_count(c, s, e);
-        if (!c->err)
-            sl_push(&c->out, (rp_chunk_span){ s, e, n, 1 });
+        split_words(c, s, e);
         return;
     }
 
@@ -301,9 +315,8 @@ static void split_sentences(cctx *c, size_t s, size_t e)
     size_t i = 0;
     while (i < nu) {
         if (u[i].n_tokens > win) {       /* single monster sentence */
-            rp_chunk_span m = u[i];
-            m.oversized = 1;
-            sl_push(&c->out, m);
+            split_words(c, u[i].start, u[i].end);
+            if (c->err || c->out.oom) { free(u); return; }
             i++;
             continue;
         }
@@ -336,12 +349,116 @@ static void split_sentences(cctx *c, size_t s, size_t e)
         rp_chunk_span *last = &c->out.v[c->out.n - 1];
         rp_chunk_span *prev = &c->out.v[c->out.n - 2];
         if (!last->oversized && !prev->oversized &&
+            last->start >= prev->end &&
             last->n_tokens < minTok &&
             prev->n_tokens + last->n_tokens <= win) {
             prev->end = last->end;
             prev->n_tokens += last->n_tokens;
             c->out.n--;
         }
+    }
+}
+
+/* ---------- word-level splitting (the finest level) ----------
+ *
+ * A piece still over win_tokens after every structural level (or a monster
+ * sentence) is cut into windows that each fit win_tokens, overlapping by
+ * ~1/8 of the window like the engines' old token-window fallback.  Cuts land
+ * on whitespace, else on a UTF-8 character boundary (CJK, Thai), so every
+ * window is a real byte range of the input: its span is exact, and the
+ * vector is embedded from exactly those bytes.  Pieces are marked
+ * .oversized=1 (cut from an over-window region). */
+
+static int utf8_cont(const char *t, size_t i)
+{
+    return ((unsigned char)t[i] & 0xC0) == 0x80;
+}
+
+/* A cut at or before i in (lo, hi]: the last whitespace position, searched
+ * back no further than halfway to lo (a piece must not collapse to a few
+ * words for want of a space), else the character boundary at or before i. */
+static size_t cut_back(const char *t, size_t lo, size_t i, size_t hi)
+{
+    if (i >= hi) return hi;
+    size_t floor_ = lo + (i - lo) / 2, p;
+    for (p = i; p > floor_; p--)
+        if (is_ws((unsigned char)t[p])) return p;
+    for (p = i; p > lo && utf8_cont(t, p); p--) ;
+    return p > lo ? p : i;
+}
+
+/* The word start at or after i, before hi: just past whitespace, else the
+ * character boundary at or after i. */
+static size_t word_fwd(const char *t, size_t i, size_t hi)
+{
+    size_t p = i;
+    if (p > 0 && !is_ws((unsigned char)t[p - 1]))      /* mid-word: skip it */
+        while (p < hi && !is_ws((unsigned char)t[p])) p++;
+    if (p >= hi) {                       /* no space ahead: char boundary */
+        for (p = i; p < hi && utf8_cont(t, p); p++) ;
+        return p;
+    }
+    while (p < hi && is_ws((unsigned char)t[p])) p++;
+    return p;
+}
+
+static size_t count_trim(cctx *c, size_t s, size_t e)
+{
+    trim(c->t, &s, &e);
+    return s < e ? piece_count(c, s, e) : 0;
+}
+
+static void split_words(cctx *c, size_t s, size_t e)
+{
+    const char *t = c->t;
+    size_t win = (size_t)c->o.win_tokens;
+    size_t ovl = win / 8;
+    size_t pos = s;
+
+    for (;;) {
+        trim(t, &pos, &e);
+        if (pos >= e) return;
+        size_t n = piece_count(c, pos, e);
+        if (c->err) return;
+        if (n <= win) {
+            sl_push(&c->out, (rp_chunk_span){ pos, e, n, 1 });
+            return;
+        }
+
+        /* largest cut whose window fits */
+        size_t lo = pos + 1, hi = e, cut = 0, cutn = 0;
+        while (lo <= hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            size_t k = cut_back(t, pos, mid, e);
+            size_t m = count_trim(c, pos, k);
+            if (c->err) return;
+            if (m <= win && k > pos) { if (k > cut) { cut = k; cutn = m; } lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        if (!cut) {                      /* one token wider than the window */
+            for (cut = pos + 1; cut < e && utf8_cont(t, cut); cut++) ;
+            cutn = count_trim(c, pos, cut);
+        }
+        size_t a = pos, z = cut;
+        trim(t, &a, &z);
+        sl_push(&c->out, (rp_chunk_span){ a, z, cutn, 1 });
+        if (c->out.oom) return;
+
+        /* next window starts ~ovl tokens before the cut */
+        size_t next = cut;
+        if (ovl > 0) {
+            size_t ql = pos + 1, qh = cut, best = cut;
+            while (ql <= qh) {
+                size_t mid = ql + (qh - ql) / 2;
+                size_t q = word_fwd(t, mid, cut);
+                size_t m = count_trim(c, q, cut);
+                if (c->err) return;
+                if (m <= ovl) { if (q < best) best = q; qh = mid - 1; }
+                else ql = mid + 1;
+            }
+            if (best > pos && best < cut) next = best;
+        }
+        pos = next;
     }
 }
 
@@ -360,11 +477,11 @@ static void split_region(cctx *c, size_t s, size_t e, int level)
     if (level <= 0) {
         size_t n = piece_count(c, s, e);
         if (c->err) return;
-        if (n > (size_t)c->o.win_tokens && c->o.sentence_split) {
-            split_sentences(c, s, e);
+        if (n > (size_t)c->o.win_tokens) {
+            split_over(c, s, e);
             return;
         }
-        sl_push(&c->out, (rp_chunk_span){ s, e, n, n > (size_t)c->o.win_tokens });
+        sl_push(&c->out, (rp_chunk_span){ s, e, n, 0 });
         return;
     }
 
@@ -407,10 +524,8 @@ static void split_region(cctx *c, size_t s, size_t e, int level)
                     pn = 0;
                     if (lvl > 1)
                         split_region(c, as, ae, lvl - 1);
-                    else if (c->o.sentence_split)
-                        split_sentences(c, as, ae);
                     else
-                        sl_push(&c->out, (rp_chunk_span){ as, ae, n, 1 });
+                        split_over(c, as, ae);
                     if (c->err || c->out.oom) { free(pend); return; }
                 }
             }
@@ -449,15 +564,14 @@ int rp_chunk_text(const char *text, size_t len,
 
     int lvl = (c.o.mode == RP_CHUNK_WINDOW) ? 0 : max_level(text, 0, len);
     if (lvl == 0) {
-        /* window mode, or no newline structure at all: one span; the caller
-         * token-windows it if it exceeds the budget */
+        /* window mode, or no newline structure at all: one span if it fits,
+         * else sentences (AUTO) / word-level windows */
         size_t n = count(count_user, text, len);
         if (n == (size_t)-1) return -1;
-        if (n > (size_t)c.o.win_tokens && c.o.sentence_split &&
-            c.o.mode != RP_CHUNK_WINDOW)
-            split_sentences(&c, 0, len);   /* structureless AUTO text */
+        if (n > (size_t)c.o.win_tokens)
+            split_over(&c, 0, len);
         else
-            sl_push(&c.out, (rp_chunk_span){ 0, len, n, n > (size_t)c.o.win_tokens });
+            sl_push(&c.out, (rp_chunk_span){ 0, len, n, 0 });
     } else {
         split_region(&c, 0, len, lvl);
         if (!c.err && !c.out.oom && c.out.n == 0) {
@@ -472,4 +586,22 @@ int rp_chunk_text(const char *text, size_t len,
     *out_spans = c.out.v;
     *out_n = c.out.n;
     return 0;
+}
+
+void rp_chunk_window_span(const char *text, size_t s, size_t e,
+                          size_t tok_start, size_t tok_n, size_t tok_total,
+                          size_t *out_s, size_t *out_e)
+{
+    size_t a = s, z = e;
+    if (tok_total && tok_n < tok_total && e > s) {
+        double len = (double)(e - s);
+        a = s + (size_t)(len * (double)tok_start / (double)tok_total);
+        z = s + (size_t)(len * (double)(tok_start + tok_n) / (double)tok_total);
+        if (z > e) z = e;
+        while (a < z && utf8_cont(text, a)) a++;
+        while (z > a && z < e && utf8_cont(text, z)) z--;
+        if (a >= z) { a = s; z = e; }
+    }
+    *out_s = a;
+    *out_e = z;
 }

@@ -765,7 +765,7 @@ typedef struct {
     int         split_mode;       /* RP_CHUNK_AUTO(0) / _WINDOW(1) / _PARA(2) */
     int         min_split_tokens; /* paragraph fragment floor; 0 = default 32, -1 = off */
     int         pack_paragraphs;  /* 1 = pack paragraphs to the window (default: one chunk per paragraph) */
-    int         sentence_split;   /* 1 = sentence-pack oversized pieces (rp-chunker sentence level) */
+    int         sentence_split;   /* 0 = default (on), 1 = on, -1 = off: sentence-pack oversized pieces */
 } rp_onnx_embed_opts;
 
 /* Compile-time-visible dtype for the C output vector: always float32.
@@ -1836,6 +1836,7 @@ static int onnx_embed_doc_run(const onnx_seqrun *cf, onnx_encsrc *E,
     /* 2) encode each chunk (with prefix); token-window any that still exceed
      * the budget (mis-estimates, oversized paragraphs, unstructured text) */
     int64_t **seqs = NULL; size_t *lens = NULL, *sidx = NULL;
+    size_t *wsS = NULL, *wsE = NULL;      /* each sequence's byte span */
     size_t nseq = 0, cap = 0;
     E->with_prefix = 1;
     for (size_t i = 0; i < nspan; i++) {
@@ -1870,11 +1871,28 @@ static int onnx_embed_doc_run(const onnx_seqrun *cf, onnx_encsrc *E,
                 int64_t **ns = realloc(seqs, nc * sizeof(*ns));
                 size_t   *nl = realloc(lens, nc * sizeof(*nl));
                 size_t   *ni = realloc(sidx, nc * sizeof(*ni));
+                size_t   *n1 = realloc(wsS, nc * sizeof(*n1));
                 if (ns) seqs = ns;
                 if (nl) lens = nl;
                 if (ni) sidx = ni;
-                if (!ns || !nl || !ni) { onnx_free_seqs(ws, wl, wk); snprintf(err, errlen, "oom"); goto fail; }
+                if (n1) wsS = n1;
+                size_t   *n2 = n1 ? realloc(wsE, nc * sizeof(*n2)) : NULL;
+                if (n2) wsE = n2;
+                if (!ns || !nl || !ni || !n1 || !n2) { onnx_free_seqs(ws, wl, wk); snprintf(err, errlen, "oom"); goto fail; }
                 cap = nc;
+            }
+            wsS[nseq] = spans[i].start;
+            wsE[nseq] = spans[i].end;
+            if (wk > 1) {
+                /* the chunker emits only spans that fit; a span that still
+                 * tokenizes past the window gets its windows' own byte
+                 * ranges (onnx_chunk_ids' stride), not the whole span */
+                size_t cw = (size_t)win > nsp ? (size_t)win - nsp : 1;
+                size_t st = cw - cw / 8; if (!st) st = cw;
+                size_t t0 = j * st, tn = n > t0 ? n - t0 : 0;
+                if (tn > cw) tn = cw;
+                rp_chunk_window_span(text, spans[i].start, spans[i].end, t0, tn, n,
+                                     &wsS[nseq], &wsE[nseq]);
             }
             if (dp_n && cf) {   /* embedding runs only; spans-only mode
                                  * needn't touch the seqs (k already fixed) */
@@ -1908,16 +1926,14 @@ static int onnx_embed_doc_run(const onnx_seqrun *cf, onnx_encsrc *E,
         R->k    = nseq;
         R->chunks = malloc(nseq * sizeof(*R->chunks));
         if (!R->chunks) { snprintf(err, errlen, "oom"); goto fail_res; }
-        for (size_t j = 0; j < nseq; j++) {
-            const rp_chunk_span *s = &spans[sidx[j]];
-            R->chunks[j] = (rp_onnx_embed_span){ s->start, s->end, lens[j] };
-        }
+        for (size_t j = 0; j < nseq; j++)
+            R->chunks[j] = (rp_onnx_embed_span){ wsS[j], wsE[j], lens[j] };
         if (cf && want_avg) {
             R->avg = onnx_embed_avg(vecs, nseq, dim, normalize, &R->coh);
             if (!R->avg) { snprintf(err, errlen, "oom"); goto fail_res; }
         }
         onnx_free_seqs(seqs, lens, nseq);
-        free(sidx);
+        free(sidx); free(wsS); free(wsE);
         free(spans);
         free(dp_ids);
         return dim;
@@ -1927,7 +1943,7 @@ fail_res:
     }
 fail:
     onnx_free_seqs(seqs, lens, nseq);
-    free(sidx);
+    free(sidx); free(wsS); free(wsE);
     free(spans);
     free(dp_ids);
     return 0;
@@ -1940,9 +1956,9 @@ fail:
  *   *out_coherence = avg pairwise cosine between unit chunk vecs, [0,1]
  *                    (k-independent; 1.0 when k==1)
  *   *out_chunks    = malloc'd rp_onnx_embed_span[k]: byte span of each chunk
- *                    in the input text (+ its token count).  Token-window
- *                    sub-chunks of an oversized/unstructured region share
- *                    that region's span.
+ *                    in the input text (+ its token count).  Windows cut
+ *                    from an over-window region carry their own byte
+ *                    ranges and overlap their neighbours.
  * Any of the out pointers may be NULL if the caller doesn't want that part.
  * On failure returns 0 (outputs zeroed). */
 size_t rp_onnx_embed_doc(void *handle, const char *text, size_t tlen,
@@ -2398,13 +2414,10 @@ static duk_ret_t onnx_embed_doc_js(duk_context *ctx)
         duk_push_lstring(ctx, text + R.chunks[i].start,
                          (duk_size_t)(R.chunks[i].end - R.chunks[i].start));
         duk_put_prop_string(ctx, -2, "text");
-        /* oversized: this vector is one of SEVERAL token windows over a span
-         * that exceeded the model window (sub-windows share their span, so
-         * the one-vector-per-paragraph invariant did not hold there) */
-        if ((i > 0 && R.chunks[i-1].start == R.chunks[i].start
-                   && R.chunks[i-1].end   == R.chunks[i].end)
-            || (i + 1 < R.k && R.chunks[i+1].start == R.chunks[i].start
-                            && R.chunks[i+1].end   == R.chunks[i].end)) {
+        /* oversized: one of several windows cut from a span that exceeded
+         * the model window -- the only chunks that overlap a neighbour */
+        if ((i > 0 && R.chunks[i].start < R.chunks[i-1].end)
+            || (i + 1 < R.k && R.chunks[i+1].start < R.chunks[i].end)) {
             duk_push_true(ctx);
             duk_put_prop_string(ctx, -2, "oversized");
         }
@@ -3556,7 +3569,7 @@ static duk_ret_t onnx_init_embed(duk_context *ctx)
             {
                 int ss = 0;
                 if (duk_get_prop_string(ctx, 1, "sentenceSplit"))
-                    ss = duk_to_boolean(ctx, -1);
+                    ss = duk_to_boolean(ctx, -1) ? 1 : -1;   /* unset: 0 = on */
                 duk_pop(ctx);
                 duk_push_int(ctx, ss);
                 duk_put_prop_string(ctx, cfg_idx, "sentSplit");
