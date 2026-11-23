@@ -199,8 +199,31 @@ function runEmbedTest() {
                windowsOk(r2.chunks.filter(function(c) { return inPara(c, sps, senp); }), sps, senp);
     });
 
+    var handText = "handed over between threads", handVec = emb.embedTextToNumbers(handText).avgVec;
     try { emb.destroy(); } catch(e) {}
     testFeature("embed destroy", true);
+
+    /* with emb gone nothing else holds the model, and the worker's own object is
+     * finalized as soon as its function returns: a copy passed through thread.put
+     * must keep the model alive on its own */
+    testFeature("handle made in a worker, used after it exits", function() {
+        var key = "handoff-" + process.getpid();
+        var t = new rampart.thread();
+        t.exec(function(a) {
+            (function() { rampart.thread.put(a.key, a.init(a.path)); })();
+            Duktape.gc();
+            rampart.thread.put(a.key + "-done", 1);
+        }, {key: key, path: path, init: llamacpp.initEmbed});
+        var done = rampart.thread.get(key + "-done", 120000);
+        t.close();
+        sleep(0.2);
+        var h = rampart.thread.del(key);
+        rampart.thread.del(key + "-done");
+        if (!done || !h) return false;
+        var v = h.embedTextToNumbers(handText).avgVec;
+        h.destroy();
+        return Math.abs(v[0] - handVec[0]) < 1e-5;
+    });
 }
 
 /* ================================================================
@@ -296,6 +319,10 @@ function runMediaTest() {
      * (both a pre-fork handle and a new load), never hang */
     var gpu = !!llamacpp.embedDefaults().gpuInUse;
     var STEP_WAIT = 300;   /* seconds */
+    /* 32-bit CPU: the child skips its own load.  It inherits the parent's model,
+     * projector and context and can't free them (destroy() there frees only the
+     * context the child made), and a second set doesn't fit in ~3GB of address space */
+    var skipLoad = !gpu && /armv[67]|i[3-6]86/.test(rampart.buildPlatform);
     var ff = "/tmp/llamacpp-test-fork-" + process.getpid();
     writeFile(ff, "");
     var pid = -1;
@@ -309,10 +336,8 @@ function runMediaTest() {
         try { out.push(Math.abs(e.embedMediaToNumbers({image: red}).avgVec[0] - vred[0]) < 1e-5 ? "same" : "different"); }
         catch(x) { out.push(/fork/.test(x.message) ? "refused" : "threw " + x.message); }
         writeFile(ff, out.join(","));
-        /* 32-bit: the inherited handle plus its new context already fill most of
-         * the ~3GB address space, so a second model+projector+context can't fit */
-        if (/armv[67]|i[3-6]86/.test(rampart.buildPlatform)) try { e.destroy(); } catch(x) {}
-        try { out.push(llamacpp.initEmbed(path, {mmproj: mmproj, imageTokens: 70}).embedMediaToNumbers({image: red}).avgVec.length === 768 ? "loaded" : "bad"); }
+        if (skipLoad) out.push("skipped");
+        else try { out.push(llamacpp.initEmbed(path, {mmproj: mmproj, imageTokens: 70}).embedMediaToNumbers({image: red}).avgVec.length === 768 ? "loaded" : "bad"); }
         catch(x) { out.push(/fork/.test(x.message) ? "refused" : "threw " + x.message); }
         writeFile(ff, out.join(","));
         process.exit(0);
@@ -327,8 +352,10 @@ function runMediaTest() {
     }
     if (res.split(",").length < 2) { kill(pid, 9); res = res ? res + ",HUNG" : ""; }
     try { rmFile(ff); } catch(x) {}
-    testFeature("fork child: " + (gpu ? "GPU -> refused, no hang" : "CPU -> same vector, new load ok"), function() {
-        return res === (gpu ? "refused,refused" : "same,loaded") || (printf("    child: %s\n", res || "HUNG"), false);
+    var what = gpu ? "GPU -> refused, no hang" : skipLoad ? "32-bit CPU -> same vector" : "CPU -> same vector, new load ok";
+    var want = gpu ? "refused,refused" : skipLoad ? "same,skipped" : "same,loaded";
+    testFeature("fork child: " + what, function() {
+        return res === want || (printf("    child: %s\n", res || "HUNG"), false);
     });
     /* the worker test runs AFTER the fork: a just-closed worker can still hold
      * rampart's thread lock while fork() already allows forking, and the child

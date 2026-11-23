@@ -267,7 +267,7 @@ We keep llama.cpp as close to upstream as possible — **almost all** customizat
 - `rampart-llamacpp.c` (the module: API usage + runtime env workarounds)
 
 But we **do** carry a small set of **source patches inside `extern/llama.cpp`** — the
-older-macOS Metal fixes and one mtmd allocation fix below. They change code paths we
+older-macOS Metal fixes, a no-Metal-device fix and one mtmd allocation fix below. They change code paths we
 cannot reach from outside the vendored tree. **These MUST be reapplied after re-vendoring.**
 
 ### Vendored patches — now kept as files in `extern/patches/`
@@ -275,8 +275,17 @@ cannot reach from outside the vendored tree. **These MUST be reapplied after re-
 ```
 extern/patches/ggml-metal-context.patch    ggml_metal_get_tensor_async
 extern/patches/ggml-metal-device.patch     ggml_metal_buffer_{set,get}_tensor  (2 hunks)
+extern/patches/ggml-metal-no-device.patch  ggml_backend_metal_reg: register no device when there is none
 extern/patches/mtmd-clip-alloc.patch       clip_model_loader::load_tensors: NULL weight buffer
 ```
+
+**ggml-metal-no-device.patch:** every macOS build compiles Metal in (also Intel, where
+`LT_ENABLE_GPU` is OFF). Upstream registers one GPU device even when
+`MTLCreateSystemDefaultDevice()` returns nil (most Intel VMs, some headless Macs): context
+creation fails (so SQL `embed()` failed, it has no CPU retry), `gpuInUse` was true and CPU
+work after a fork was refused. The patch registers none, so those hosts are plain CPU. It
+acts only when there is no device; it runs when ggml first creates the device (not at
+`require()`, which must stay fork-safe) and covers rampart-llamacpp and rampart-clip.
 
 **mtmd-clip-alloc.patch** (added with b11798): when the projector's weight buffer can't be
 allocated, upstream hands the NULL to `ggml_backend_buffer_set_usage()`, whose
@@ -285,7 +294,7 @@ projector (~1 GB) doesn't fit in the address space; a GPU too full for the proje
 the same path. The patch throws instead, which `clip_init()` already catches, so
 `mtmd_init_from_file()` returns NULL and `initEmbed({mmproj})` throws a JS error.
 
-All three hunks are the same fix: on macOS 11, `newBufferWithBytesNoCopy` returns nil for
+The three context/device hunks are the same fix: on macOS 11, `newBufferWithBytesNoCopy` returns nil for
 non-page-aligned host memory (macOS 12+ tolerates it), which upstream then `GGML_ASSERT`s
 -> crash in embed/rerank. The fix: on nil, fall back to a copying/staging Metal buffer.
 Each is marked in-source with `// rampart-langtools:`.
@@ -298,7 +307,7 @@ The Metal ones:
 ```sh
 cd extern/llama.cpp
 for p in ../patches/*.patch; do patch -p1 --no-backup-if-mismatch < "$p"; done
-grep -rn "rampart-langtools:" ggml/src/ggml-metal/    # expect 3 hits
+grep -rn "rampart-langtools:" ggml/src/ggml-metal/    # expect 4 hits
 grep -rn "rampart-langtools:" tools/mtmd/             # expect 1 hit
 ```
 
@@ -318,6 +327,9 @@ for f in ggml/src/ggml-metal/ggml-metal-context.m ggml/src/ggml-metal/ggml-metal
     diff -u "$P/$f" "extern/llama.cpp/$f" \
       | sed -e "1s|^--- .*|--- a/$f|" -e "2s|^+++ .*|+++ b/$f|" > "extern/patches/$(basename $f .m).patch"
 done
+f=ggml/src/ggml-metal/ggml-metal.cpp
+diff -u "$P/$f" "extern/llama.cpp/$f" \
+  | sed -e "1s|^--- .*|--- a/$f|" -e "2s|^+++ .*|+++ b/$f|" > extern/patches/ggml-metal-no-device.patch
 f=tools/mtmd/clip.cpp
 diff -u "$P/$f" "extern/llama.cpp/$f" \
   | sed -e "1s|^--- .*|--- a/$f|" -e "2s|^+++ .*|+++ b/$f|" > extern/patches/mtmd-clip-alloc.patch

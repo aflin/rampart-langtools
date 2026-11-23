@@ -36,6 +36,7 @@
 #endif
 
 #include <stdarg.h>
+#include <dlfcn.h>              /* rampart-clip's fork flag: see lt_gpu_forked */
 
 /* get_current_thread() lives in the rampart binary (like the duk_* symbols).
  * Keep the reference WEAK so a non-rampart host that dlopens this module just
@@ -46,19 +47,15 @@
 
 /* ---- per-thread resources freed when their rampart thread exits -------------
  * A handle copied into a rampart thread builds that thread's own llama context
- * (embed/rerank) or generation engine on first use.  Thread copies carry no
- * finalizer, so before this nothing freed them when the thread ended: each
+ * (embed/rerank: see lt_emb_box) or generation engine on first use.  A copy may
+ * be unreachable to JS finalizers when the thread ends, so without this each
  * short-lived worker leaked a context (~1-1.5 GB VRAM at an 8192 window).
  * rampart-thread.c runs set_thread_fin_cb() callbacks when a thread closes,
- * after its JS heaps are destroyed, on that thread.  One record per rebuilt
- * copy; the copy's explicit destroy() frees the resources itself and NULLs
- * them here, so the callback only frees what is still live.  The record itself
- * is freed by rampart (set_thread_fin_cb takes malloc'd data). */
+ * after its JS heaps are destroyed, on that thread.  For generation: one record
+ * per rebuilt copy; the copy's explicit destroy() frees the engine itself and
+ * NULLs it here, so the callback only frees what is still live.  The record
+ * itself is freed by rampart (set_thread_fin_cb takes malloc'd data). */
 typedef struct {
-    struct llama_context *lctx;     /* embed/rerank: context + one model ref */
-    struct llama_model   *lmodel;
-    void                 *mproj;    /* lt_mproj*: one projector ref, or NULL */
-    void                 *toks;     /* rerank: this copy's rp_rerank_toks */
     void                 *ginfo;    /* gen: this copy's rp_llama_info */
 } lt_thr_fin;
 
@@ -154,6 +151,16 @@ static void lt_errmsg_clear(duk_context *ctx)
 
 
 // --- CUDA availability check ---
+/* The process that initialized the GPU runtime: the first one in which ggml
+ * reported a GPU backend (registration enumerates the devices) or the CUDA
+ * kernel check found a device -- whether or not a model then loaded.  A forked
+ * child inherits the value, which is how lt_gpu_forked() knows its parent's GPU
+ * state is unusable here. */
+static pid_t g_gpu_pid = 0;
+/* What that process found: 1 = integrated, 2 = dedicated (0 = none so far).
+ * Inherited across fork() like g_gpu_pid. */
+static int g_gpu_kind = 0;
+
 #if ( defined(LT_ENABLE_GPU) && !defined(__APPLE__) )
     #define HAVE_CUDA 1
 
@@ -200,6 +207,9 @@ static void lt_errmsg_clear(duk_context *ctx)
             }
             return 1;  /* no CUDA GPU -> CPU build runs, allow */
         }
+        /* the runtime is live in this process from here on, even if the device
+         * is refused below or the load fails */
+        if (!g_gpu_pid) g_gpu_pid = getpid();
         if (device < 0 || device >= ndev) device = 0;
         struct cudaDeviceProp p;
         cudaError_t ge = cudaGetDeviceProperties(&p, device);
@@ -274,21 +284,29 @@ static void lt_errmsg_clear(duk_context *ctx)
  * and reporting want ANY GPU-class backend (lt_gpu_in_use), while the
  * chunk-batching default wants dedicated VRAM specifically
  * (lt_dedicated_gpu_in_use).  See each one's comment. */
-/* The process in which ggml first reported a GPU backend, i.e. the one that
- * initialized the GPU runtime (registration enumerates the devices).  A forked
- * child inherits the value, which is how lt_gpu_forked() knows its parent's GPU
- * state is unusable here. */
-static pid_t g_gpu_pid = 0;
+static int lt_gpu_forked(void);
 
 static int lt_gpu_backend_kind(void)
 {
     int kind = 0;   /* 0 = none, 1 = integrated, 2 = dedicated */
+
+    /* Once known, never ask the driver again: ggml_backend_dev_type() calls
+     * cudaGetDeviceProperties(), which in a forked child of a CUDA 11/12 parent
+     * fails and makes ggml abort -- and the post-fork refusals call this.  (Tests
+     * only g_gpu_kind, so another thread can't see a pid without its kind.) */
+    if (g_gpu_kind) return g_gpu_kind;
+    /* a parent that touched the GPU without getting that far (refused device,
+     * or rampart-clip): enumerating here would abort the same way */
+    if (lt_gpu_forked()) return 0;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         enum ggml_backend_dev_type t = ggml_backend_dev_type(ggml_backend_dev_get(i));
         if (t == GGML_BACKEND_DEVICE_TYPE_GPU)  { kind = 2; break; }
         if (t == GGML_BACKEND_DEVICE_TYPE_IGPU) kind = 1;
     }
-    if (kind && !g_gpu_pid) g_gpu_pid = getpid();
+    if (kind) {
+        if (!g_gpu_pid) g_gpu_pid = getpid();
+        g_gpu_kind = kind;
+    }
     return kind;
 }
 
@@ -322,16 +340,34 @@ static int lt_dedicated_gpu_in_use(void)
 /* The post-fork refusal for NEW loads.  The per-handle refusals (LT_FORK_REFUSAL)
  * only catch handles made before the fork; a child that loads a model of its own
  * after its parent initialized the GPU used to HANG in the GPU runtime.  Checked
- * at the top of every load path; lt_gpu_note() after each load makes sure the
- * parent's g_gpu_pid is set even on a path that never asked lt_gpu_in_use(). */
+ * at the top of every load path; lt_gpu_note() after each load ATTEMPT makes sure
+ * the parent's g_gpu_pid is set even on a path that never asked lt_gpu_in_use():
+ * a load that fails has still registered the backends, i.e. initialized the GPU. */
 #define LT_FORK_REFUSAL_LOAD "llama.cpp: a GPU backend (CUDA/Metal) was initialized " \
     "before this process was forked -- loading a model in the child would hang or " \
     "crash the GPU runtime. Fork before loading models (rampart-server daemon mode + " \
     "postForkFunc), or use a CPU-only build."
 
-static int lt_gpu_forked(void)
+static int lt_gpu_forked_here(void)
 {
     return g_gpu_pid && g_gpu_pid != getpid();
+}
+
+/* for rampart-clip, which has its own ggml but shares the GPU runtime */
+int rp_llamacpp_gpu_forked(void)
+{
+    return lt_gpu_forked_here();
+}
+
+static int lt_gpu_forked(void)
+{
+    if (lt_gpu_forked_here()) return 1;
+#if HAVE_CUDA || defined(__APPLE__)
+    /* ...and the other way round: the parent's GPU may be rampart-clip's */
+    int (*clip_forked)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "rp_clip_gpu_forked");
+    if (clip_forked && clip_forked()) return 1;
+#endif
+    return 0;
 }
 
 static void lt_gpu_note(void)
@@ -674,8 +710,8 @@ static rp_llama_info *lg_new_info_e(const lgen_engine_params *p, char *err, size
         return NULL;
     }
     lgen_engine *eng = lgen_engine_create(p, err, errlen);
-    if (!eng) return NULL;
     lt_gpu_note();
+    if (!eng) return NULL;
     rp_llama_info *info = NULL;
     CALLOC(info, sizeof(rp_llama_info));
     info->thr = get_current_thread();
@@ -1706,10 +1742,10 @@ static duk_ret_t lg_init_gen_batched(duk_context *ctx)
 
 /* ---- multimodal projector (mmproj) shared state ------------------------------
  * One mtmd_context per (mmproj path, text model, gpu, imageTokens), refcounted the
- * same way as the text model (lgen_model_*): every per-thread embed context holds
- * one CHECKED reference, taken in initEmbed / emb_resolve's rebuild and released
- * in emb_free alongside the model's.  A copy whose origin was destroyed before its
- * first use fails cleanly instead of touching a freed projector.
+ * same way as the text model (lgen_model_*): every lt_emb_box holds one CHECKED
+ * reference, taken in initEmbed / emb_resolve's rebuild and released alongside
+ * the model's.  A copy whose origin was destroy()ed before its first use fails
+ * cleanly instead of touching a freed projector.
  * mtmd's encoder is not thread-safe, so encodes serialize on the entry's mutex;
  * bitmap decode and tokenize are thread-safe upstream and run unlocked. */
 typedef struct lt_mproj {
@@ -1800,12 +1836,6 @@ static void lt_mproj_release(lt_mproj *p)
 static void lt_thr_fin_cb(void *arg)
 {
     lt_thr_fin *f = (lt_thr_fin *)arg;
-    if (f->lctx) {
-        if (f->mproj) lt_mproj_release((lt_mproj *)f->mproj);   /* references the model */
-        llama_free(f->lctx);
-        lgen_model_release(f->lmodel);
-    }
-    if (f->toks) free(f->toks);
     if (f->ginfo) {
         rp_llama_info *info = (rp_llama_info *)f->ginfo;
         /* Only an idle engine: freeing one with queued requests fires their
@@ -1840,106 +1870,235 @@ static lt_thr_fin *lt_thr_fin_get(duk_context *ctx, duk_idx_t obj)
     return f;
 }
 
-// Tear down an embed/rerank handle. A handle may be COPIED across threads (each
-// copy rebuilds its own per-thread llama_ctx from the shared model). So free each
-// resource by its correct owner, or copies will double-free:
-//   - llama_ctx + a model refcount: per CONTEXT — only the copy that built it on
-//     THIS thread (ctx_thread/ctx_pid match) frees its context and releases one
-//     model refcount (the model is freed by the cache when the last is released).
-//   - rerank_toks: per HANDLE (allocated once at init) — only the ORIGIN copy
-//     (emb_origin_thr/pid, never changed by a rebuild) frees it.
-/* inner teardown: expects the handle object at the TOP of the stack.  The
-   destroy() method wrapper pushes `this`; as a finalizer duktape passes the
-   object as the argument (duk_push_this would yield undefined there). */
-static duk_ret_t emb_free_(duk_context *ctx)
+/* ---- embed/rerank handle lifetime ------------------------------------------
+ * A lt_emb_box is one built context plus the references it was built on.  Every
+ * JS object carrying it -- the handle that built it and each copy rampart makes
+ * (thread.put/get, exec() args, globals copied into new threads) -- holds one
+ * ref: objOnCopyCallback takes it and the finalizer, which rampart re-attaches
+ * to such copies, drops it (as rampart-clip does).
+ *
+ *   - lctx is used only on the thread + pid that built it.  A copy used anywhere
+ *     else builds its own box and lets go of the one it arrived with.
+ *   - lctx is freed by destroy() on that thread, when that thread exits, when the
+ *     object that built it is finalized there (unless a same-thread copy has
+ *     started using it: `shared`), or with the box.
+ *   - the model + projector refs last as long as the box, so a copy can still
+ *     build after the original was garbage collected or its thread ended.  Only
+ *     an explicit destroy() releases them early; a copy first used after that
+ *     gets "model was destroyed".
+ *   - a forked child frees none of its parent's contexts, models or projectors.
+ *
+ * "thread_copied" is set by rampart on every copy and cleared when a copy
+ * builds, so !thread_copied identifies the object that built its box. */
+typedef struct lt_emb_box {
+    struct lt_emb_box    *next;
+    int                   refs;
+    int                   shared;
+    int                   thr;
+    int                   pid;
+    struct llama_context *lctx;
+    struct llama_model   *lmodel;
+    lt_mproj             *mproj;
+    void                 *toks;     /* rerank: rp_rerank_toks */
+} lt_emb_box;
+
+#define LT_BOX_SYM    DUK_HIDDEN_SYMBOL("emb_box")
+#define LT_COPIED_SYM DUK_HIDDEN_SYMBOL("thread_copied")
+
+static pthread_mutex_t g_box_mu = PTHREAD_MUTEX_INITIALIZER;
+static lt_emb_box     *g_box    = NULL;
+static __thread int    g_box_fin_set = 0;
+
+/* Thread exit: free the contexts built on it.  Their boxes keep the model refs
+ * for copies held elsewhere.  Done under the lock, so that another thread's last
+ * unref cannot free a model before the context that uses it. */
+static void lt_box_thr_fin_cb(void *arg)
 {
-    struct llama_model *lmodel = NULL;
-    struct llama_context *lctx = NULL;
+    int thr = get_thread_num(), pid = (int)getpid();
+    lt_emb_box *b;
 
-    // guard against a second teardown of the same copy (explicit destroy + finalizer)
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("destroyed")) && duk_get_boolean_default(ctx, -1, 0)) {
-        duk_pop_2(ctx);
-        return 0;
-    }
-    duk_pop(ctx);
-
-    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("model"));
-    lmodel = duk_get_pointer(ctx, -1);
-    duk_pop(ctx);
-
-    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("llama_ctx"));
-    lctx = duk_get_pointer(ctx, -1);
-    duk_pop(ctx);
-
-    int ctx_thr = -1, ctx_pid = -1, org_thr = -1, org_pid = -1;
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_thread")))
-        ctx_thr = duk_get_int(ctx, -1);
-    duk_pop(ctx);
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_pid")))
-            ctx_pid = duk_get_int(ctx, -1);
-    duk_pop(ctx);
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("emb_origin_thr")))
-        org_thr = duk_get_int(ctx, -1);
-    duk_pop(ctx);
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("emb_origin_pid")))
-        org_pid = duk_get_int(ctx, -1);
-    duk_pop(ctx);
-
-    int cur_thr = get_thread_num();
-    int cur_pid = (int)getpid();
-    int own_context = (lctx && ctx_thr == cur_thr && ctx_pid == cur_pid);
-    int is_origin   = (org_thr == cur_thr && org_pid == cur_pid);
-
-    /* this copy frees its own per-thread resources below: the thread-exit
-     * callback (lt_thr_fin) must not free them again */
-    if (own_context) {
-        lt_thr_fin *f = lt_thr_fin_get(ctx, -1);
-        if (f) { f->lctx = NULL; f->mproj = NULL; f->toks = NULL; }
-        duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("thr_fin"));
-    }
-
-    // rerank_toks: the origin copy owns the one made at init; a copy that
-    // REBUILT on its own thread (own_context, not origin) replaced its pointer
-    // with a private struct at rebuild -- it owns that one.  A copy that never
-    // rebuilt still points at the origin's struct and must not free it.
-    if (is_origin || own_context)
-    {
-        if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rerank_toks")))
-        {
-            void *toks = duk_get_pointer(ctx, -1);
-            if (toks) free(toks);
-            duk_pop(ctx);
-            duk_push_pointer(ctx, NULL);
-            duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rerank_toks"));
+    (void)arg;      /* freed by rampart-thread.c */
+    g_box_fin_set = 0;
+    pthread_mutex_lock(&g_box_mu);
+    for (b = g_box; b; b = b->next)
+        if (b->lctx && b->thr == thr && b->pid == pid) {
+            llama_free(b->lctx);
+            b->lctx = NULL;
         }
-        else
-            duk_pop(ctx);
+    pthread_mutex_unlock(&g_box_mu);
+}
+
+/* takes over the caller's context, model ref, projector ref and toks */
+static lt_emb_box *lt_box_new(struct llama_context *lctx, struct llama_model *lmodel,
+                              lt_mproj *pj, void *toks)
+{
+    lt_emb_box *b = NULL;
+
+    CALLOC(b, sizeof(lt_emb_box));
+    b->refs   = 1;
+    b->thr    = get_thread_num();
+    b->pid    = (int)getpid();
+    b->lctx   = lctx;
+    b->lmodel = lmodel;
+    b->mproj  = pj;
+    b->toks   = toks;
+
+    /* one callback per thread; the main thread only ends with the process */
+    if (b->thr && !g_box_fin_set && set_thread_fin_cb && get_current_thread) {
+        RPTHR *t = get_current_thread();
+        void *arg = t ? malloc(1) : NULL;
+        if (arg) {
+            set_thread_fin_cb(t, lt_box_thr_fin_cb, arg);
+            g_box_fin_set = 1;
+        }
     }
 
-    // per-context resources: only the copy that built this context frees them
-    if (own_context)
+    pthread_mutex_lock(&g_box_mu);
+    b->next = g_box;
+    g_box = b;
+    pthread_mutex_unlock(&g_box_mu);
+    return b;
+}
+
+static void lt_box_unref(lt_emb_box *b)
+{
+    lt_emb_box **bp;
+    int last;
+
+    if (!b) return;
+    pthread_mutex_lock(&g_box_mu);
+    last = (--b->refs == 0);
+    if (last)
+        for (bp = &g_box; *bp; bp = &(*bp)->next)
+            if (*bp == b) { *bp = b->next; break; }
+    pthread_mutex_unlock(&g_box_mu);
+    if (!last) return;
+
+    if (b->pid == (int)getpid()) {
+        if (b->mproj)  lt_mproj_release(b->mproj);      /* references the model */
+        if (b->lctx)   llama_free(b->lctx);
+        if (b->lmodel) lgen_model_release(b->lmodel);
+    }
+    if (b->toks) free(b->toks);
+    free(b);
+}
+
+static lt_emb_box *lt_box_get(duk_context *ctx, duk_idx_t obj)
+{
+    lt_emb_box *b = NULL;
+
+    if (duk_get_prop_string(ctx, obj, LT_BOX_SYM))
+        b = (lt_emb_box *)duk_get_pointer(ctx, -1);
+    duk_pop(ctx);
+    return b;
+}
+
+static int lt_obj_flag(duk_context *ctx, duk_idx_t obj, const char *sym)
+{
+    int on = 0;
+
+    if (duk_get_prop_string(ctx, obj, sym))
+        on = duk_get_boolean_default(ctx, -1, 0);
+    duk_pop(ctx);
+    return on;
+}
+
+/* The box's context if the handle on top of the stack may use it here, else
+ * NULL: the caller builds one (see lt_box_replace). */
+static struct llama_context *lt_box_use(duk_context *ctx, lt_emb_box *b)
+{
+    if (!b->lctx || b->thr != get_thread_num() || b->pid != (int)getpid())
+        return NULL;
+    if (!b->shared && lt_obj_flag(ctx, -1, LT_COPIED_SYM))
+        b->shared = 1;
+    return b->lctx;
+}
+
+/* the handle on top of the stack has built: it now owns nb and drops old */
+static void lt_box_replace(duk_context *ctx, lt_emb_box *old, lt_emb_box *nb)
+{
+    duk_push_pointer(ctx, nb);
+    duk_put_prop_string(ctx, -2, LT_BOX_SYM);
+    duk_del_prop_string(ctx, -1, LT_COPIED_SYM);
+    duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("destroyed"));
+    lt_box_unref(old);
+}
+
+/* objOnCopyCallback: called with the object being copied */
+static duk_ret_t emb_copy_cb(duk_context *ctx)
+{
+    lt_emb_box *b = lt_box_get(ctx, 0);
+
+    if (b) {
+        pthread_mutex_lock(&g_box_mu);
+        b->refs++;
+        pthread_mutex_unlock(&g_box_mu);
+    }
+    return 0;
+}
+
+/* finalizer, of handles and of their copies (may run in the thread.put heap) */
+static duk_ret_t emb_finalize(duk_context *ctx)
+{
+    lt_emb_box *b = lt_box_get(ctx, 0);
+
+    if (!b) return 0;
+    /* on its own thread, so nothing can be mid-call with this context */
+    if (b->lctx && !b->shared && b->thr == get_thread_num() && b->pid == (int)getpid() &&
+        !lt_obj_flag(ctx, 0, LT_COPIED_SYM))
     {
+        pthread_mutex_lock(&g_box_mu);
+        llama_free(b->lctx);
+        b->lctx = NULL;
+        pthread_mutex_unlock(&g_box_mu);
+    }
+    duk_push_pointer(ctx, NULL);
+    duk_put_prop_string(ctx, 0, LT_BOX_SYM);
+    lt_box_unref(b);
+    return 0;
+}
+
+/* destroy(): free this thread's context and release its model + projector now */
+static duk_ret_t emb_free(duk_context *ctx)
+{
+    duk_push_this(ctx);
+    if (lt_obj_flag(ctx, -1, DUK_HIDDEN_SYMBOL("destroyed")))
+        return 0;
+
+    lt_emb_box *b = lt_box_get(ctx, -1);
+    if (b && b->lctx && b->thr == get_thread_num() && b->pid == (int)getpid())
+    {
+        pthread_mutex_lock(&g_box_mu);
+        struct llama_context *lctx   = b->lctx;
+        struct llama_model   *lmodel = b->lmodel;
+        lt_mproj             *pj     = b->mproj;
+        b->lctx   = NULL;
+        b->lmodel = NULL;
+        b->mproj  = NULL;
+        pthread_mutex_unlock(&g_box_mu);
+
         /* the projector references the model: release it first */
-        if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("mproj")) && duk_get_pointer(ctx, -1))
-            lt_mproj_release((lt_mproj *)duk_get_pointer(ctx, -1));
-        duk_pop(ctx);
-        duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("mproj"));
+        if (pj) lt_mproj_release(pj);
         llama_free(lctx);
-        lgen_model_release(lmodel); // refcount--, model freed by cache at zero
+        if (lmodel) lgen_model_release(lmodel);     /* refcount--, freed by the cache at zero */
+        duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("mproj"));
         duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("model"));
-        duk_del_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("llama_ctx"));
     }
 
     duk_push_true(ctx);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("destroyed"));
-
     return 0;
 }
 
-static duk_ret_t emb_free(duk_context *ctx)
+/* give the new handle on top of the stack its box, copy hook and finalizer */
+static void lt_box_attach(duk_context *ctx, lt_emb_box *b)
 {
-    duk_push_this(ctx);
-    return emb_free_(ctx);
+    duk_push_pointer(ctx, b);
+    duk_put_prop_string(ctx, -2, LT_BOX_SYM);
+    duk_push_c_function(ctx, emb_copy_cb, 1);
+    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("objOnCopyCallback"));
+    duk_push_c_function(ctx, emb_finalize, 1);
+    duk_set_finalizer(ctx, -2);
 }
 
 /* Mode-specific options for embed/rerank, parsed into cp AFTER parse_common_opts.
@@ -2462,40 +2621,35 @@ static struct llama_context *emb_resolve(duk_context *ctx, const char *what,
     lmodel = duk_get_pointer(ctx, -1);
     duk_pop(ctx);
 
-    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("llama_ctx"));
-    lctx = duk_get_pointer(ctx, -1);
-    duk_pop(ctx);
-
     duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("vec_dim"));
     *out_dim = duk_get_int(ctx, -1);
     duk_pop(ctx);
 
-    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_thread"));
-    int thrno = duk_get_int(ctx, -1);
-    duk_pop(ctx);
-
-    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_pid"));
-    int pidno = duk_get_int(ctx, -1);
-    duk_pop(ctx);
+    lt_emb_box *box = lt_box_get(ctx, -1);
+    if (!box)
+        RP_THROW(ctx, "rampart-llama-cpp:%s - NULL llama_context", what);
+    lctx = lt_box_use(ctx, box);
 
     int curthr = get_thread_num();
     int curpid = (int)getpid();
 
-    // get a new context if in a new thread.  Model stays the same.
-    if (curthr != thrno || pidno != curpid )
+    // No context of this thread's to use: build one.  Model stays the same.
+    // (Not for a handle destroy()ed on this thread: that is an error, below.)
+    if (!lctx && !(box->thr == curthr && box->pid == curpid &&
+                   lt_obj_flag(ctx, -1, DUK_HIDDEN_SYMBOL("destroyed"))))
     {
 
         // Post-fork refusal: GPU runtimes don't survive fork (CPU continues).
-        if (pidno != curpid && lt_gpu_in_use())
+        if (box->pid != curpid && lt_gpu_in_use())
             RP_THROW(ctx, LT_FORK_REFUSAL);
         duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("cp_buf"));
         struct llama_context_params *cp_buf = duk_get_buffer_data(ctx, -1, NULL);
         duk_pop(ctx);
 
-        // Take this copy's model refcount FIRST, and checked: if the origin copy
-        // (sole ref holder) was destroyed before our first use here, the model is
-        // already freed -- fail cleanly rather than building a context on freed
-        // memory. (Released in emb_free when this copy's context is freed.)
+        // Take this copy's model refcount FIRST, and checked: if the handle was
+        // destroy()ed before our first use here, the model is already freed --
+        // fail cleanly rather than building a context on freed memory.
+        // (Released with this copy's lt_emb_box.)
         if (!lgen_model_addref_checked(lmodel))
             RP_THROW(ctx, "rampart-llama-cpp:%s - model was destroyed "
                           "(the originating handle was destroy()ed); create a new handle", what);
@@ -2519,19 +2673,7 @@ static struct llama_context *emb_resolve(duk_context *ctx, const char *what,
                           "(the originating handle was destroy()ed); create a new handle", what);
         }
 
-        /* free this copy's context when its thread exits (see lt_thr_fin) */
-        lt_thr_fin *f = lt_thr_fin_register();
-        if (f) { f->lctx = lctx; f->lmodel = lmodel; f->mproj = pj; }
-        duk_push_pointer(ctx, f);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("thr_fin"));
-
-        duk_push_pointer(ctx, lctx);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
-
-        duk_push_int(ctx, curthr);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
-        duk_push_int(ctx, curpid);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
+        lt_box_replace(ctx, box, lt_box_new(lctx, lmodel, pj, NULL));
     }
 
     if (!lctx)
@@ -3329,7 +3471,7 @@ void *rp_embed_load(const char *path, char *err, size_t errlen)
     }
 #endif
     h->lmodel = llama_model_load_from_file(path, mp);
-    if (h->lmodel) lt_gpu_note();
+    lt_gpu_note();
     if (!h->lmodel) {
         if (err && errlen)
             snprintf(err, errlen, "rp_embed_load: could not load '%s': %s",
@@ -3513,6 +3655,18 @@ static size_t rp_embed_compute_avgvec(rp_embed_handle_t *h,
     return (size_t)dim;
 }
 
+/* Post-fork refusal (see fork policy above): a child inheriting this handle
+ * may continue only on CPU.  Both modes need it -- per-thread would build a
+ * context on the parent's model, shared-context would run the parent's own
+ * context.  Check before taking h->mtx. */
+static int rp_embed_fork_refused(rp_embed_handle_t *h)
+{
+    if ((int)getpid() == h->init_pid || !lt_gpu_in_use()) return 0;
+    static int warned = 0;
+    if (!warned) { warned = 1; lt_warn("%s\n", LT_FORK_REFUSAL); }
+    return 1;
+}
+
 /* Find or create the calling thread's llama_context (shared lmodel
  * comes from h).  Returns NULL on failure.  Mutex briefly during
  * map lookup and lazy llama_init_from_model. */
@@ -3523,13 +3677,7 @@ get_per_thread_ctx(rp_embed_handle_t *h)
     int pid   = (int)getpid();
     struct llama_context *lctx = NULL;
 
-    /* Post-fork refusal (see fork policy above): a child inheriting this
-     * handle may continue only on CPU. */
-    if (pid != h->init_pid && lt_gpu_in_use()) {
-        static int warned = 0;
-        if (!warned) { warned = 1; lt_warn("%s\n", LT_FORK_REFUSAL); }
-        return NULL;
-    }
+    if (rp_embed_fork_refused(h)) return NULL;
 
     pthread_mutex_lock(&h->mtx);
     for (int i = 0; i < h->n_thread_ctxs; i++) {
@@ -3576,6 +3724,7 @@ size_t rp_embed_text(void *handle, const char *text, size_t tlen, float **out_ve
         dim = rp_embed_compute_avgvec(h, lctx, text, tlen,
                                       out_vec, err, sizeof err);
     } else {
+        if (rp_embed_fork_refused(h)) return 0;
         /* Serialized path: one shared (model, ctx), full embed under mutex. */
         pthread_mutex_lock(&h->mtx);
         dim = rp_embed_compute_avgvec(h, h->lctx, text, tlen,
@@ -3644,6 +3793,7 @@ size_t rp_embed_doc(void *handle, const char *text, size_t tlen,
                                   out_vecs, out_k, (ll_chunk_span **)out_chunks,
                                   out_avg, out_coherence, err, sizeof err);
     } else {
+        if (rp_embed_fork_refused(h)) return 0;
         dim = ll_embed_doc_cached(h, h->lctx, text, tlen, prefix, plen, /*lock_compute*/1,
                                   out_vecs, out_k, (ll_chunk_span **)out_chunks,
                                   out_avg, out_coherence, err, sizeof err);
@@ -3679,6 +3829,7 @@ size_t rp_embed_spans(void *handle, const char *text, size_t tlen,
                            NULL, &k, (ll_chunk_span **)out_spans,
                            NULL, NULL, err, sizeof err);
     } else {
+        if (rp_embed_fork_refused(h)) return 0;
         pthread_mutex_lock(&h->mtx);
         dim = ll_embed_doc(h->lctx, vocab, text, tlen, NULL, 0, h->vec_dim,
                            RP_CHUNK_AUTO, 0, 0, 0, 1 /* spans_only */, 1, 0,
@@ -3745,9 +3896,9 @@ static duk_ret_t llamacpp_model_info(duk_context *ctx)
     mp.n_gpu_layers = 0;      /* belt-and-suspenders: never touch the GPU here */
 
     struct llama_model *m = llama_model_load_from_file(path, mp);
+    lt_gpu_note();
     if (!m)
         RP_THROW(ctx, "modelInfo: could not load '%s'", path);
-    lt_gpu_note();
 
     char arch[128] = {0};
     if (llama_model_meta_val_str(m, "general.architecture", arch, sizeof arch) < 0)
@@ -3838,7 +3989,7 @@ static duk_ret_t llamacpp_media_info(duk_context *ctx)
 
     char lerr[256] = {0};
     struct llama_model *lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
-    if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
+    lt_gpu_note();   /* loaded or not: see lt_gpu_forked */
     if (!lmodel)
         RP_THROW(ctx, "mediaInfo: could not load model '%s': %s", model, lerr[0] ? lerr : strerror(errno));
 
@@ -3930,7 +4081,7 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     // double-free and shares weights across threads.
     char lerr[256] = {0};
     lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
-    if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
+    lt_gpu_note();   /* loaded or not: see lt_gpu_forked */
 
     if (!lmodel)
         RP_THROW(ctx, "rampart-llama-cpp:init - Could not load ggml file '%s': %s", model, lerr[0] ? lerr : strerror(errno));
@@ -3965,7 +4116,7 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
             mp.devices      = devs;    /* force CPU-only: no Metal/GPU backend */
             lt_warn("rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
             lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
-            if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
+            lt_gpu_note();   /* loaded or not: see lt_gpu_forked */
             if (lmodel)
                 lctx = new_embed_context(ctx, lmodel, &cp);
         }
@@ -4030,9 +4181,6 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     duk_dup(ctx, 0);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("model_path"));
 
-    duk_push_pointer(ctx, lctx);
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
-
     duk_push_int(ctx, vec_dim);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("vec_dim"));
 
@@ -4089,19 +4237,6 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
         duk_push_int(ctx, sentSpl);  duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("chunk_sent"));
     }
 
-    duk_push_int(ctx, (int)get_thread_num());
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
-
-    duk_push_int(ctx, (int)getpid());
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
-
-    // origin thread/pid: NEVER updated on rebuild — identifies the one copy that
-    // owns per-handle resources (e.g. rerank_toks). See emb_free.
-    duk_push_int(ctx, (int)get_thread_num());
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("emb_origin_thr"));
-    duk_push_int(ctx, (int)getpid());
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("emb_origin_pid"));
-
     duk_push_c_function(ctx, embed_text_to_buf32, 1);
     duk_put_prop_string(ctx, -2, "embedTextToFp32Buf");
 
@@ -4124,8 +4259,7 @@ static duk_ret_t llamacpp_init_embed(duk_context *ctx)
     duk_push_c_function(ctx, emb_free, 0);
     duk_put_prop_string(ctx, -2, "destroy");
 
-    duk_push_c_function(ctx, emb_free_, 1); /* finalizer: object arrives as the argument */
-    duk_set_finalizer(ctx, -2);
+    lt_box_attach(ctx, lt_box_new(lctx, lmodel, pj, NULL));
 
     return 1;
 }
@@ -4356,36 +4490,24 @@ static duk_ret_t rerank_text(duk_context *ctx)
         lmodel = (struct llama_model *)duk_get_pointer(ctx, -1);
     duk_pop(ctx);
 
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("llama_ctx")))
-        lctx = (struct llama_context *)duk_get_pointer(ctx, -1);
-    duk_pop(ctx);
+    lt_emb_box *box = lt_box_get(ctx, -1);
+    if (!box)
+        RP_THROW(ctx, "rerank: Invalid model or context");
+    lctx = lt_box_use(ctx, box);
+    if (lctx)
+        toks = (rp_rerank_toks *)box->toks;
 
-    if (duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("rerank_toks")))
-        toks = (rp_rerank_toks *)duk_get_pointer(ctx, -1);
-    duk_pop(ctx);
-
-    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_thread"));
-    int thrno = duk_get_int(ctx, -1);
-    duk_pop(ctx);
-
-    duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("ctx_pid"));
-    int pidno = duk_get_int(ctx, -1);
-    duk_pop(ctx);
-
-    int curthr = get_thread_num();
-    int curpid = (int)getpid();
-
-    // get a new context if in a new thread.  Model stays the same.
-    if (curthr != thrno || pidno != curpid )
+    // no context of this thread's to use: build one.  Model stays the same.
+    if (!lctx)
     {
         // Post-fork refusal: GPU runtimes don't survive fork (CPU continues).
-        if (pidno != curpid && lt_gpu_in_use())
+        if (box->pid != (int)getpid() && lt_gpu_in_use())
             RP_THROW(ctx, LT_FORK_REFUSAL);
         duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("cp_buf"));
         struct llama_context_params *cp_buf = duk_get_buffer_data(ctx, -1, NULL);
         duk_pop(ctx);
 
-        // checked refcount FIRST: if the origin copy was destroyed (its ref was
+        // checked refcount FIRST: if the handle was destroy()ed (its ref was
         // the last), the model is freed -- fail cleanly, no use-after-free.
         if (!lgen_model_addref_checked(lmodel))
             RP_THROW(ctx, "rerank - model was destroyed (the originating handle "
@@ -4397,33 +4519,11 @@ static duk_ret_t rerank_text(duk_context *ctx)
             RP_THROW(ctx, "rerank - failed to create llama context on this thread");
         }
 
-        // Per-copy rerank_toks: the ORIGIN copy frees its own struct in emb_free,
-        // so this copy takes a private one (its strings live in the shared model,
-        // which this copy's refcount above now keeps alive).
-        {
-            rp_rerank_toks *mytoks = NULL;
-            REMALLOC(mytoks, sizeof(rp_rerank_toks));
-            get_rr_toks(lmodel, mytoks);
-            toks = mytoks;
-            duk_push_pointer(ctx, mytoks);
-            duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rerank_toks"));
-        }
-
-        /* free this copy's context + toks when its thread exits (see lt_thr_fin) */
-        {
-            lt_thr_fin *f = lt_thr_fin_register();
-            if (f) { f->lctx = lctx; f->lmodel = lmodel; f->toks = toks; }
-            duk_push_pointer(ctx, f);
-            duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("thr_fin"));
-        }
-
-        duk_push_pointer(ctx, lctx);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
-
-        duk_push_int(ctx, curthr);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
-        duk_push_int(ctx, curpid);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
+        // each box has its own rerank toks (their strings live in the shared
+        // model, which the refcount above now keeps alive)
+        REMALLOC(toks, sizeof(rp_rerank_toks));
+        get_rr_toks(lmodel, toks);
+        lt_box_replace(ctx, box, lt_box_new(lctx, lmodel, NULL, toks));
     }
 
 
@@ -4563,7 +4663,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     // shared, refcounted load (one refcount per context; released in emb_free)
     char lerr[256] = {0};
     lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
-    if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
+    lt_gpu_note();   /* loaded or not: see lt_gpu_forked */
 
     if (!lmodel)
         RP_THROW(ctx, "rampart-llama-cpp:initRerank - Could not load ggml file '%s': %s", model, lerr[0] ? lerr : strerror(errno));
@@ -4613,7 +4713,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
             mp.devices      = devs;
             lt_warn("rampart-llamacpp: GPU context init failed for '%s'; retrying on CPU\n", model);
             lmodel = lgen_model_acquire(model, &mp, lerr, sizeof lerr);
-            if (lmodel) lt_gpu_note();   /* records g_gpu_pid: see lt_gpu_forked */
+            lt_gpu_note();   /* loaded or not: see lt_gpu_forked */
             if (lmodel)
                 lctx = llama_init_from_model(lmodel, cp);
         }
@@ -4631,21 +4731,6 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     // Store pointers
     duk_push_pointer(ctx, lmodel);
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("model"));
-
-    duk_push_pointer(ctx, lctx);
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("llama_ctx"));
-
-    duk_push_int(ctx, (int)get_thread_num());
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_thread"));
-
-    duk_push_int(ctx, (int)getpid());
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("ctx_pid"));
-
-    // origin (never updated on rebuild): the one copy that frees rerank_toks
-    duk_push_int(ctx, (int)get_thread_num());
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("emb_origin_thr"));
-    duk_push_int(ctx, (int)getpid());
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("emb_origin_pid"));
 
     void *cp_buf = duk_push_fixed_buffer(ctx, sizeof(struct llama_context_params));
     duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("cp_buf"));
@@ -4667,9 +4752,6 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
 
     get_rr_toks(lmodel, toks);
 
-    duk_push_pointer(ctx, toks);
-    duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("rerank_toks"));
-
     // Add the rerank function
     duk_push_c_function(ctx, rerank_text, 3);
     duk_put_prop_string(ctx, -2, "rerank");
@@ -4677,8 +4759,7 @@ static duk_ret_t llamacpp_init_rerank(duk_context *ctx)
     duk_push_c_function(ctx, emb_free, 0);
     duk_put_prop_string(ctx, -2, "destroy");
 
-    duk_push_c_function(ctx, emb_free_, 1); /* finalizer: object arrives as the argument */
-    duk_set_finalizer(ctx, -2);
+    lt_box_attach(ctx, lt_box_new(lctx, lmodel, NULL, toks));
 
     return 1;
 }

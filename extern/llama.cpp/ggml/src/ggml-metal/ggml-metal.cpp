@@ -1042,6 +1042,15 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
 
             for (int i = 0; i < g_devices; ++i) {
                 auto * dev = ggml_backend_metal_device_init(&reg, i);
+                // rampart-langtools: MTLCreateSystemDefaultDevice() is nil when there is no
+                // Metal GPU (most Intel VMs, some headless Macs).  Upstream registers a GPU
+                // device anyway: context creation then fails, and callers believe a GPU is
+                // in use (so refuse CPU work after fork).  Register none: plain CPU.
+                if (!ggml_metal_device_get_obj((ggml_metal_device_t) dev->context)) {
+                    delete dev;
+                    g_devices = i; // as GGML_METAL_DEVICES=0
+                    break;
+                }
                 devs.emplace_back(dev);
 
                 reg_ctx->devices.push_back(dev);

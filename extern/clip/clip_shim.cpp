@@ -95,6 +95,27 @@ static void clip_once_init(void) {
 extern "C" { int get_thread_num(void) __attribute__((weak)); }
 static int cur_thread_num(void) { return get_thread_num ? get_thread_num() : 0; }
 #include <unistd.h>   /* getpid */
+#include <dlfcn.h>    /* rampart-llamacpp's fork flag: see clip_gpu_forked */
+
+/* The post-fork refusal for NEW loads, as in rampart-llamacpp: g_gpu_pid is the
+ * process in which this module's ggml first initialized a GPU runtime (device
+ * lookup does that, whether or not CLIP ends up on the GPU).  A forked child
+ * inherits it and must not ask the driver anything -- loading there died.  The
+ * runtime is shared with rampart-llamacpp, so each module also asks the other. */
+static pid_t g_gpu_pid = 0;
+
+extern "C" int rp_clip_gpu_forked(void) {
+    return g_gpu_pid && g_gpu_pid != getpid();
+}
+
+static bool clip_gpu_forked(void) {
+    if (rp_clip_gpu_forked()) return true;
+#if defined(CLIP_HAVE_CUDA) || defined(__APPLE__)
+    int (*lc_forked)(void) = (int (*)(void)) dlsym(RTLD_DEFAULT, "rp_llamacpp_gpu_forked");
+    if (lc_forked && lc_forked()) return true;
+#endif
+    return false;
+}
 
 static std::string vformat(const char * fmt, va_list ap) {
     va_list ap2; va_copy(ap2, ap);
@@ -316,6 +337,9 @@ static ggml_backend_t clip_backend_init(int * is_gpu, ggml_type wtype) {
     clip_once_init();          /* must precede any ggml device creation */
     if (is_gpu) *is_gpu = 0;
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    /* IGPU too: unused here, but looking it up initialized its runtime all the same */
+    if (!g_gpu_pid && (dev || ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU)))
+        g_gpu_pid = getpid();
     if (dev) {
         int ok = 1;
 #ifdef CLIP_HAVE_CUDA
@@ -362,6 +386,11 @@ static ggml_backend_t clip_backend_of_type(int use_gpu) {
 #define CLIP_FORK_REFUSAL "rampart-clip: this model was loaded before a fork() and uses " \
     "the GPU -- using it in the child would crash the CUDA runtime. Load the model after " \
     "forking (rampart-server postForkFunc), or run it on CPU."
+
+#define CLIP_FORK_REFUSAL_LOAD "clip_load: a GPU backend (CUDA/Metal) was initialized " \
+    "before this process was forked -- loading a model in the child would hang or crash " \
+    "the GPU runtime. Fork before loading models (rampart-server postForkFunc), or use a " \
+    "CPU-only build."
 
 // find or lazily create the calling thread's compute context (of the load-chosen
 // backend type).  Refuses in a forked child if the handle uses the GPU.
@@ -554,8 +583,17 @@ clip_handle * clip_load(const char * path, char * err, size_t errlen) {
     {   // cache hit?
         std::lock_guard<std::mutex> lk(g_cache_lock);
         for (clip_handle * c = g_cache_head; c; c = c->next)
-            if (c->path == path) { c->refcount++; return c; }
+            if (c->path == path) {
+                if (c->use_gpu && c->init_pid != (int) getpid()) {
+                    set_err(err, errlen, "%s", CLIP_FORK_REFUSAL_LOAD);
+                    return nullptr;
+                }
+                c->refcount++;
+                return c;
+            }
     }
+    /* before anything that asks the driver */
+    if (clip_gpu_forked()) { set_err(err, errlen, "%s", CLIP_FORK_REFUSAL_LOAD); return nullptr; }
     clip_handle * h = clip_build(path, err, errlen);
     if (!h) return nullptr;
     std::lock_guard<std::mutex> lk(g_cache_lock);
